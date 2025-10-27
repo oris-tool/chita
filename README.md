@@ -1,8 +1,6 @@
 # CHITA Library
 
-This repository provides CHITA, a Java library implementing a quantitative approach to predict the spread of infectious diseases within a cluster. 
-
-CHITA is presented in a paper titled "An observation-based quantitative approach to predict the spread of infectious diseases within a cluster", authored by Laura Carnevali, Silvia Dani, Niccolò Niccoli, Benedetta Picano, and Enrico Vicario, currently submitted for a journal publication. 
+This repository provides CHITA, a Java library implementing a quantitative approach to predict the spread of infectious diseases within a cluster. CHITA is presented in a paper titled "An observation-based quantitative approach to predict the spread of infectious diseases within a cluster", authored by Laura Carnevali, Silvia Dani, Niccolò Niccoli, Benedetta Picano, and Enrico Vicario, currently submitted for a journal publication. 
 
 The most distinctive features of CHITA are: 
 - definition of a custom-made extensible metamodel of an infection chain of a disease; 
