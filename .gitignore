@@ -1,0 +1,12 @@
+__pycache__
+.idea
+.venv
+D0
+D1
+D2*
+D3
+lib__
+out
+chita.iml
+README copy.md
+stpn_solution.csv
