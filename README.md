@@ -45,14 +45,14 @@ This repository provides a ready-to-use Maven project that you can easily import
 
 1. **Install Java >= 11.** For Windows, you can download a [package from Oracle](https://www.oracle.com/java/technologies/downloads/#java11); for Linux, you can run `apt-get install openjdk-11-jdk`; for macOS, you can run `brew install --cask java`. 
 
-2. **Download Eclipse.** The [Eclipse IDE for Java Developers](http://www.eclipse.org/downloads/eclipse-packages/) package is sufficient.
+2. **Download Eclipse or IntelliJ.** Regarding Eclipse, the [Eclipse IDE for Java Developers](http://www.eclipse.org/downloads/eclipse-packages/) package is sufficient.
 
 3. **Clone this project.** Inside Eclipse:
    - Select `File > Import > Maven > Check out Maven Projects from SCM` and click `Next`.
    - If the `SCM URL` dropbox is grayed out, click on `m2e Marketplace` and install `m2e-egit`. You will have to restart Eclipse.
    - As `SCM URL`, type: `git@github.com:oris-tool/chita.git` and click `Next` and then `Finish`.
 
-4. **Install Python.** We provide a minimal quick-start for the Python tools (Python 3.8+). First choose one for your platform:
+4. **Install Python >= 3.8.** We provide a minimal quick-start for the Python tools. First choose one for your platform:
    - Windows:
 
    ```powershell
