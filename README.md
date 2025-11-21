@@ -12,26 +12,26 @@ The most distinctive features of CHITA are:
 
 To support reproducibility of the experimental results reported in the paper, perform the steps reported below to repeat the experiments.
 
-1) Run the simulation
+1. Run the simulation
    ```powershell
    python run_n_simulations.py
    ```
 
    This script generates datasets and intermediate output used by the analysis.
 
-2) Run the Java STPN analysis 
+2. Run the Java STPN analysis 
    
    Import the project into Eclipse or IntelliJ and run the `main` method in `com.chita.analysis.STPNAnalysis`.
   
    Note: The analysis writes `stpn_solution.csv` if it does not exist.
 
-3) Run the simulation for 10 steps
+3. Run the simulation for 10 steps
 
    ```powershell
    python run_n_simultations.py --rep 10
    ```
 
-4) Plot results
+4. Plot results
 
    ```powershell
    python plot_results.py
@@ -52,11 +52,8 @@ This repository provides a ready-to-use Maven project that you can easily import
    - If the `SCM URL` dropbox is grayed out, click on `m2e Marketplace` and install `m2e-egit`. You will have to restart Eclipse.
    - As `SCM URL`, type: `git@github.com:oris-tool/chita.git` and click `Next` and then `Finish`.
 
-   ### Quick Python
-
-   Minimal quick-start for the Python tools (Python 3.8+).
-
-   Quick install (choose one for your platform):
+4. **Install Python.** We ptovide a inimal quick-start for the Python tools (Python 3.8+):
+   - Quick install (choose one for your platform):
 
    Windows:
 
