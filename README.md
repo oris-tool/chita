@@ -52,9 +52,8 @@ This repository provides a ready-to-use Maven project that you can easily import
    - If the `SCM URL` dropbox is grayed out, click on `m2e Marketplace` and install `m2e-egit`. You will have to restart Eclipse.
    - As `SCM URL`, type: `git@github.com:oris-tool/chita.git` and click `Next` and then `Finish`.
 
-4. **Install Python.** We provide a inimal quick-start for the Python tools (Python 3.8+):
-   - Quick install (choose one for your platform):
-   -- Windows:
+4. **Install Python.** We provide a minimal quick-start for the Python tools (Python 3.8+). First choose one for your platform:
+   - Windows:
 
    ```powershell
    python -m venv .venv
@@ -62,7 +61,7 @@ This repository provides a ready-to-use Maven project that you can easily import
    pip install -r requirements.txt
    ```
 
-   -- macOS / Linux:
+   - macOS / Linux:
 
    ```bash
    python3 -m venv .venv
@@ -70,13 +69,13 @@ This repository provides a ready-to-use Maven project that you can easily import
    pip install -r requirements.txt
    ```
 
-   -- If a shell blocks script execution on Windows, run:
+   - If a shell blocks script execution on Windows, run:
 
    ```powershell
    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
 
-   -- Python dependencies are listed in `requirements.txt`.
+   - Python dependencies are listed in `requirements.txt`.
 
 ## Licence
 
