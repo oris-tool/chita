@@ -12,26 +12,25 @@ The most distinctive features of CHITA are:
 
 To support reproducibility of the experimental results reported in the paper, perform the steps reported below to repeat the experiments.
 
-1. Run the simulation
+1. Generate the data sets of observations used in the paper and compute a gournd truth for each of them.
+   
    ```powershell
    python run_n_simulations.py
    ```
 
-   This script generates datasets and intermediate output used by the analysis.
-
-2. Run the Java STPN analysis 
+3. Execute our approach for each data set of observations. 
    
    Import the project into Eclipse or IntelliJ and run the `main` method in `com.chita.analysis.STPNAnalysis`.
   
-   Note: The analysis writes `stpn_solution.csv` if it does not exist.
+   Note: The analysis writes on the file named `stpn_solution.csv` if it does not exist.
 
-3. Run the simulation for 10 steps
+4. Execute the alternative simulative baseline for each data set of observations (10 runs for each data set).
 
    ```powershell
    python run_n_simultations.py --rep 10
    ```
 
-4. Plot results
+5. Plot results
 
    ```powershell
    python plot_results.py
