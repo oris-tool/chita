@@ -12,14 +12,13 @@ The most distinctive features of CHITA are:
 
 To support reproducibility of the experimental results reported in the paper, perform the steps reported below to repeat the experiments.
 
-1. Generate the data sets of observations used in the paper and compute a gournd truth for each of them.
+1. Generate the data sets of observations used in the paper and compute a ground truth for each of them.
    
    ```powershell
    python run_n_simulations.py
    ```
 
-<<<<<<< HEAD
-   This script generates datasets and intermediate output used by the analysis.
+   This script generates data sets and intermediate output used by the analysis.
 
    To run the simulation until convergence (with a maximum iteration cap), use:
 
@@ -27,23 +26,19 @@ To support reproducibility of the experimental results reported in the paper, pe
    python run_n_simulations.py --run_until_convergence --iterations_cap 100000
    ```
 
-2) Run the Java STPN analysis 
-=======
-3. Execute our approach for each data set of observations. 
->>>>>>> 9db7fe64ee09f18e33d5986bb5cc3fbc1d4770b4
+2. Execute our approach for each data set of observations.
    
    Import the project into Eclipse or IntelliJ and run the `main` method in `com.chita.analysis.STPNAnalysis`.
   
    Note: The analysis writes on the file named `stpn_solution.csv` if it does not exist.
 
-4. Execute the alternative simulative baseline for each data set of observations (10 runs for each data set).
+3. Execute the alternative simulative baseline for each data set of observations (10 runs for each data set).
 
    ```powershell
    python run_n_simulations.py --rep 10
    ```
 
-<<<<<<< HEAD
-4) Compute precision metrics (Brier Score and ECE)
+4. Compute precision metrics (Reliability Diagrams, Brier Score and ECE).
 
    ```powershell
    python compute_precision_metrics.py
@@ -51,10 +46,7 @@ To support reproducibility of the experimental results reported in the paper, pe
 
    The script scans experiment folders (`D*`) and writes outputs under each dataset in `precision_metrics/`.
 
-5) Plot results
-=======
-5. Plot results
->>>>>>> 9db7fe64ee09f18e33d5986bb5cc3fbc1d4770b4
+5. Plot results.
 
    ```powershell
    python plot_results.py
