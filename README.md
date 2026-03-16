@@ -12,11 +12,13 @@ The most distinctive features of CHITA are:
 
 To support reproducibility of the experimental results reported in the paper, perform the steps reported below to repeat the experiments.
 
-1) Run the simulation
+1. Generate the data sets of observations used in the paper and compute a gournd truth for each of them.
+   
    ```powershell
    python run_n_simulations.py
    ```
 
+<<<<<<< HEAD
    This script generates datasets and intermediate output used by the analysis.
 
    To run the simulation until convergence (with a maximum iteration cap), use:
@@ -26,17 +28,21 @@ To support reproducibility of the experimental results reported in the paper, pe
    ```
 
 2) Run the Java STPN analysis 
+=======
+3. Execute our approach for each data set of observations. 
+>>>>>>> 9db7fe64ee09f18e33d5986bb5cc3fbc1d4770b4
    
    Import the project into Eclipse or IntelliJ and run the `main` method in `com.chita.analysis.STPNAnalysis`.
   
-   Note: The analysis writes `stpn_solution.csv` if it does not exist.
+   Note: The analysis writes on the file named `stpn_solution.csv` if it does not exist.
 
-3) Run the simulation for 10 steps
+4. Execute the alternative simulative baseline for each data set of observations (10 runs for each data set).
 
    ```powershell
    python run_n_simulations.py --rep 10
    ```
 
+<<<<<<< HEAD
 4) Compute precision metrics (Brier Score and ECE)
 
    ```powershell
@@ -46,6 +52,9 @@ To support reproducibility of the experimental results reported in the paper, pe
    The script scans experiment folders (`D*`) and writes outputs under each dataset in `precision_metrics/`.
 
 5) Plot results
+=======
+5. Plot results
+>>>>>>> 9db7fe64ee09f18e33d5986bb5cc3fbc1d4770b4
 
    ```powershell
    python plot_results.py
@@ -59,20 +68,15 @@ This repository provides a ready-to-use Maven project that you can easily import
 
 1. **Install Java >= 11.** For Windows, you can download a [package from Oracle](https://www.oracle.com/java/technologies/downloads/#java11); for Linux, you can run `apt-get install openjdk-11-jdk`; for macOS, you can run `brew install --cask java`. 
 
-2. **Download Eclipse.** The [Eclipse IDE for Java Developers](http://www.eclipse.org/downloads/eclipse-packages/) package is sufficient.
+2. **Download Eclipse or IntelliJ.** Regarding Eclipse, the [Eclipse IDE for Java Developers](http://www.eclipse.org/downloads/eclipse-packages/) package is sufficient.
 
 3. **Clone this project.** Inside Eclipse:
    - Select `File > Import > Maven > Check out Maven Projects from SCM` and click `Next`.
    - If the `SCM URL` dropbox is grayed out, click on `m2e Marketplace` and install `m2e-egit`. You will have to restart Eclipse.
    - As `SCM URL`, type: `git@github.com:oris-tool/chita.git` and click `Next` and then `Finish`.
 
-   ### Quick Python
-
-   Minimal quick-start for the Python tools (Python 3.8+).
-
-   Quick install (choose one for your platform):
-
-   Windows:
+4. **Install Python >= 3.8.** We provide a minimal quick-start for the Python tools. First choose one for your platform:
+   - Windows:
 
    ```powershell
    python -m venv .venv
@@ -80,7 +84,7 @@ This repository provides a ready-to-use Maven project that you can easily import
    pip install -r requirements.txt
    ```
 
-   macOS / Linux:
+   - macOS / Linux:
 
    ```bash
    python3 -m venv .venv
@@ -88,13 +92,13 @@ This repository provides a ready-to-use Maven project that you can easily import
    pip install -r requirements.txt
    ```
 
-   If a shell blocks script execution on Windows, run:
+   - If a shell blocks script execution on Windows, run:
 
    ```powershell
    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
 
-   Python dependencies are listed in `requirements.txt`.
+   - Python dependencies are listed in `requirements.txt`.
 
 ## Licence
 
