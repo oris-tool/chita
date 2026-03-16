@@ -19,6 +19,12 @@ To support reproducibility of the experimental results reported in the paper, pe
 
    This script generates datasets and intermediate output used by the analysis.
 
+   To run the simulation until convergence (with a maximum iteration cap), use:
+
+   ```powershell
+   python run_n_simulations.py --run_until_convergence --iterations_cap 100000
+   ```
+
 2) Run the Java STPN analysis 
    
    Import the project into Eclipse or IntelliJ and run the `main` method in `com.chita.analysis.STPNAnalysis`.
@@ -28,10 +34,18 @@ To support reproducibility of the experimental results reported in the paper, pe
 3) Run the simulation for 10 steps
 
    ```powershell
-   python run_n_simultations.py --rep 10
+   python run_n_simulations.py --rep 10
    ```
 
-4) Plot results
+4) Compute precision metrics (Brier Score and ECE)
+
+   ```powershell
+   python compute_precision_metrics.py
+   ```
+
+   The script scans experiment folders (`D*`) and writes outputs under each dataset in `precision_metrics/`.
+
+5) Plot results
 
    ```powershell
    python plot_results.py
