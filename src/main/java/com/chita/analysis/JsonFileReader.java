@@ -19,9 +19,11 @@ package com.chita.analysis;
 
 import java.io.FileReader;
 import java.io.IOException;
+
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+
 public class JsonFileReader {
 
     public static JsonObject readJsonFromFile(String filePath) {

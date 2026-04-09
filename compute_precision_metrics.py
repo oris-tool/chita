@@ -164,9 +164,6 @@ def process_and_save(json_path_p, json_path_g, M=10, metrics_output='metrics.jso
     print(f"\n✅ All metrics and coordinates saved successfully to: {metrics_output}")
     print(f"✅ All subject plots saved successfully in the directory: ./{plots_dir}/")
 
-# ==========================================
-# Execution
-# ==========================================
 if __name__ == "__main__":
     # gather all data
     for experiment_folder in [f for f in os.listdir(".") if os.path.isdir(f) and f.startswith("D")]:
@@ -203,13 +200,3 @@ if __name__ == "__main__":
             metrics_output=os.path.join(results_dir, 'metrics_baseline.json'), 
             plots_dir=os.path.join(results_dir, "simulatedBaseline", 'plots')
         )
-
-    # #results_dir = f"{root_dir}/precision_metrics/s8_t84_84_simulated"
-    # results_dir = f"{root_dir}/precision_metrics/s8_t84_84_numericalAnalysys"
-    # process_and_save(
-    #     prediction_file_path, 
-    #     ground_truth_file_path, 
-    #     M=10, 
-    #     metrics_output=os.path.join(results_dir, 'metrics.json'), 
-    #     plots_dir=os.path.join(results_dir, 'plots')
-    # )

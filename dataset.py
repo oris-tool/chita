@@ -19,12 +19,12 @@ import os
 import json
 import random
 
-#hyper-parameters
+# Hyper-parameters
 file = "path/filename"
 n_subjects = {5, 10, 15}
 time_limit = {14, 21, 28}
 
-#create file json of dataset
+# Create a JSON dataset file.
 def create_empty_json_file(filename):
     # Check if the file already exists
     if os.path.exists(filename):
@@ -46,7 +46,7 @@ def create_empty_json_file(filename):
             json.dump({"events" : []}, file)  # Dump an empty JSON object
         print(f"File '{filename}' created successfully.")
 
-#sample involved subjects for a single event
+# Sample involved subjects for a single event.
 def sample_involved_subjects(N):
     lower_bound = 2
     upper_bound = (N // 2) - 1 
@@ -55,7 +55,7 @@ def sample_involved_subjects(N):
     n_involved_subjects = random.randint(lower_bound, upper_bound)
     return random.sample(range(1, N + 1), n_involved_subjects)
 
-#sample events timestamps
+# Sample event timestamps.
 def sample_timestamps(M, T, fine_grained_rng = None):
     T_hours = T * 24
     sampled = random.sample(range(0, T_hours + 1), M)
@@ -64,48 +64,48 @@ def sample_timestamps(M, T, fine_grained_rng = None):
         sampled = [sampled[i] + minutes[i] for i in range(M)]
     return sorted(sampled)
 
-#sample risk factor of a single event
+# Sample the risk factor of a single event.
 def sample_risk_factor():
     return random.uniform(0, 1)
 
-#sample number of external contact of a subject
+# Sample the number of external contacts of a subject.
 def sample_external_contacts(max_contacts = 4):
     return random.randint(0, max_contacts)
 
-#sample number of symptomps of a subject
+# Sample the number of symptoms of a subject.
 def sample_symptoms(T):
     return random.randint(0, 2*T//7)
 
-#sample symptomps of a subject
+# Sample symptoms of a subject.
 def get_sampled_symptoms(n_symptoms):
-    symptoms = get_symptoms() #già in formato evento
+    symptoms = get_symptoms()  # Already in event format.
     if symptoms == None:
         return None
     sampled_symptoms = random.sample(symptoms, n_symptoms)
     return sampled_symptoms
 
-#run simulation to get symptoms
+# Run the simulation to get symptoms.
 def get_symptoms():
     pass
 
-#sample number of tests of a subject
+# Sample the number of tests of a subject.
 def sample_tests(T):
     return random.randint(0, 2*T//7)
 
-#sample tests of a subject
+# Sample tests of a subject.
 def get_sampled_tests(n_tests):
-    tests = get_tests() #già in formato evento
+    tests = get_tests()  # Already in event format.
     if tests == None:
         return None
     sampled_tests = random.sample(tests, n_tests)
     return sampled_tests
 
-#run simulation to get tests
+# Run the simulation to get tests.
 def get_tests():
     pass
 
-#create the right format of the event
-def create_event(event_type, involved_subjects, t, risk_factor = None, result = None):
+# Create the JSON event representation.
+def create_event(event_type, involved_subjects, t, risk_factor = None, result = None, duration_hours = None):
     event = {
         "type": event_type,
         "involved_subjects": involved_subjects,
@@ -113,6 +113,8 @@ def create_event(event_type, involved_subjects, t, risk_factor = None, result = 
         "risk_factor": risk_factor,
         "result": result
     }
+    if duration_hours is not None:
+        event["duration_hours"] = duration_hours
     return event
 
 def create_datasets(file, n_subjects, time_limit, seed = None, fine_grained = False, internal_contacts = None, max_contacts = 4):
@@ -140,7 +142,6 @@ def create_datasets(file, n_subjects, time_limit, seed = None, fine_grained = Fa
             n_contacts = internal_contacts
             if n_contacts is None:
                 n_contacts = {N}
-            event_type = "Event"
             for M in n_contacts:
                 filename = f"{file}_{M}.json"
                 created_files.append(filename)

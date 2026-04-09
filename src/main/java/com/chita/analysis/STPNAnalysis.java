@@ -31,22 +31,136 @@ import org.oristool.petrinet.Transition;
 
 import java.io.*;
 import java.math.BigDecimal;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 
 
 public class STPNAnalysis {
-    // 1. Build model
-    // 2. Set Marking
-    // 3. Run analysis
-    // 4. Get Solution
+    private static final int OBSERVATION_CURVE_CACHE_VERSION = 1;
+    private static final int OBSERVATION_CURVE_TIME_LIMIT_DAYS = 60;
+    private static final double OBSERVATION_CURVE_BASE_DT_DAYS = 0.05;
+    private static final String ACTIVE_OBSERVATION_CURVE_SCENARIO = "mid";
+    private static final double TEST_GAMMA_SHAPE = 7.85;
+    private static final double TEST_GAMMA_SCALE = 2.14;
+    private static final double TEST_GAMMA_SCALING = 0.94;
 
-    public static <R, S> TransientSolution<R, S> buildModel(int samples, float step){
+    private static final CurveScenario LOWER_CURVE_SCENARIO = new CurveScenario(
+            "lower",
+            0.601,
+            new ErlangExponentialParams(2, 0.61472, 0.33939),
+            new ErlangExponentialParams(1, 0.47539, 0.20980),
+            0.96812, 0.03188, 10.19072, 0.33560
+    );
+    private static final CurveScenario MID_CURVE_SCENARIO = new CurveScenario(
+            "mid",
+            0.649,
+            new ErlangExponentialParams(2, 0.54129, 0.32205),
+            new ErlangExponentialParams(2, 0.60118, 0.21962),
+            0.88188, 0.11812, 4.64146, 0.62170
+    );
+    private static final CurveScenario UPPER_CURVE_SCENARIO = new CurveScenario(
+            "upper",
+            0.693,
+            new ErlangExponentialParams(2, 0.60444, 0.23860),
+            new ErlangExponentialParams(3, 0.65074, 0.23365),
+            0.75307, 0.24693, 2.64235, 0.86642
+    );
+
+    private static final class ErlangExponentialParams {
+        final int erlangStages;
+        final double erlangRate;
+        final double exponentialRate;
+
+        ErlangExponentialParams(int erlangStages, double erlangRate, double exponentialRate) {
+            this.erlangStages = erlangStages;
+            this.erlangRate = erlangRate;
+            this.exponentialRate = exponentialRate;
+        }
+
+        String signature() {
+            return String.format(
+                    Locale.US,
+                    "n=%d,l1=%.12f,l2=%.12f",
+                    erlangStages,
+                    erlangRate,
+                    exponentialRate
+            );
+        }
+    }
+
+    private static final class CurveScenario {
+        final String name;
+        final double symptomaticProbability;
+        final ErlangExponentialParams onset;
+        final ErlangExponentialParams symptomDuration;
+        final double psiP1;
+        final double psiP2;
+        final double psiL1;
+        final double psiL2;
+
+        CurveScenario(
+                String name,
+                double symptomaticProbability,
+                ErlangExponentialParams onset,
+                ErlangExponentialParams symptomDuration,
+                double psiP1,
+                double psiP2,
+                double psiL1,
+                double psiL2
+        ) {
+            this.name = name;
+            this.symptomaticProbability = symptomaticProbability;
+            this.onset = onset;
+            this.symptomDuration = symptomDuration;
+            this.psiP1 = psiP1;
+            this.psiP2 = psiP2;
+            this.psiL1 = psiL1;
+            this.psiL2 = psiL2;
+        }
+
+        String signature() {
+            return String.format(
+                    Locale.US,
+                    "scenario=%s;s=%.12f;onset={%s};duration={%s};psi=%.12f,%.12f,%.12f,%.12f;gamma=%.12f,%.12f,%.12f;dt=%.12f",
+                    name,
+                    symptomaticProbability,
+                    onset.signature(),
+                    symptomDuration.signature(),
+                    psiP1,
+                    psiP2,
+                    psiL1,
+                    psiL2,
+                    TEST_GAMMA_SHAPE,
+                    TEST_GAMMA_SCALE,
+                    TEST_GAMMA_SCALING,
+                    OBSERVATION_CURVE_BASE_DT_DAYS
+            );
+        }
+    }
+
+    private static final class ObservationCurves {
+        final double[] phi;
+        final double[] theta;
+        final double[] psiSurvival;
+
+        ObservationCurves(double[] phi, double[] theta, double[] psiSurvival) {
+            this.phi = phi;
+            this.theta = theta;
+            this.psiSurvival = psiSurvival;
+        }
+
+        int length() {
+            return phi.length;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <R, S> TransientSolution<R, S> buildModel(int samples, float step) {
         PetriNet net = new PetriNet();
         Marking marking = new Marking();
 
+        // Places and transitions
         Place Asymptomatic = net.addPlace("Asymptomatic");
         Place DevelopingSymptoms = net.addPlace("DevelopingSymptoms");
         Place EffectiveContact = net.addPlace("EffectiveContact");
@@ -56,75 +170,49 @@ public class STPNAnalysis {
         Place Isolated = net.addPlace("Isolated");
         Place Symptomatic = net.addPlace("Symptomatic");
         Place Symptomatology = net.addPlace("Symptomatology");
-        Place p0 = net.addPlace("p0");
-        Place p1 = net.addPlace("p1");
-        Place p2 = net.addPlace("p2");
-        Place p3 = net.addPlace("p3");
-        Place p4 = net.addPlace("p4");
-        Place p5 = net.addPlace("p5");
-        Place p6 = net.addPlace("p6");
-        Place p7 = net.addPlace("p7");
+        Place _healing = net.addPlace("_healing");
+        Place _infectiousness = net.addPlace("_infectiousness");
+        Place _isolating = net.addPlace("_isolating");
+        Place _symptomsonset = net.addPlace("_symptomsonset");
+        Transition Isolating_erlang = net.addTransition("Isolating_erlang");
+        Transition Isolating_exp = net.addTransition("Isolating_exp");
         Transition effectiveContact = net.addTransition("effectiveContact");
+        Transition healing_exp1 = net.addTransition("healing_exp1");
+        Transition healing_exp2 = net.addTransition("healing_exp2");
+        Transition infectiousness_erl = net.addTransition("infectiousness_erl");
+        Transition infectiousness_exp = net.addTransition("infectiousness_exp");
         Transition noSymptoms = net.addTransition("noSymptoms");
         Transition symptoms = net.addTransition("symptoms");
-        Transition t0 = net.addTransition("t0");
-        Transition t1 = net.addTransition("t1");
-        Transition t10 = net.addTransition("t10");
-        Transition t11 = net.addTransition("t11");
-        Transition t12 = net.addTransition("t12");
-        Transition t13 = net.addTransition("t13");
-        Transition t14 = net.addTransition("t14");
-        Transition t15 = net.addTransition("t15");
-        Transition t2 = net.addTransition("t2");
-        Transition t3 = net.addTransition("t3");
-        Transition t5 = net.addTransition("t5");
-        Transition t6 = net.addTransition("t6");
-        Transition t7 = net.addTransition("t7");
-        Transition t8 = net.addTransition("t8");
-        Transition t9 = net.addTransition("t9");
+        Transition symptomsonset_erl = net.addTransition("symptomsonset_erl");
+        Transition symptomsonset_exp = net.addTransition("symptomsonset_exp");
 
-        //Generating Connectors
-        net.addPostcondition(symptoms, DevelopingSymptoms);
-        net.addPrecondition(p7, t14);
-        net.addPrecondition(p3, t11);
-        net.addPrecondition(DevelopingSymptoms, t0);
+        // Petri net arcs
+        net.addPrecondition(Infectious, healing_exp1);
+        net.addPostcondition(symptomsonset_erl, _symptomsonset);
+        net.addPostcondition(infectiousness_exp, Infectious);
         net.addPrecondition(Symptomatology, symptoms);
-        net.addPrecondition(p5, t9);
-        net.addPostcondition(t7, p3);
-        net.addPrecondition(Symptomatology, noSymptoms);
-        net.addPrecondition(Infectious, t5);
-        net.addPostcondition(t1, p1);
-        net.addPostcondition(t3, Symptomatic);
-        net.addPostcondition(t6, Healed);
-        net.addPostcondition(t10, p7);
-        net.addPostcondition(t2, Symptomatic);
-        net.addPostcondition(effectiveContact, Symptomatology);
-        net.addPrecondition(Asymptomatic, t5);
-        net.addPostcondition(t13, Infectious);
-        net.addPostcondition(t12, p5);
-        net.addPostcondition(t8, p4);
-        net.addPrecondition(p2, t6);
-        net.addPostcondition(t15, Isolated);
-        net.addPostcondition(t5, p2);
-        net.addPostcondition(t11, p5);
-        net.addPrecondition(Symptomatic, t15);
-        net.addPrecondition(Infected, t8);
-        net.addPrecondition(Infectious, t15);
-        net.addPrecondition(EffectiveContact, effectiveContact);
-        net.addPostcondition(effectiveContact, Infected);
-        net.addPrecondition(p1, t3);
-        net.addPrecondition(Infected, t7);
-        net.addPrecondition(DevelopingSymptoms, t1);
-        net.addPostcondition(t9, p6);
-        net.addPrecondition(p0, t2);
-        net.addPostcondition(t14, Infectious);
-        net.addPostcondition(t0, p0);
-        net.addPrecondition(p4, t12);
-        net.addPrecondition(p5, t10);
-        net.addPrecondition(p6, t13);
+        net.addPostcondition(healing_exp2, Healed);
+        net.addPrecondition(Symptomatic, Isolating_erlang);
+        net.addPrecondition(_healing, healing_exp2);
         net.addPostcondition(noSymptoms, Asymptomatic);
+        net.addPrecondition(Symptomatology, noSymptoms);
+        net.addPostcondition(symptoms, DevelopingSymptoms);
+        net.addPostcondition(effectiveContact, Infected);
+        net.addPrecondition(Infected, infectiousness_erl);
+        net.addPostcondition(Isolating_erlang, _isolating);
+        net.addPostcondition(effectiveContact, Symptomatology);
+        net.addPrecondition(Asymptomatic, healing_exp1);
+        net.addPrecondition(_infectiousness, infectiousness_exp);
+        net.addPrecondition(_isolating, Isolating_exp);
+        net.addPrecondition(DevelopingSymptoms, symptomsonset_erl);
+        net.addPostcondition(symptomsonset_exp, Symptomatic);
+        net.addPrecondition(EffectiveContact, effectiveContact);
+        net.addPostcondition(healing_exp1, _healing);
+        net.addPostcondition(Isolating_exp, Isolated);
+        net.addPrecondition(_symptomsonset, symptomsonset_exp);
+        net.addPostcondition(infectiousness_erl, _infectiousness);
 
-        //Generating Properties
+        // Initial marking and transition features
         marking.setTokens(Asymptomatic, 0);
         marking.setTokens(DevelopingSymptoms, 0);
         marking.setTokens(EffectiveContact, 1);
@@ -134,41 +222,24 @@ public class STPNAnalysis {
         marking.setTokens(Isolated, 0);
         marking.setTokens(Symptomatic, 0);
         marking.setTokens(Symptomatology, 0);
-        marking.setTokens(p0, 0);
-        marking.setTokens(p1, 0);
-        marking.setTokens(p2, 0);
-        marking.setTokens(p3, 0);
-        marking.setTokens(p4, 0);
-        marking.setTokens(p5, 0);
-        marking.setTokens(p6, 0);
-        marking.setTokens(p7, 0);
+        marking.setTokens(_healing, 0);
+        marking.setTokens(_infectiousness, 0);
+        marking.setTokens(_isolating, 0);
+        marking.setTokens(_symptomsonset, 0);
+        Isolating_erlang.addFeature(StochasticTransitionFeature.newErlangInstance(3, new BigDecimal("0.0336325")));
+        Isolating_exp.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.016447083", net)));
         effectiveContact.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("1", net)));
         effectiveContact.addFeature(new Priority(0));
-        noSymptoms.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.35", net)));
+        healing_exp1.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.0055816667", net)));
+        healing_exp2.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.01115625", net)));
+        infectiousness_erl.addFeature(StochasticTransitionFeature.newErlangInstance(2, new BigDecimal("0.060879")));
+        infectiousness_exp.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.02051375", net)));
+        noSymptoms.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.351", net)));
         noSymptoms.addFeature(new Priority(0));
-        symptoms.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.65", net)));
+        symptoms.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.649", net)));
         symptoms.addFeature(new Priority(0));
-        t0.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.81", net)));
-        t0.addFeature(new Priority(0));
-        t1.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.19", net)));
-        t1.addFeature(new Priority(0));
-        t10.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.11", net)));
-        t10.addFeature(new Priority(0));
-        t11.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.6958 / 24", net)));
-        t12.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.1626 / 24", net)));
-        t13.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("1.357/24", net)));
-        t14.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.170/24", net)));
-        t15.addFeature(StochasticTransitionFeature.newUniformInstance(new BigDecimal("0"), new BigDecimal("24")));
-        t2.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.6958 / 24", net)));
-        t3.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.1626 / 24", net)));
-        t5.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("1/(10.68 * 24)", net)));
-        t6.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("1/(1.27 * 24)", net)));
-        t7.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.81", net)));
-        t7.addFeature(new Priority(0));
-        t8.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.19", net)));
-        t8.addFeature(new Priority(0));
-        t9.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.89", net)));
-        t9.addFeature(new Priority(0));
+        symptomsonset_erl.addFeature(StochasticTransitionFeature.newErlangInstance(2, new BigDecimal("0.02255375")));
+        symptomsonset_exp.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.01341875", net)));
 
         // Run analysis
         TreeTransient analysis = TreeTransient.builder()
@@ -178,14 +249,10 @@ public class STPNAnalysis {
 
         TransientSolution<Marking, Marking> result = analysis.compute(net, marking);
 
-        var rewardRates = TransientSolution.rewardRates("Infectious");
+        var rewardRates = TransientSolution.rewardRates("Infectious==1 && Isolated==0");
         var rewardedSolution = TransientSolution.computeRewards(false, result, rewardRates);
 
         return (TransientSolution<R, S>) rewardedSolution;
-
-
-
-
     }
 
 
@@ -216,78 +283,489 @@ public class STPNAnalysis {
         map.putAll(filledMap);
     }
 
+    private static double clamp01(double value) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            return 0.0;
+        }
+        return Math.max(0.0, Math.min(1.0, value));
+    }
+
+    private static CurveScenario activeCurveScenario() {
+        if (ACTIVE_OBSERVATION_CURVE_SCENARIO.equals("lower")) {
+            return LOWER_CURVE_SCENARIO;
+        }
+        if (ACTIVE_OBSERVATION_CURVE_SCENARIO.equals("mid")) {
+            return MID_CURVE_SCENARIO;
+        }
+        if (ACTIVE_OBSERVATION_CURVE_SCENARIO.equals("upper")) {
+            return UPPER_CURVE_SCENARIO;
+        }
+        throw new IllegalArgumentException("Unknown observation curve scenario: " + ACTIVE_OBSERVATION_CURVE_SCENARIO);
+    }
+
+    private static boolean hasObservationCurveOffset(ObservationCurves curves, int offset) {
+        return offset >= 0 && offset < curves.length();
+    }
+
+    private static double computeKernelValue(
+            HashMap<Integer, Double> stpnSolutionMap,
+            int offset,
+            Integer firstPositiveTestOffset,
+            double[] psiSurvival
+    ) {
+        if (firstPositiveTestOffset == null || offset < firstPositiveTestOffset) {
+            return stpnSolutionMap.getOrDefault(offset, 0.0);
+        }
+
+        int elapsedOffsetSincePositiveTest = offset - firstPositiveTestOffset;
+        if (elapsedOffsetSincePositiveTest >= psiSurvival.length) {
+            return 0.0;
+        }
+        return psiSurvival[elapsedOffsetSincePositiveTest];
+    }
+
+    private static ObservationCurves loadOrCreateObservationCurves(float timeStepHours) throws IOException {
+        CurveScenario scenario = activeCurveScenario();
+        int horizonSteps = observationCurveHorizonSteps(timeStepHours);
+        Path cachePath = observationCurveCachePath(scenario, timeStepHours);
+        ObservationCurves curves = loadObservationCurves(cachePath, scenario, timeStepHours, horizonSteps);
+        if (curves != null) {
+            System.out.println("Loaded observation curves from " + cachePath);
+            return curves;
+        }
+
+        System.out.println("Observation curve cache not found or stale. Computing " + scenario.name + " curves...");
+        curves = computeObservationCurves(scenario, timeStepHours, horizonSteps);
+        writeObservationCurves(cachePath, scenario, timeStepHours, curves);
+        System.out.println("Observation curves saved to " + cachePath);
+        return curves;
+    }
+
+    private static int observationCurveHorizonSteps(float timeStepHours) {
+        return (int) Math.ceil(OBSERVATION_CURVE_TIME_LIMIT_DAYS * 24.0 / (double) timeStepHours);
+    }
+
+    private static String timeStepLabel(float timeStepHours) {
+        String label = String.format(Locale.US, "%.6f", (double) timeStepHours);
+        while (label.contains(".") && label.endsWith("0")) {
+            label = label.substring(0, label.length() - 1);
+        }
+        if (label.endsWith(".")) {
+            label = label.substring(0, label.length() - 1);
+        }
+        return label.replace("-", "m").replace(".", "p");
+    }
+
+    private static Path observationCurveCachePath(CurveScenario scenario, float timeStepHours) {
+        return Path.of("observation_curves_" + scenario.name + "_step" + timeStepLabel(timeStepHours) + ".csv");
+    }
+
+    private static ObservationCurves loadObservationCurves(
+            Path cachePath,
+            CurveScenario scenario,
+            float timeStepHours,
+            int horizonSteps
+    ) {
+        if (!Files.exists(cachePath)) {
+            return null;
+        }
+
+        HashMap<String, String> metadata = new HashMap<>();
+        double[] phi = new double[horizonSteps];
+        double[] theta = new double[horizonSteps];
+        double[] psiSurvival = new double[horizonSteps];
+        int loadedRows = 0;
+        boolean foundHeader = false;
+
+        try (BufferedReader reader = Files.newBufferedReader(cachePath)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) {
+                    continue;
+                }
+                if (line.startsWith("#")) {
+                    String payload = line.substring(1).trim();
+                    int separator = payload.indexOf('=');
+                    if (separator > 0) {
+                        metadata.put(payload.substring(0, separator).trim(), payload.substring(separator + 1).trim());
+                    }
+                    continue;
+                }
+                if (!foundHeader) {
+                    if (!line.equals("index,phi,theta,psi_survival")) {
+                        return null;
+                    }
+                    foundHeader = true;
+                    continue;
+                }
+
+                String[] parts = line.split(",");
+                if (parts.length != 4) {
+                    return null;
+                }
+                int index = Integer.parseInt(parts[0]);
+                if (index < 0 || index >= horizonSteps) {
+                    return null;
+                }
+                phi[index] = Double.parseDouble(parts[1]);
+                theta[index] = Double.parseDouble(parts[2]);
+                psiSurvival[index] = Double.parseDouble(parts[3]);
+                loadedRows++;
+            }
+        } catch (IOException | NumberFormatException e) {
+            return null;
+        }
+
+        if (!foundHeader || loadedRows != horizonSteps) {
+            return null;
+        }
+        if (!String.valueOf(OBSERVATION_CURVE_CACHE_VERSION).equals(metadata.get("version"))) {
+            return null;
+        }
+        if (!scenario.name.equals(metadata.get("scenario"))) {
+            return null;
+        }
+        if (!scenario.signature().equals(metadata.get("parameter_signature"))) {
+            return null;
+        }
+        if (!String.valueOf(horizonSteps).equals(metadata.get("horizon_steps"))) {
+            return null;
+        }
+        try {
+            double cachedTimeStepHours = Double.parseDouble(metadata.getOrDefault("time_step_hours", "NaN"));
+            if (Math.abs(cachedTimeStepHours - (double) timeStepHours) > 1e-9) {
+                return null;
+            }
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        return new ObservationCurves(phi, theta, psiSurvival);
+    }
+
+    private static void writeObservationCurves(
+            Path cachePath,
+            CurveScenario scenario,
+            float timeStepHours,
+            ObservationCurves curves
+    ) throws IOException {
+        try (BufferedWriter writer = Files.newBufferedWriter(cachePath)) {
+            writer.write("# version=" + OBSERVATION_CURVE_CACHE_VERSION);
+            writer.newLine();
+            writer.write("# scenario=" + scenario.name);
+            writer.newLine();
+            writer.write("# parameter_signature=" + scenario.signature());
+            writer.newLine();
+            writer.write(String.format(Locale.US, "# time_step_hours=%.12f%n", (double) timeStepHours));
+            writer.write("# horizon_steps=" + curves.length());
+            writer.newLine();
+            writer.write("# curve_time_limit_days=" + OBSERVATION_CURVE_TIME_LIMIT_DAYS);
+            writer.newLine();
+            writer.write(String.format(Locale.US, "# base_dt_days=%.12f%n", OBSERVATION_CURVE_BASE_DT_DAYS));
+            writer.write("index,phi,theta,psi_survival");
+            writer.newLine();
+
+            for (int i = 0; i < curves.length(); i++) {
+                writer.write(String.format(
+                        Locale.US,
+                        "%d,%.17g,%.17g,%.17g%n",
+                        i,
+                        curves.phi[i],
+                        curves.theta[i],
+                        curves.psiSurvival[i]
+                ));
+            }
+        }
+    }
+
+    private static ObservationCurves computeObservationCurves(
+            CurveScenario scenario,
+            float timeStepHours,
+            int horizonSteps
+    ) {
+        double[] phiBase = computePhiBaseCurve(scenario);
+        double[] thetaBase = computeThetaBaseCurve(scenario);
+        double[] phi = new double[horizonSteps];
+        double[] theta = new double[horizonSteps];
+        double[] psiSurvival = new double[horizonSteps];
+
+        for (int i = 0; i < horizonSteps; i++) {
+            double tDays = i * (double) timeStepHours / 24.0;
+            phi[i] = clamp01(sampleBaseCurve(phiBase, tDays));
+            theta[i] = clamp01(sampleBaseCurve(thetaBase, tDays));
+            psiSurvival[i] = clamp01(
+                    scenario.psiP1 * Math.exp(-scenario.psiL1 * tDays)
+                            + scenario.psiP2 * Math.exp(-scenario.psiL2 * tDays)
+            );
+        }
+
+        return new ObservationCurves(phi, theta, psiSurvival);
+    }
+
+    private static double[] computePhiBaseCurve(CurveScenario scenario) {
+        int baseSamples = baseCurveSamples();
+        double[] onsetPdf = generalizedErlangPdf(scenario.onset, baseSamples);
+        double[] durationPdf = generalizedErlangPdf(scenario.symptomDuration, baseSamples);
+        double[] durationSurvival = new double[baseSamples];
+        double durationCdf = 0.0;
+
+        for (int i = 0; i < baseSamples; i++) {
+            durationCdf += durationPdf[i] * OBSERVATION_CURVE_BASE_DT_DAYS;
+            durationSurvival[i] = clamp01(1.0 - durationCdf);
+        }
+
+        double[] phiConv = convolve(onsetPdf, durationSurvival, baseSamples, OBSERVATION_CURVE_BASE_DT_DAYS);
+        for (int i = 0; i < baseSamples; i++) {
+            phiConv[i] = clamp01(scenario.symptomaticProbability * phiConv[i]);
+        }
+        return phiConv;
+    }
+
+    private static double[] computeThetaBaseCurve(CurveScenario scenario) {
+        int baseSamples = baseCurveSamples();
+        double[] onsetPdf = generalizedErlangPdf(scenario.onset, baseSamples);
+        double[] positiveSinceSymptomOnset = new double[baseSamples];
+
+        for (int i = 0; i < baseSamples; i++) {
+            double tDays = i * OBSERVATION_CURVE_BASE_DT_DAYS;
+            positiveSinceSymptomOnset[i] = clamp01(
+                    TEST_GAMMA_SCALING * gammaSurvival(TEST_GAMMA_SHAPE, TEST_GAMMA_SCALE, tDays)
+            );
+        }
+
+        double[] thetaConv = convolve(onsetPdf, positiveSinceSymptomOnset, baseSamples, OBSERVATION_CURVE_BASE_DT_DAYS);
+        for (int i = 0; i < baseSamples; i++) {
+            thetaConv[i] = clamp01(thetaConv[i]);
+        }
+        return thetaConv;
+    }
+
+    private static int baseCurveSamples() {
+        return (int) Math.ceil(OBSERVATION_CURVE_TIME_LIMIT_DAYS / OBSERVATION_CURVE_BASE_DT_DAYS);
+    }
+
+    private static double[] generalizedErlangPdf(ErlangExponentialParams params, int samples) {
+        double[] erlangPdf = new double[samples];
+        double[] exponentialPdf = new double[samples];
+        for (int i = 0; i < samples; i++) {
+            double tDays = i * OBSERVATION_CURVE_BASE_DT_DAYS;
+            erlangPdf[i] = erlangPdf(tDays, params.erlangStages, params.erlangRate);
+            exponentialPdf[i] = exponentialPdf(tDays, params.exponentialRate);
+        }
+        return convolve(erlangPdf, exponentialPdf, samples, OBSERVATION_CURVE_BASE_DT_DAYS);
+    }
+
+    private static double erlangPdf(double t, int stages, double rate) {
+        if (t < 0.0 || stages <= 0 || rate <= 0.0) {
+            return 0.0;
+        }
+        if (t == 0.0) {
+            return stages == 1 ? rate : 0.0;
+        }
+        double logPdf = stages * Math.log(rate) + (stages - 1) * Math.log(t) - rate * t - logFactorial(stages - 1);
+        return Math.exp(logPdf);
+    }
+
+    private static double exponentialPdf(double t, double rate) {
+        if (t < 0.0 || rate <= 0.0) {
+            return 0.0;
+        }
+        return rate * Math.exp(-rate * t);
+    }
+
+    private static double logFactorial(int n) {
+        double result = 0.0;
+        for (int i = 2; i <= n; i++) {
+            result += Math.log(i);
+        }
+        return result;
+    }
+
+    private static double[] convolve(double[] a, double[] b, int length, double dt) {
+        double[] result = new double[length];
+        for (int i = 0; i < length; i++) {
+            double sum = 0.0;
+            for (int j = 0; j <= i; j++) {
+                sum += a[j] * b[i - j];
+            }
+            result[i] = sum * dt;
+        }
+        return result;
+    }
+
+    private static double sampleBaseCurve(double[] curve, double tDays) {
+        if (tDays < 0.0) {
+            return 0.0;
+        }
+        double position = tDays / OBSERVATION_CURVE_BASE_DT_DAYS;
+        int lowerIndex = (int) Math.floor(position);
+        if (lowerIndex < 0) {
+            return 0.0;
+        }
+        if (lowerIndex >= curve.length - 1) {
+            return lowerIndex == curve.length - 1 ? curve[lowerIndex] : 0.0;
+        }
+        double fraction = position - lowerIndex;
+        return curve[lowerIndex] * (1.0 - fraction) + curve[lowerIndex + 1] * fraction;
+    }
+
+    private static double gammaSurvival(double shape, double scale, double t) {
+        if (t <= 0.0) {
+            return 1.0;
+        }
+        return regularizedGammaQ(shape, t / scale);
+    }
+
+    private static double regularizedGammaQ(double a, double x) {
+        if (a <= 0.0 || x < 0.0) {
+            return Double.NaN;
+        }
+        if (x == 0.0) {
+            return 1.0;
+        }
+        if (x < a + 1.0) {
+            return 1.0 - regularizedGammaPSeries(a, x);
+        }
+        return regularizedGammaQContinuedFraction(a, x);
+    }
+
+    private static double regularizedGammaPSeries(double a, double x) {
+        final int maxIterations = 10000;
+        final double epsilon = 1e-14;
+        double sum = 1.0 / a;
+        double term = sum;
+
+        for (int n = 1; n <= maxIterations; n++) {
+            term *= x / (a + n);
+            sum += term;
+            if (Math.abs(term) < Math.abs(sum) * epsilon) {
+                double logTerm = -x + a * Math.log(x) - logGamma(a);
+                return clamp01(sum * Math.exp(logTerm));
+            }
+        }
+        double logTerm = -x + a * Math.log(x) - logGamma(a);
+        return clamp01(sum * Math.exp(logTerm));
+    }
+
+    private static double regularizedGammaQContinuedFraction(double a, double x) {
+        final int maxIterations = 10000;
+        final double epsilon = 1e-14;
+        final double fpMin = 1e-300;
+        double b = x + 1.0 - a;
+        double c = 1.0 / fpMin;
+        double d = 1.0 / Math.max(b, fpMin);
+        double h = d;
+
+        for (int i = 1; i <= maxIterations; i++) {
+            double an = -i * (i - a);
+            b += 2.0;
+            d = an * d + b;
+            if (Math.abs(d) < fpMin) {
+                d = fpMin;
+            }
+            c = b + an / c;
+            if (Math.abs(c) < fpMin) {
+                c = fpMin;
+            }
+            d = 1.0 / d;
+            double delta = d * c;
+            h *= delta;
+            if (Math.abs(delta - 1.0) < epsilon) {
+                break;
+            }
+        }
+
+        double logTerm = -x + a * Math.log(x) - logGamma(a);
+        return clamp01(Math.exp(logTerm) * h);
+    }
+
+    private static double logGamma(double x) {
+        double[] coefficients = {
+                676.5203681218851,
+                -1259.1392167224028,
+                771.32342877765313,
+                -176.61502916214059,
+                12.507343278686905,
+                -0.13857109526572012,
+                9.9843695780195716e-6,
+                1.5056327351493116e-7
+        };
+
+        if (x < 0.5) {
+            return Math.log(Math.PI) - Math.log(Math.sin(Math.PI * x)) - logGamma(1.0 - x);
+        }
+
+        x -= 1.0;
+        double sum = 0.99999999999980993;
+        for (int i = 0; i < coefficients.length; i++) {
+            sum += coefficients[i] / (x + i + 1.0);
+        }
+        double t = x + coefficients.length - 0.5;
+        return 0.5 * Math.log(2.0 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(sum);
+    }
+
+    private static HashMap<String, ArrayList<Event>> indexEventsBySubject(Collection<Event> events) {
+        HashMap<String, ArrayList<Event>> eventsBySubject = new HashMap<>();
+        for (Event event : events) {
+            for (String subject : event.involvedSubjects) {
+                eventsBySubject
+                        .computeIfAbsent(subject, ignored -> new ArrayList<>())
+                        .add(event);
+            }
+        }
+        return eventsBySubject;
+    }
+
+    private static String getArgValue(String[] args, String name) {
+        for (int i = 0; i < args.length - 1; i++) {
+            if (args[i].equals(name)) {
+                return args[i + 1];
+            }
+        }
+        return null;
+    }
+
     public static void main(String[] args) throws Exception {
-        float time_step = 0.1f;
+        float time_step = 1.0f;
+        String timeStepArg = getArgValue(args, "--time-step");
+        if (timeStepArg != null) {
+            time_step = Float.parseFloat(timeStepArg);
+            if (time_step <= 0.0f) {
+                throw new IllegalArgumentException("time_step must be greater than 0");
+            }
+        }
+        String stpnSolutionPath = getArgValue(args, "--stpn-solution-path");
+        if (stpnSolutionPath == null || stpnSolutionPath.isBlank()) {
+            stpnSolutionPath = "stpn_solution.csv";
+        }
+        boolean precomputeOnly = Arrays.asList(args).contains("--precompute-only");
 
 
-        List<String> jsonFiles = new ArrayList<>();
-
-
+        LinkedHashSet<String> discoveredJsonFiles = new LinkedHashSet<>();
         Path startPath = Path.of(".");
         // Recursively search this folder and subfolders for files ending with "simulated.json"
         try (java.util.stream.Stream<Path> walk = Files.walk(startPath)) {
             walk.filter(Files::isRegularFile)
                 .filter(p -> p.toString().endsWith("simulated.json"))
-                .forEach(p -> {
-                    String fp = p.toString();
-                    if (!jsonFiles.contains(fp)) jsonFiles.add(fp);
-                });
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(startPath)) {
-            for (Path entry : stream) {
-                if (Files.isRegularFile(entry) && entry.toString().endsWith("simulated.json")) {
-                    jsonFiles.add(entry.toString());
-                }
-            }
+                .map(Path::toString)
+                .forEach(discoveredJsonFiles::add);
         } catch (IOException e) {
             e.printStackTrace();
         }
 
+        List<String> jsonFiles = new ArrayList<>(discoveredJsonFiles);
         jsonFiles.forEach(System.out::println);
-        HashMap<Double, Double> phi = new HashMap<>(); // curve of relevance of symptoms
-        // the key is in DAYS * 24 (hours)
-        phi.put(0.0, 0.0);
-        phi.put(2.5 * (int)(Math.round(24.0 / time_step)), 0.65 * 0.75);
-        phi.put(4.0 * (int)(Math.round(24.0 / time_step)), 0.65 * 0.95);
-        phi.put(10.0 * (int)(Math.round(24.0 / time_step)), 0.65 * 0.75);
-        phi.put(15.0 * (int)(Math.round(24.0 / time_step)), 0.65 * 0.5);
-        phi.put(20.0 * (int)(Math.round(24.0 / time_step)), 0.65 * 0.25);
-        phi.put(25.0 * (int)(Math.round(24.0 / time_step)), 0.65 * 0.125);
-        phi.put(30.0 * (int)(Math.round(24.0 / time_step)), 0.65 * 0.0625);
-        phi.put(35.0 * (int)(Math.round(24.0 / time_step)), 0.0);
-        // fill
-        fillWithGranularity(phi);
-
-        HashMap<Double, Double> theta = new HashMap<>(); // curve of relevance of tests
-        // the key is in DAYS * 24 (hours)
-        theta.put(0.0, 0.0);
-        theta.put(2.5 * (int)(Math.round(24.0 / time_step)), 0.75);
-        theta.put(4.0 * (int)(Math.round(24.0 / time_step)), 0.95);
-        theta.put(14.0 * (int)(Math.round(24.0 / time_step)), 0.75);
-        theta.put(19.0 * (int)(Math.round(24.0 / time_step)), 0.5);
-        theta.put(24.0 * (int)(Math.round(24.0 / time_step)), 0.25);
-        theta.put(29.0 * (int)(Math.round(24.0 / time_step)), 0.125);
-        theta.put(34.0 * (int)(Math.round(24.0 / time_step)), 0.0625);
-        theta.put(35.0 * (int)(Math.round(24.0 / time_step)), 0.0);
-        // fill
-        fillWithGranularity(theta);
-        ArrayList<double[]> priorsCombinations = new ArrayList<>();
-        priorsCombinations.add(new double[]{0.5, 0.5, 0.5});
-
+        ObservationCurves observationCurves = loadOrCreateObservationCurves(time_step);
         int time_limit = 84;
+        int curve_time_limit = 63;
 
         HashMap<Integer, Double> stpnSolutionMap = new HashMap<>();
-        File stpnCsvFile = new File("stpn_solution.csv");
-
-// Check if the solution file already exists.
+        File stpnCsvFile = new File(stpnSolutionPath);
         if (!stpnCsvFile.exists()) {
-            // --- 1. File NOT found: Generate, Save, and Populate Map ---
-            System.out.println("stpn_solution.csv not found. Generating new solution...");
+            System.out.println(stpnCsvFile.getName() + " not found. Generating new solution...");
 
-            // Generate the solution by running the STPN analysis.
-            TransientSolution<Integer, Double> solution = buildModel(time_limit * 24, time_step);
+            int curveSamples = Math.round((curve_time_limit * 24.0f) / time_step);
+            TransientSolution<Integer, Double> solution = buildModel(curveSamples, time_step);
 
             try (FileWriter writer = new FileWriter(stpnCsvFile)) {
                 writer.append("Time,State,Value\n"); // CSV Header
@@ -305,8 +783,7 @@ public class STPNAnalysis {
                 e.printStackTrace();
             }
         } else {
-            // --- 2. File FOUND: Load from CSV into the Map ---
-            System.out.println("Loading existing solution from stpn_solution.csv...");
+            System.out.println("Loading existing solution from " + stpnCsvFile.getName() + "...");
             try (BufferedReader reader = new BufferedReader(new FileReader(stpnCsvFile))) {
                 String line;
                 reader.readLine(); // Skip header row
@@ -331,7 +808,11 @@ public class STPNAnalysis {
             }
         }
 
-        List<Long> timesList = new ArrayList<>();
+        if (precomputeOnly) {
+            return;
+        }
+
+        long coreAnalysisStartedAt = System.nanoTime();
         for (int repetition = 0; repetition < 1; repetition++) {
             for (int documentId = 0; documentId < jsonFiles.size(); documentId++) {
                 int n_iterations = 3;
@@ -341,8 +822,7 @@ public class STPNAnalysis {
                 JsonObject jsonObject = JsonFileReader.readJsonFromFile(filePath);
                 int n_subjects = 0;
 
-                Queue<Event> events = new LinkedList<>();
-                Random random = new Random();
+                List<Event> events = new ArrayList<>();
                 if (jsonObject != null) {
                     n_subjects = jsonObject.get("n_subjects").getAsInt();
                     time_limit = jsonObject.get("time_limit").getAsInt();
@@ -356,7 +836,7 @@ public class STPNAnalysis {
                         Boolean result = event.has("result") && !event.get("result").isJsonNull() ? event.get("result").getAsBoolean() : null;
                         events.add(new Event(event.get("type").getAsString(),
                                 involved_subjects,
-                                event.get("time").getAsInt(),
+                                event.get("time").getAsDouble(),
                                 riskFactor,
                                 result));
                     }
@@ -373,25 +853,29 @@ public class STPNAnalysis {
 
 
                 if (n_iterations > n_subjects || n_iterations <= 0) throw new AssertionError();
-                HashMap<Integer, Tracks> tracks_record = new HashMap<>();
+                Tracks[] tracksRecord = new Tracks[n_iterations];
 
                 // Here we iterate over the symptoms and tests to gather that information
                 ArrayList<Event> symptomsAndTests = new ArrayList<>();
                 for (Event event : events) {
-                    if (((event.type.equals("Symptoms") && event.result.equals(true)) || event.type.equals("Test")) && event.time < time_limit) { // we assume that the symptoms are only for the subject involved in the external contact
+                    if (((event.type.equals("Symptoms") && Boolean.TRUE.equals(event.result)) || event.type.equals("Test")) && event.time < time_limit) { // we assume that the symptoms are only for the subject involved in the external contact
                         symptomsAndTests.add(event);
                     }
                 }
-
+                HashMap<String, ArrayList<Event>> symptomsAndTestsBySubject = indexEventsBySubject(symptomsAndTests);
+                System.out.println("Time horizon: " + time_horizon + ", Time step: " + time_step + ", Curve time limit: " + curve_time_limit);
                 for (int current_iteration = 0; current_iteration < n_iterations; current_iteration++) {
                     HashMap<String, double[]> probabilityOfNotBeingInfectedDueToPreviousContact = new HashMap<>();
                     for (int i = 0; i < n_subjects; i++) {
                         probabilityOfNotBeingInfectedDueToPreviousContact.put(String.valueOf(i + 1), new double[time_horizon]);
                         Arrays.fill(probabilityOfNotBeingInfectedDueToPreviousContact.get(String.valueOf(i + 1)), 1.0);
                     }
-                    tracks_record.put(current_iteration, new Tracks(names, time_horizon));
+                    Tracks currentTracks = new Tracks(names, time_horizon);
+                    tracksRecord[current_iteration] = currentTracks;
+                    Tracks previousTracks = current_iteration > 0 ? tracksRecord[current_iteration - 1] : null;
+
                     for (Event event : events) {
-                        int eventTime = Math.round(event.time / time_step); // this is the event time scaled by the time step
+                        int eventTime = (int) Math.round(event.time / time_step); // this is the event time scaled by the time step
                         if (eventTime >= time_horizon) {
                             continue;
                         }
@@ -405,26 +889,33 @@ public class STPNAnalysis {
                             double Pw_h_given_e_s_k_is_effective = 1.0;
                             double prior = 1.0;
 
-                            for (Event entry : symptomsAndTests) {
-                                if (!entry.involvedSubjects[0].equals(involvedSubject) || entry.time < event.time) {
-                                    continue;
-                                }
+                            Integer firstPositiveTestOffset = null;
+                            ArrayList<Event> subjectSymptomsAndTests = symptomsAndTestsBySubject.get(involvedSubject);
+                            if (subjectSymptomsAndTests != null) {
+                                for (Event entry : subjectSymptomsAndTests) {
+                                    if (entry.time < event.time) {
+                                        continue;
+                                    }
 
-                                double desiredKey = Math.round((entry.time - event.time) / time_step);
-                                if (desiredKey < 0.0 || !phi.containsKey(desiredKey)) {
-                                    continue;
-                                }
+                                    int curveOffset = (int) Math.round((entry.time - event.time) / time_step);
+                                    if (!hasObservationCurveOffset(observationCurves, curveOffset)) {
+                                        continue;
+                                    }
 
-                                if (entry.type.equals("Symptoms") && entry.result.equals(true)) {
-                                    Pw_h_given_e_s_k_is_effective *= phi.get(desiredKey);
-                                    prior *= priorsValues[0];
-                                } else if (entry.type.equals("Test")) {
-                                    if (entry.result) {
-                                        Pw_h_given_e_s_k_is_effective *= theta.get(desiredKey);
-                                        prior *= priorsValues[1];
-                                    } else {
-                                        Pw_h_given_e_s_k_is_effective *= (1.0 - theta.get(desiredKey));
-                                        prior *= priorsValues[2];
+                                    if (entry.type.equals("Symptoms") && Boolean.TRUE.equals(entry.result)) {
+                                        Pw_h_given_e_s_k_is_effective *= observationCurves.phi[curveOffset];
+                                        prior *= priorsValues[0];
+                                    } else if (entry.type.equals("Test")) {
+                                        if (entry.result) {
+                                            Pw_h_given_e_s_k_is_effective *= observationCurves.theta[curveOffset];
+                                            prior *= priorsValues[1];
+                                            if (firstPositiveTestOffset == null || curveOffset < firstPositiveTestOffset) {
+                                                firstPositiveTestOffset = curveOffset;
+                                            }
+                                        } else {
+                                            Pw_h_given_e_s_k_is_effective *= (1.0 - observationCurves.theta[curveOffset]);
+                                            prior *= priorsValues[2];
+                                        }
                                     }
                                 }
                             }
@@ -432,13 +923,26 @@ public class STPNAnalysis {
 
                             int offset_external = 0;
                             while (eventTime + offset_external < time_horizon) {
-                                double previousValue = tracks_record.get(current_iteration).getSample(involvedSubject, eventTime + offset_external);
+                                int sampleTime = eventTime + offset_external;
 
-                                // Use the pre-calculated r_ext here
-                                double newValue = stpnSolutionMap.get(offset_external) * r_ext * probabilityOfNotBeingInfectedDueToPreviousContact.get(involvedSubject)[eventTime + offset_external] + previousValue;
+                                double[] probabilityTrack = probabilityOfNotBeingInfectedDueToPreviousContact.get(involvedSubject);
+                                double[] currentTrack = currentTracks.getTrack(involvedSubject);
+                                double previousValue = currentTrack[sampleTime];
 
-                                probabilityOfNotBeingInfectedDueToPreviousContact.get(involvedSubject)[eventTime + offset_external] *= (1.0 - r_ext);
-                                tracks_record.get(current_iteration).editTrack(involvedSubject, eventTime + offset_external, newValue);
+                                double stpn_value;
+                                // After the first positive test, the kernel follows the
+                                // survival curve of the time from positive test to isolation.
+                                stpn_value = computeKernelValue(
+                                        stpnSolutionMap,
+                                        offset_external,
+                                        firstPositiveTestOffset,
+                                        observationCurves.psiSurvival
+                                );
+
+                                double newValue = stpn_value * r_ext * probabilityTrack[sampleTime] + previousValue;
+
+                                probabilityTrack[sampleTime] *= (1.0 - r_ext);
+                                currentTrack[sampleTime] = newValue;
                                 offset_external++;
                             }
                         } else if (current_iteration > 0 && event.type.equals("Internal")) {
@@ -447,43 +951,53 @@ public class STPNAnalysis {
                             String secondHighestRiskSubject = null;
                             double secondHighestRisk = 0.0;
                             for (String subject : involvedSubjects) { // get the highest risk subject
-                                if (tracks_record.get(current_iteration - 1).getSample(subject, eventTime) > highestRisk) {
-                                    highestRisk = tracks_record.get(current_iteration - 1).getSample(subject, eventTime);
+                                double subjectRisk = previousTracks.getSample(subject, eventTime);
+                                if (subjectRisk > highestRisk) {
+                                    highestRisk = subjectRisk;
                                     highestRiskSubject = subject;
                                 }
                             }
                             for (String subject : involvedSubjects) { // get the second highest risk subject. This is used to update ~P for the highest risk subject
-                                if (tracks_record.get(current_iteration - 1).getSample(subject, eventTime) > secondHighestRisk && tracks_record.get(current_iteration - 1).getSample(subject, eventTime) < highestRisk) {
-                                    secondHighestRisk = tracks_record.get(current_iteration - 1).getSample(subject, eventTime);
+                                double subjectRisk = previousTracks.getSample(subject, eventTime);
+                                if (subjectRisk > secondHighestRisk && subjectRisk < highestRisk) {
+                                    secondHighestRisk = subjectRisk;
                                     secondHighestRiskSubject = subject;
                                 }
                             }
                             double riskFactor_internal = event.riskFactor;
-
                             HashMap<String, Double> r_int_map = new HashMap<>();
+                            HashMap<String, Integer> firstPositiveTestOffsetMap = new HashMap<>();
                             for (String subject : involvedSubjects) {
                                 double Pw_h_given_e_s_k_is_effective = 1.0;
                                 double prior = 1.0;
+                                firstPositiveTestOffsetMap.put(subject, null);
 
-                                for (Event entry : symptomsAndTests) {
-                                    if (!entry.involvedSubjects[0].equals(subject) || entry.time < event.time) {
-                                        continue;
-                                    }
-                                    double desiredKey = Math.round((entry.time - event.time) / time_step);
-                                    if (desiredKey < 0.0 || !phi.containsKey(desiredKey)) {
-                                        continue;
-                                    }
+                                ArrayList<Event> subjectSymptomsAndTests = symptomsAndTestsBySubject.get(subject);
+                                if (subjectSymptomsAndTests != null) {
+                                    for (Event entry : subjectSymptomsAndTests) {
+                                        if (entry.time < event.time) {
+                                            continue;
+                                        }
+                                        int curveOffset = (int) Math.round((entry.time - event.time) / time_step);
+                                        if (!hasObservationCurveOffset(observationCurves, curveOffset)) {
+                                            continue;
+                                        }
 
-                                    if (entry.type.equals("Symptoms") && entry.result.equals(true)) {
-                                        Pw_h_given_e_s_k_is_effective *= phi.get(desiredKey);
-                                        prior *= priorsValues[0];
-                                    } else if (entry.type.equals("Test")) {
-                                        if (entry.result) {
-                                            Pw_h_given_e_s_k_is_effective *= theta.get(desiredKey);
-                                            prior *= priorsValues[1];
-                                        } else {
-                                            Pw_h_given_e_s_k_is_effective *= (1.0 - theta.get(desiredKey));
-                                            prior *= priorsValues[2];
+                                        if (entry.type.equals("Symptoms") && Boolean.TRUE.equals(entry.result)) {
+                                            Pw_h_given_e_s_k_is_effective *= observationCurves.phi[curveOffset];
+                                            prior *= priorsValues[0];
+                                        } else if (entry.type.equals("Test")) {
+                                            if (entry.result) {
+                                                Pw_h_given_e_s_k_is_effective *= observationCurves.theta[curveOffset];
+                                                prior *= priorsValues[1];
+                                                Integer currentPositiveTestOffset = firstPositiveTestOffsetMap.get(subject);
+                                                if (currentPositiveTestOffset == null || curveOffset < currentPositiveTestOffset) {
+                                                    firstPositiveTestOffsetMap.put(subject, curveOffset);
+                                                }
+                                            } else {
+                                                Pw_h_given_e_s_k_is_effective *= (1.0 - observationCurves.theta[curveOffset]);
+                                                prior *= priorsValues[2];
+                                            }
                                         }
                                     }
                                 }
@@ -493,17 +1007,27 @@ public class STPNAnalysis {
                             int offset_internal = 0;
                             while (eventTime + offset_internal < time_horizon) {
                                 for (String subject : involvedSubjects) {
-                                    double previousValue = tracks_record.get(current_iteration).getSample(subject, eventTime + offset_internal);
+                                    int sampleTime = eventTime + offset_internal;
+
+                                    double[] probabilityTrack = probabilityOfNotBeingInfectedDueToPreviousContact.get(subject);
+                                    double[] currentTrack = currentTracks.getTrack(subject);
+                                    double previousValue = currentTrack[sampleTime];
                                     double q = subject.equals(highestRiskSubject) ? secondHighestRisk : highestRisk;
 
                                     // Retrieve the pre-calculated r_int
                                     double r_int = r_int_map.get(subject);
 
-                                    double solutionValue = stpnSolutionMap.getOrDefault(offset_internal, 0.0);
-                                    double newValue = r_int * q * solutionValue * probabilityOfNotBeingInfectedDueToPreviousContact.get(subject)[eventTime + offset_internal] + previousValue;
+                                    double solutionValue = computeKernelValue(
+                                            stpnSolutionMap,
+                                            offset_internal,
+                                            firstPositiveTestOffsetMap.get(subject),
+                                            observationCurves.psiSurvival
+                                    );
 
-                                    probabilityOfNotBeingInfectedDueToPreviousContact.get(subject)[eventTime + offset_internal] *= (1.0 - q);
-                                    tracks_record.get(current_iteration).editTrack(subject, eventTime + offset_internal, newValue);
+                                    double newValue = r_int * q * solutionValue * probabilityTrack[sampleTime] + previousValue;
+
+                                    probabilityTrack[sampleTime] *= (1.0 - (r_int * q));
+                                    currentTrack[sampleTime] = newValue;
                                 }
                                 offset_internal++;
                             }
@@ -515,12 +1039,18 @@ public class STPNAnalysis {
 
                 Tracks tracks = new Tracks(names, time_horizon);
                 for (int i = 0; i < n_subjects; i++) {
+                    String subjectName = String.valueOf(i + 1);
+                    double[] aggregateTrack = tracks.getTrack(subjectName);
+                    double[][] iterationTracks = new double[n_iterations][];
+                    for (int k = 0; k < n_iterations; k++) {
+                        iterationTracks[k] = tracksRecord[k].getTrack(subjectName);
+                    }
                     for (int j = 0; j < time_horizon; j++) {
                         double sum = 0.0;
                         for (int k = 0; k < n_iterations; k++) {
-                            sum += tracks_record.get(k).getSample(String.valueOf(i + 1), j);
+                            sum += iterationTracks[k][j];
                         }
-                        tracks.editTrack(String.valueOf(i + 1), j, sum);
+                        aggregateTrack[j] = sum;
                     }
                     Path jsonPath = Path.of(filePath);
                     Path parent = jsonPath.getParent();
@@ -536,5 +1066,8 @@ public class STPNAnalysis {
                 }
             }
         }
+
+        double coreAnalysisRuntimeSeconds = (System.nanoTime() - coreAnalysisStartedAt) / 1_000_000_000.0;
+        System.out.printf(Locale.US, "__TIMING__ core_analysis_runtime_seconds=%.9f%n", coreAnalysisRuntimeSeconds);
     }
 }

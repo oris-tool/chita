@@ -20,17 +20,15 @@ package com.chita.analysis;
 public class Event {
     String type;
     String[] involvedSubjects;
-    int time;
+    double time;
     Double riskFactor;
     Boolean result;
 
-    public Event(String type, String[] involvedSubjects, int time, Double riskFactor, Boolean result) {
+    public Event(String type, String[] involvedSubjects, double time, Double riskFactor, Boolean result) {
         this.type = type;
         this.involvedSubjects = involvedSubjects;
         this.time = time;
         this.riskFactor = riskFactor;
         this.result = result;
     }
-
-
 }

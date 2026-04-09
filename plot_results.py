@@ -17,16 +17,10 @@
 
 import json
 import os
-import seaborn as sns
-import numpy as np
 
 import matplotlib.pyplot as plt
-
-import scipy.stats as stats
-
 import metrics as cm
-
-import csv
+import numpy as np
 import pandas as pd
 
 def plot_results(results, title="", xlabel="Timestep", ylabel="Correlation", output_path="./unknown.png"):
@@ -50,8 +44,6 @@ if __name__ == "__main__":
         columns.append(f"top_{i}_precision_moving_avg")
     columns.append("mrr")
     df = pd.DataFrame(columns=columns)
-
-    PRIORS_SUFFIXES = ["0.25,0.25,0.75", "0.5,0.5,0.5", "0.75,0.75,0.25"]
 
     granularity = 0.1 # 6 minutes
 
@@ -90,12 +82,10 @@ if __name__ == "__main__":
             sp_corrs_moving_avg, _ = cm.compute_spearman_correlation_moving_window(gt_data, ana_data, window_size=WINDOWS[0])
             # Plot the results
             plot_results(sp_corrs_moving_avg, title="Spearman's Correlation Moving Average", xlabel="Timestep", ylabel="Correlation", output_path=os.path.join(current_output_plot_dir, "spearmans_correlation_moving_avg.png"))
-            top_n_avg_precisions = {}
             for i in range(1, MAX_TOP_PRECISION + 1):
                 if i > len(gt_data):
                     break
                 precisions = cm.compute_top_n_precision(gt_data, ana_data, i)
-                top_n_avg_precisions[i] = precisions
                 # Plot the results
                 plot_results(precisions, title=f"Top {i} Precision", xlabel="Timestep", ylabel="Precision", output_path=os.path.join(current_output_plot_dir, f"top_{i}_precision.png"))
             for i in range(1, MAX_TOP_PRECISION + 1):
@@ -143,12 +133,10 @@ if __name__ == "__main__":
             sp_corrs_moving_avg, _ = cm.compute_spearman_correlation_moving_window(gt_data, ana_data, window_size=WINDOWS[0])
             # Plot the results
             plot_results(sp_corrs_moving_avg, title="Spearman's Correlation Moving Average", xlabel="Timestep", ylabel="Correlation", output_path=os.path.join(current_output_plot_dir, "spearmans_correlation_moving_avg.png"))
-            top_n_avg_precisions = {} # {1: [], 2: [], 3
             for i in range(1, MAX_TOP_PRECISION + 1):
                 if i > len(gt_data):
                     break
                 precisions = cm.compute_top_n_precision(gt_data, ana_data, i)
-                top_n_avg_precisions[i] = precisions
                 # Plot the results
                 plot_results(precisions, title=f"Top {i} Precision", xlabel="Timestep", ylabel="Precision", output_path=os.path.join(current_output_plot_dir, f"top_{i}_precision.png"))
             for i in range(1, MAX_TOP_PRECISION + 1):

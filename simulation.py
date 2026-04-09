@@ -23,12 +23,63 @@ import numpy as np
 
 from inversion_method import sample_from_hyper_exp, sample_generalized_erlang
 
+
+HEALTHY = 0
+INFECTED = 1
+INFECTIOUS = 2
+HEALED = 3
+ISOLATED = 4
+
+ASYMPTOMATIC = 0
+DEVELOPING_SYMPTOMS = 1
+SYMPTOMATIC = 2
+
+TRACK_HEALTHY = 0
+TRACK_INFECTIOUS = 1
+TRACK_HEALED = 3
+TRACK_ISOLATED = 4
+
+HOURS_PER_DAY = 24.0
+POSITIVE_TEST_ISOLATION_PSI = {
+    "p1": 0.88188,
+    "p2": 0.11812,
+    "lambda1_per_day": 4.64146,
+    "lambda2_per_day": 0.62170,
+}
+
+
+def _transition_parameters(parameter_bundle):
+    if parameter_bundle is None:
+        return None
+    if "transitions" in parameter_bundle:
+        return parameter_bundle["transitions"]
+    return parameter_bundle
+
+
+def _transition_value(transition_spec, key):
+    if key in transition_spec:
+        return transition_spec[key]
+    legacy_key = key.replace("_", " ")
+    if legacy_key in transition_spec:
+        return transition_spec[legacy_key]
+    raise KeyError(f"Missing transition key '{key}' in specification: {transition_spec}")
+
+
+def _sample_bundle_transition_duration(transition_spec):
+    erlang_stages = int(_transition_value(transition_spec, "erlang_stages"))
+    erlang_lambda = float(_transition_value(transition_spec, "erlang_lambda"))
+    exponential_lambda = float(_transition_value(transition_spec, "exponential_lambda"))
+    lambdas = []
+    if erlang_stages > 0:
+        lambdas.extend([erlang_lambda] * erlang_stages)
+    lambdas.append(exponential_lambda)
+    return float(sample_generalized_erlang(lambdas))
+
 class Subject:
     def __init__(self, id, state, symptoms = 0):
         """
-        id: int
-        state: int (0 = healthy, 1 = infected, 2 = infectious, 3 = healed, 4 = isolated)
-        symptoms: int (0 = no symptoms, 1 = developing symptoms, 2 = symptomatic)
+        state: HEALTHY, INFECTED, INFECTIOUS, HEALED, or ISOLATED.
+        symptoms: ASYMPTOMATIC, DEVELOPING_SYMPTOMS, or SYMPTOMATIC.
         """
         self.id = id
         self.state = state
@@ -58,27 +109,34 @@ def print_event(event):
         print(event)
 
 
-def infect_subject(data, subjects, subject_id, current_time, N, fine_grained_rng=None, distortion=1.0):
-    if abs(distortion - 1.0) < 1e-6: 
-        # PARAMETERS
-        ## Develop Symptoms
-        p1_develop_symptoms = 0.81
-        lambda1_develop_symptoms = 0.6958 / 24.0
-        p2_develop_symptoms = 0.19
-        lambda2_develop_symptoms = 0.1626 / 24.0
-        ## Infectious
-        ### First part is like Develop Symptoms
-        ### Second part:
-        p1_infectious = 0.89
-        p2_infectious = 0.11
-        lambda1_infectious = 1.357/24.0
-        lambda2_infectious = 0.170/24.0
+def print_subject_snapshot(subjects, involved_subjects, prefix):
+    for subject in involved_subjects:
+        subject_state = subjects[subject - 1].state
+        subject_symptoms = subjects[subject - 1].symptoms
+        print(
+            f"{prefix} subject={subject} state={subject_state} symptoms={subject_symptoms}"
+        )
+
+
+def infect_subject(data, subjects, subject_id, current_time, N, fine_grained_rng=None, distortion=1.0, parameter_bundle=None):
+    transition_parameters = _transition_parameters(parameter_bundle)
+    if transition_parameters is not None:
+        symptomatic_probability = float(_transition_value(transition_parameters["symptoms"], "true"))
+        symptoms_onset_spec = transition_parameters["symptomsOnset"]
+        infectiousness_spec = transition_parameters["infectiousness"]
+    elif abs(distortion - 1.0) < 1e-6:
+        erl_k_dev_symptoms = 2
+        lambda_erl_dev_symptoms = 0.022553849
+        lambda_exp_dev_symptoms = 0.013418615
+
+        erl_k_infectious = 2
+        lambda_erl_infectious = 0.0608792530475255
+        lambda_exp_infectious = 0.0205136260095492
     elif abs(distortion - 1.15) < 1e-6:
         p1_develop_symptoms = 0.76
         lambda1_develop_symptoms = 0.56385 / 24.0
         p2_develop_symptoms = 0.24
         lambda2_develop_symptoms = 0.182557 / 24.0
-        ## Infectious
         p1_infectious = 0.85662
         p2_infectious = 0.14338
         lambda1_infectious = 1.137232/24.0
@@ -88,7 +146,6 @@ def infect_subject(data, subjects, subject_id, current_time, N, fine_grained_rng
         lambda1_develop_symptoms = 0.867248 / 24.0
         p2_develop_symptoms = 0.14
         lambda2_develop_symptoms = 0.142598 / 24.0
-        ## Infectious
         p1_infectious = 0.9177
         p2_infectious = 0.082286
         lambda1_infectious = 1.648341/24.0
@@ -98,7 +155,6 @@ def infect_subject(data, subjects, subject_id, current_time, N, fine_grained_rng
         lambda1_develop_symptoms = 0.4897 / 24.0
         p2_develop_symptoms = 0.287
         lambda2_develop_symptoms = 0.1973 / 24.0
-        ## Infectious
         p1_infectious = 0.833
         p2_infectious = 0.167
         lambda1_infectious = 1.0177/24.0
@@ -108,22 +164,32 @@ def infect_subject(data, subjects, subject_id, current_time, N, fine_grained_rng
         lambda1_develop_symptoms = 1.0158 / 24.0
         p2_develop_symptoms = 0.112
         lambda2_develop_symptoms = 0.1286 / 24.0
-        ## Infectious
         p1_infectious = 0.935
         p2_infectious = 0.065
         lambda1_infectious = 1.903/24.0
         lambda2_infectious = 0.132/24.0
         
-    symptomatic_threshold = 0.35
+    symptomatic_threshold = 0.351
     generate_symptoms_threshold = 0.75
 
 
-    subjects[subject_id-1].state = 1
-    if random.random() < symptomatic_threshold:
-        subjects[subject_id-1].symptoms = 0 # asymptomatic
+    subjects[subject_id-1].state = INFECTED
+    if transition_parameters is not None:
+        is_asymptomatic = random.random() >= symptomatic_probability
     else:
-        subjects[subject_id-1].symptoms = 1
-        develop_symptoms_in = sample_from_hyper_exp(p1_develop_symptoms, p2_develop_symptoms, lambda1_develop_symptoms, lambda2_develop_symptoms)
+        is_asymptomatic = random.random() < symptomatic_threshold
+    if is_asymptomatic:
+        subjects[subject_id-1].symptoms = ASYMPTOMATIC
+    else:
+        subjects[subject_id-1].symptoms = DEVELOPING_SYMPTOMS
+        if transition_parameters is not None:
+            develop_symptoms_in = _sample_bundle_transition_duration(symptoms_onset_spec)
+        elif abs(distortion - 1.0) < 1e-6:
+            develop_symptoms_in = sample_generalized_erlang(
+                [lambda_erl_dev_symptoms] * erl_k_dev_symptoms + [lambda_exp_dev_symptoms]
+            )
+        else:
+            develop_symptoms_in = sample_from_hyper_exp(p1_develop_symptoms, p2_develop_symptoms, lambda1_develop_symptoms, lambda2_develop_symptoms)
         event = dataset.create_event("Develop_Symptoms", [subject_id], current_time + develop_symptoms_in, risk_factor=None, result=None)
         data["events"].append(event)
         n_symptoms = random.randint(1, N)
@@ -137,22 +203,28 @@ def infect_subject(data, subjects, subject_id, current_time, N, fine_grained_rng
                 event = dataset.create_event("Symptoms", [subject_id], current_time + event_offset, risk_factor=None, result=None)
                 data["events"].append(event)
 
-
-    infectious_in = sample_from_hyper_exp(p1_develop_symptoms, p2_develop_symptoms, lambda1_develop_symptoms, lambda2_develop_symptoms) + sample_from_hyper_exp(p1_infectious, p2_infectious, lambda1_infectious, lambda2_infectious)
+    if transition_parameters is not None:
+        infectious_in = _sample_bundle_transition_duration(infectiousness_spec)
+    elif abs(distortion - 1.0) < 1e-6:
+        infectious_in = sample_generalized_erlang(
+            [lambda_erl_infectious] * erl_k_infectious + [lambda_exp_infectious]
+        )
+    else:
+        infectious_in = sample_from_hyper_exp(p1_develop_symptoms, p2_develop_symptoms, lambda1_develop_symptoms, lambda2_develop_symptoms) + sample_from_hyper_exp(p1_infectious, p2_infectious, lambda1_infectious, lambda2_infectious)
     event = dataset.create_event("Infectious", [subject_id], current_time + infectious_in, risk_factor=None, result=None)
     data["events"].append(event)
-    data["events"].sort(key=lambda x: x["time"])
-    print(f"\033[1mSubject {subject_id} is now infected\033[0m")
     return subjects
 
 
-def set_healing_time(data, subjects, subject_id, current_time, distortion=1.0):
-    subjects[subject_id-1].state = 2
-    # PARAMETERS
-    if abs(distortion - 1.0) < 1e-6:
+def set_healing_time(data, subjects, subject_id, current_time, distortion=1.0, parameter_bundle=None):
+    subjects[subject_id-1].state = INFECTIOUS
+    transition_parameters = _transition_parameters(parameter_bundle)
+    if transition_parameters is not None:
+        heal_in = _sample_bundle_transition_duration(transition_parameters["healing"])
+    elif abs(distortion - 1.0) < 1e-6:
         ## Generalized Erlang
-        lambda1 = 1 / (10.68 * 24.0) # 0.093633 / 24.0
-        lambda2 = 1 / (1.27 * 24.0) # 0.787227 / 24.0
+        lambda1 = 0.011156175
+        lambda2 = 0.005581493
         heal_in = sample_generalized_erlang([lambda1, lambda2])
     elif abs(distortion - 1.15) < 1e-6:
         lambda1 = 0.0993 / 24.0
@@ -178,41 +250,170 @@ def set_healing_time(data, subjects, subject_id, current_time, distortion=1.0):
 
     event = dataset.create_event("Heal", [subject_id], current_time + heal_in, risk_factor=None, result=None)
     data["events"].append(event)
-    data["events"].sort(key=lambda x: x["time"])
-    print(f"\033[1mSubject {subject_id} is now infectious\033[0m")
     return subjects
 
-def set_isolation_time(data, subjects, subject_id, current_time, fine_grained_rng=None, distortion=1.0):
-    min_isolate_in_hours = 0
-    max_isolate_in_hours = int(24 * distortion)
-    # max_isolate_in_hours = int(24)
-    isolate_in = random.randint(min_isolate_in_hours, max_isolate_in_hours)
-    isolate_for = random.randint(isolate_in, max_isolate_in_hours * 21)
+
+def _sample_isolation_delay(fine_grained_rng=None, distortion=1.0, transition_parameters=None):
+    if transition_parameters is not None:
+        isolate_in = _sample_bundle_transition_duration(transition_parameters["isolating"])
+    elif abs(distortion - 1.0) < 1e-6:
+        erl_k = 3
+        lambda_erl = 0.033632585
+        lambda_exp = 0.016447155
+        isolate_in = sample_generalized_erlang([lambda_erl] * erl_k + [lambda_exp])
+    else:
+        min_isolate_in_hours = 0
+        max_isolate_in_hours = int(24 * distortion)
+        isolate_in = random.randint(min_isolate_in_hours, max_isolate_in_hours)
     if fine_grained_rng is not None:
         isolate_in += fine_grained_rng.random()
-        isolate_for += fine_grained_rng.random()
-    subjects[subject_id-1].state = 2 # so they get isolated
-    event = dataset.create_event("Enter_Isolation", [subject_id], current_time + isolate_in, risk_factor=None, result=None)
+    return isolate_in
+
+
+def _sample_positive_test_isolation_delay(fine_grained_rng=None):
+    psi_parameters = POSITIVE_TEST_ISOLATION_PSI
+    delay_days = sample_from_hyper_exp(
+        psi_parameters["p1"],
+        psi_parameters["p2"],
+        psi_parameters["lambda1_per_day"],
+        psi_parameters["lambda2_per_day"],
+    )
+    return delay_days * HOURS_PER_DAY
+
+
+def _sample_isolation_duration(fine_grained_rng=None, distortion=1.0, transition_parameters=None):
+    if transition_parameters is not None:
+        isolation_duration = _sample_bundle_transition_duration(transition_parameters["healing"])
+    else:
+        max_isolate_in_hours = int(24 * distortion)
+        isolation_duration = random.randint(
+            int(max_isolate_in_hours * 7),
+            int(max_isolate_in_hours * 28),
+        )
+    if fine_grained_rng is not None:
+        isolation_duration += fine_grained_rng.random()
+    return isolation_duration
+
+
+def _find_pending_isolation_events(data, subject_id, current_time):
+    pending_enter = None
+    for event in data["events"]:
+        if (
+            event["type"] == "Enter_Isolation"
+            and subject_id in event["involved_subjects"]
+            and event["time"] >= current_time
+        ):
+            if pending_enter is None or event["time"] < pending_enter["time"]:
+                pending_enter = event
+
+    pending_exit = None
+    if pending_enter is None:
+        return None, None
+
+    for event in data["events"]:
+        if (
+            event["type"] == "Exit_Isolation"
+            and subject_id in event["involved_subjects"]
+            and event["time"] >= pending_enter["time"]
+        ):
+            if pending_exit is None or event["time"] < pending_exit["time"]:
+                pending_exit = event
+
+    return pending_enter, pending_exit
+
+
+def set_isolation_time(data, subjects, subject_id, current_time, fine_grained_rng=None, distortion=1.0, parameter_bundle=None):
+    transition_parameters = _transition_parameters(parameter_bundle)
+    isolate_in = _sample_isolation_delay(fine_grained_rng, distortion, transition_parameters)
+    isolation_duration = _sample_isolation_duration(fine_grained_rng, distortion, transition_parameters)
+    subjects[subject_id-1].state = INFECTIOUS
+    enter_time = current_time + isolate_in
+    event = dataset.create_event("Enter_Isolation", [subject_id], enter_time, risk_factor=None, result=None)
     data["events"].append(event)
-    event = dataset.create_event("Exit_Isolation", [subject_id], current_time + isolate_for, risk_factor=None, result=None)
+    event = dataset.create_event(
+        "Exit_Isolation",
+        [subject_id],
+        enter_time + isolation_duration,
+        risk_factor=None,
+        result=None,
+    )
     data["events"].append(event)
-    data["events"].sort(key=lambda x: x["time"])
+    return subjects
+
+
+def schedule_isolation_after_positive_test(
+    data,
+    subjects,
+    subject_id,
+    current_time,
+    fine_grained_rng=None,
+    distortion=1.0,
+    parameter_bundle=None,
+):
+    if subjects[subject_id - 1].state == ISOLATED:
+        return subjects
+
+    transition_parameters = _transition_parameters(parameter_bundle)
+    target_enter_time = current_time + _sample_positive_test_isolation_delay(fine_grained_rng)
+    pending_enter, pending_exit = _find_pending_isolation_events(data, subject_id, current_time)
+
+    if pending_enter is None:
+        enter_event = dataset.create_event(
+            "Enter_Isolation",
+            [subject_id],
+            target_enter_time,
+            risk_factor=None,
+            result=None,
+        )
+        data["events"].append(enter_event)
+        exit_event = dataset.create_event(
+            "Exit_Isolation",
+            [subject_id],
+            target_enter_time + _sample_isolation_duration(fine_grained_rng, distortion, transition_parameters),
+            risk_factor=None,
+            result=None,
+        )
+        data["events"].append(exit_event)
+    elif pending_enter["time"] > target_enter_time:
+        delay_delta = pending_enter["time"] - target_enter_time
+        pending_enter["time"] = target_enter_time
+        if pending_exit is not None:
+            pending_exit["time"] = max(target_enter_time, pending_exit["time"] - delay_delta)
+        else:
+            exit_event = dataset.create_event(
+                "Exit_Isolation",
+                [subject_id],
+                target_enter_time + _sample_isolation_duration(fine_grained_rng, distortion, transition_parameters),
+                risk_factor=None,
+                result=None,
+            )
+            data["events"].append(exit_event)
+
     return subjects
 
 def _export_data(data, filename):
     data["events"].sort(key=lambda x: x["time"])
     with open(filename, 'w') as file:
         json.dump(data, file, indent=4)
-    print(f"Data exported to {filename}")
 
 
 
     
 
-def simulate_one_iteration(data, n_subjects, export_data=False, exported_data_filename=None, seed = None, fine_grained = False, distortion = 1.0):
+def simulate_one_iteration(
+    data,
+    n_subjects,
+    export_data=False,
+    exported_data_filename=None,
+    seed=None,
+    fine_grained=False,
+    distortion=1.0,
+    parameter_bundle=None,
+):
     # Create a list of subjects
     if seed is not None:
         random.seed(seed)
+        np.random.seed(seed)
     if fine_grained:
         if seed is not None:
             fine_grained_rng = random.Random(seed)
@@ -223,91 +424,105 @@ def simulate_one_iteration(data, n_subjects, export_data=False, exported_data_fi
 
     subjects = []
     for i in range(n_subjects):
-        subjects.append(Subject(i, 0))
+        subjects.append(Subject(i, HEALTHY))
     past_events = []
     while data["events"]:
+        data["events"].sort(key=lambda x: x["time"])
         event = data["events"].pop(0)
-        print_event(event)
-        # Get involved subjects
         involved_subjects = event["involved_subjects"]
-        type = event["type"]
+        event_type = event["type"]
         current_time = event["time"]
-        # Infection through external event
-        if event["type"] == "External":
-            if event["risk_factor"] > random.random(): # XXX
+        if event_type == "External":
+            if event["risk_factor"] > random.random():
                 for subject in involved_subjects:
-                    if subjects[subject - 1].state == 0:
-                        subjects = infect_subject(data, subjects, subject, current_time, n_subjects, fine_grained_rng, distortion) # subjects[subject - 1].state : 0 -> 1
-        elif event["type"] == "Infectious":
+                    if subjects[subject - 1].state == HEALTHY:
+                        subjects = infect_subject(
+                            data,
+                            subjects,
+                            subject,
+                            current_time,
+                            n_subjects,
+                            fine_grained_rng,
+                            distortion,
+                            parameter_bundle=parameter_bundle,
+                        )
+        elif event_type == "Infectious":
             for subject in involved_subjects:
-                print(subject)
-                print("state", subjects[subject-1].state)
-                if subjects[subject - 1].state == 1:
-                    if subjects[subject - 1].symptoms == 0:
-                        subjects = set_healing_time(data, subjects, subject, current_time, distortion) # subjects[subject - 1].state : 1 -> 3. Subject is asymptomatic
-                    elif subjects[subject - 1].symptoms == 1 or subjects[subject - 1].symptoms == 2:
-                        subjects = set_isolation_time(data, subjects, subject, current_time, fine_grained_rng, distortion) # subjects[subject - 1].state : 1 -> 2 -> 4. Subject is symptomatic
-        elif event["type"] == "Heal":
+                if subjects[subject - 1].state == INFECTED:
+                    if subjects[subject - 1].symptoms == ASYMPTOMATIC:
+                        subjects = set_healing_time(
+                            data,
+                            subjects,
+                            subject,
+                            current_time,
+                            distortion,
+                            parameter_bundle=parameter_bundle,
+                        )
+                    elif subjects[subject - 1].symptoms in (DEVELOPING_SYMPTOMS, SYMPTOMATIC):
+                        subjects = set_isolation_time(
+                            data,
+                            subjects,
+                            subject,
+                            current_time,
+                            fine_grained_rng,
+                            distortion,
+                            parameter_bundle=parameter_bundle,
+                        )
+        elif event_type == "Heal":
             for subject in involved_subjects:
-                if subjects[subject - 1].state == 2:
-                    subjects[subject - 1].state = 3
-                    print(f"\033[1mSubject {subject} is now healed\033[0m")
-                    # Reset symptoms when subject is healed
-                    subjects[subject - 1].symptoms = 0
-        elif event["type"] == "Develop_Symptoms":
+                if subjects[subject - 1].state == INFECTIOUS:
+                    subjects[subject - 1].state = HEALED
+                    subjects[subject - 1].symptoms = ASYMPTOMATIC
+        elif event_type == "Develop_Symptoms":
             for subject in involved_subjects:
-                if subjects[subject - 1].symptoms == 1:
-                    subjects[subject - 1].symptoms = 2
-                    print(f"\033[1mSubject {subject} is now symptomatic\033[0m")
-        elif event["type"] == "Enter_Isolation":
+                if subjects[subject - 1].symptoms == DEVELOPING_SYMPTOMS:
+                    subjects[subject - 1].symptoms = SYMPTOMATIC
+        elif event_type == "Enter_Isolation":
             for subject in involved_subjects:
-                if subjects[subject - 1].state == 2:
-                    subjects[subject - 1].state = 4
-                    print(f"\033[1mSubject {subject} is now isolated\033[0m")
-        elif event["type"] == "Exit_Isolation":
+                if subjects[subject - 1].state == INFECTIOUS:
+                    subjects[subject - 1].state = ISOLATED
+        elif event_type == "Exit_Isolation":
             for subject in involved_subjects:
-                if subjects[subject - 1].state == 4:
-                    subjects[subject - 1].state = 3
-                    print(f"\033[1mSubject {subject} is now healthy\033[0m")
-                    # Reset symptoms when subject is healed
-                    subjects[subject - 1].symptoms = 0
-        elif event["type"] == "Internal":
-            # Remove isolated and immune subjects from the event
-            # involved_subjects = [subject for subject in involved_subjects if subjects[subject - 1].state == 0 or subjects[subject - 1].state == 2] # only healthy and infectious subjects
-            # Check if at least one subject is infectious
-            infectious = False
-            for subject in involved_subjects:
-                if subjects[subject - 1].state == 2:
-                    infectious = True
-                    break
-            
-            # If at least one subject is infectious, infect the others
+                if subjects[subject - 1].state == ISOLATED:
+                    subjects[subject - 1].state = HEALED
+                    subjects[subject - 1].symptoms = ASYMPTOMATIC
+        elif event_type == "Internal":
+            infectious = any(subjects[subject - 1].state == INFECTIOUS for subject in involved_subjects)
             if infectious:
                 for subject in involved_subjects:
-                    if event["risk_factor"] > random.random() and subjects[subject - 1].state == 0: # XXX
-                        subjects = infect_subject(data, subjects, subject, current_time, n_subjects, fine_grained_rng, distortion) # subject[subject - 1].state : 0 -> 1
-                        # input("--->")
-        elif event["type"] == "Symptoms":
-            # Check if subject is symptomatic. if asymptomatic (0) -> symptoms = False, if they are developing symptoms (1) -> symptoms = random, if they is symptomatic (2) -> symptoms = True
+                    if event["risk_factor"] > random.random() and subjects[subject - 1].state == HEALTHY:
+                        subjects = infect_subject(
+                            data,
+                            subjects,
+                            subject,
+                            current_time,
+                            n_subjects,
+                            fine_grained_rng,
+                            distortion,
+                            parameter_bundle=parameter_bundle,
+                        )
+        elif event_type == "Symptoms":
             is_symptomatic = False
             for subject in involved_subjects:
-                if subjects[subject - 1].symptoms == 2:
+                if subjects[subject - 1].symptoms == SYMPTOMATIC:
                     is_symptomatic = True
-                    print(f"\033[1mSubject {subject} is symptomatic\033[0m")
-                elif subjects[subject - 1].symptoms == 1:
+                elif subjects[subject - 1].symptoms == DEVELOPING_SYMPTOMS:
                     is_symptomatic = random.random() < 0.5
-                    print(f"\033[1mSubject {subject} is not symptomatic\033[0m")
-                else:
-                    print(f"\033[1mSubject {subject} is not symptomatic\033[0m")
             event["result"] = is_symptomatic
-        elif event["type"] == "Test":
+        elif event_type == "Test":
             is_positive = False
             for subject in involved_subjects:
-                if subjects[subject - 1].state == 2 or subjects[subject - 1].state == 4:
+                if subjects[subject - 1].state == INFECTIOUS or subjects[subject - 1].state == ISOLATED:
                     is_positive = True
-                    print(f"\033[38;5;208m\033[3mSubject {subject} is positive\033[0m")
-                else:
-                    print(f"\033[38;5;30m\033[3mSubject {subject} is negative\033[0m")
+                    subjects = schedule_isolation_after_positive_test(
+                        data,
+                        subjects,
+                        subject,
+                        current_time,
+                        fine_grained_rng=fine_grained_rng,
+                        distortion=distortion,
+                        parameter_bundle=parameter_bundle,
+                    )
             event["result"] = is_positive
         past_events.append(event)
 
@@ -319,32 +534,22 @@ def simulate_one_iteration(data, n_subjects, export_data=False, exported_data_fi
         
 
 def get_numerical_results(simulated_data, granularity=1.0):
-    # Get the number of the subjects and the time limit
     n_subjects = simulated_data["n_subjects"]
     time_limit = simulated_data["time_limit"]
-    # Create n_subjects lists of 0s, each list is long time_limit * 24
-    state = {i : [0] * int(time_limit * 24 / granularity) for i in range(1, n_subjects + 1)}
+    state = {i : [TRACK_HEALTHY] * int(time_limit * 24 / granularity) for i in range(1, n_subjects + 1)}
 
-    decimals = 0
-    if granularity < 1.0:
-        decimals = int(-np.log10(granularity))
-    
-    # Iterate over the events of the simulated data
     for event in sorted(simulated_data["events"], key=lambda x: x["time"]):
         involved_subjects = event["involved_subjects"]
-        current_time = int(np.round(event["time"], decimals) / granularity) # round to the nearest granularity
-        # If the event is Infectious, set the state of the involeved subjects to 1 for the current time and all the next hours
+        current_time = int(np.round(event["time"] / granularity))
         if event["type"] == "Infectious":
             for subject in involved_subjects:
-                state[subject][current_time:] = [1] * len(state[subject][current_time:])
-        # If the event is Heal, set the state of the involeved subjects to 3 for the current time and all the next hours
+                state[subject][current_time:] = [TRACK_INFECTIOUS] * len(state[subject][current_time:])
         elif event["type"] == "Heal":
             for subject in involved_subjects:
-                state[subject][current_time:] = [3] * len(state[subject][current_time:])
-        # If the event is Enter_Isolation, set the state of the involeved subjects to 4 for the current time and all the next hours
+                state[subject][current_time:] = [TRACK_HEALED] * len(state[subject][current_time:])
         elif event["type"] == "Enter_Isolation":
             for subject in involved_subjects:
-                state[subject][current_time:] = [4] * len(state[subject][current_time:])
+                state[subject][current_time:] = [TRACK_ISOLATED] * len(state[subject][current_time:])
     return state
         
 

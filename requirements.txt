@@ -4,3 +4,6 @@ pandas>=2.0.0
 matplotlib>=3.6.0
 seaborn>=0.12.0
 tqdm>=4.64.0
+networkx>=3.2.1
+EoN>=1.2
+PyYAML>=6.0

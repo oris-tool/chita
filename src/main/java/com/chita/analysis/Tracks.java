@@ -26,9 +26,9 @@ import java.util.HashMap;
 import java.util.Map;
 
 public class Tracks {
-    HashMap<String, Double[]> tracks;
-    String[] names;
-    int nSamples;
+    private final HashMap<String, double[]> tracks;
+    private final String[] names;
+    private final int nSamples;
 
     public Tracks(String[] names, int nSamples) {
         this.names = names;
@@ -36,28 +36,35 @@ public class Tracks {
         tracks = new HashMap<>();
 
         for (String name : names) {
-            tracks.put(name, new Double[nSamples]);
+            tracks.put(name, new double[nSamples]);
             Arrays.fill(tracks.get(name), 0.0);
         }
     }
 
-    public void editTrack (String name, int time, Double value){
+    public void editTrack(String name, int time, Double value) {
         tracks.get(name)[time] = value;
     }
 
-    public Double getSample (String name, int time){
+    public Double getSample(String name, int time) {
         return tracks.get(name)[time];
     }
 
-    public Tracks copy(){
+    public double[] getTrack(String name) {
+        return tracks.get(name);
+    }
+
+    public Tracks copy() {
         Tracks copy = new Tracks(Arrays.copyOf(this.names, this.names.length), this.nSamples);
         for (String name : names) {
             copy.tracks.put(name, Arrays.copyOf(this.tracks.get(name), this.nSamples));
         }
-        // assert copy and this.tracks different object but with equal values
-        for (String name : names){
-            if (copy.tracks.get(name) == this.tracks.get(name)) throw new AssertionError("Same object");
-            if (!Arrays.equals(copy.tracks.get(name), this.tracks.get(name))) throw new AssertionError("Track values are different :(");
+        for (String name : names) {
+            if (copy.tracks.get(name) == this.tracks.get(name)) {
+                throw new AssertionError("Copied track shares the original array");
+            }
+            if (!Arrays.equals(copy.tracks.get(name), this.tracks.get(name))) {
+                throw new AssertionError("Copied track values differ from the original");
+            }
         }
         return copy;
     }
@@ -65,7 +72,7 @@ public class Tracks {
     public JsonObject toJson() {
         Gson gson = new GsonBuilder().setPrettyPrinting().serializeSpecialFloatingPointValues().create();
         JsonObject jsonObject = new JsonObject();
-        for (Map.Entry<String, Double[]> entry : tracks.entrySet()) {
+        for (Map.Entry<String, double[]> entry : tracks.entrySet()) {
             jsonObject.add(entry.getKey(), gson.toJsonTree(entry.getValue()));
         }
         return jsonObject;

@@ -52,7 +52,7 @@ if __name__ == "__main__":
     df = pd.DataFrame(columns=columns)
     granularity = 0.1 # 6 minutes
     WINDOW = int(1 / granularity)
-    datasets = ["D0", "D1", "D2", "D2+15", "D2-15", "D2+25", "D2-25", "D3"]
+    datasets = ["D2", "D2+15", "D2-15", "D2+25", "D2-25", "D3"]
     for dataset in datasets:
         print("Processing dataset:", dataset)
         ana_files = [f for f in sorted(os.listdir(dataset)) if f.endswith(".json") and "tracks" in f and "excluded" not in f]
