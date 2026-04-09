@@ -73,7 +73,26 @@ def _sample_bundle_transition_duration(transition_spec):
     if erlang_stages > 0:
         lambdas.extend([erlang_lambda] * erlang_stages)
     lambdas.append(exponential_lambda)
-    return float(sample_generalized_erlang(lambdas))
+    sampled_duration = float(sample_generalized_erlang(lambdas))
+    unit_measure = str(transition_spec.get("unit_measure", "hours")).strip().lower()
+    if unit_measure in {"day", "days"}:
+        return sampled_duration * HOURS_PER_DAY
+    return sampled_duration
+
+
+def _sample_bundle_hyper_exp_duration(transition_spec):
+    sampled_duration = float(
+        sample_from_hyper_exp(
+            float(_transition_value(transition_spec, "p1")),
+            float(_transition_value(transition_spec, "p2")),
+            float(_transition_value(transition_spec, "lambda1")),
+            float(_transition_value(transition_spec, "lambda2")),
+        )
+    )
+    unit_measure = str(transition_spec.get("unit_measure", "hours")).strip().lower()
+    if unit_measure in {"day", "days"}:
+        return sampled_duration * HOURS_PER_DAY
+    return sampled_duration
 
 class Subject:
     def __init__(self, id, state, symptoms = 0):
@@ -270,7 +289,10 @@ def _sample_isolation_delay(fine_grained_rng=None, distortion=1.0, transition_pa
     return isolate_in
 
 
-def _sample_positive_test_isolation_delay(fine_grained_rng=None):
+def _sample_positive_test_isolation_delay(fine_grained_rng=None, transition_parameters=None):
+    if transition_parameters is not None and "notificationToIsolation" in transition_parameters:
+        return _sample_bundle_hyper_exp_duration(transition_parameters["notificationToIsolation"])
+
     psi_parameters = POSITIVE_TEST_ISOLATION_PSI
     delay_days = sample_from_hyper_exp(
         psi_parameters["p1"],
@@ -281,9 +303,24 @@ def _sample_positive_test_isolation_delay(fine_grained_rng=None):
     return delay_days * HOURS_PER_DAY
 
 
-def _sample_isolation_duration(fine_grained_rng=None, distortion=1.0, transition_parameters=None):
+def _sample_isolation_duration(
+    fine_grained_rng=None,
+    distortion=1.0,
+    transition_parameters=None,
+    subject_symptoms=None,
+):
     if transition_parameters is not None:
-        isolation_duration = _sample_bundle_transition_duration(transition_parameters["healing"])
+        if (
+            subject_symptoms in (DEVELOPING_SYMPTOMS, SYMPTOMATIC)
+            and "symptomaticPeriod" in transition_parameters
+        ):
+            isolation_duration = _sample_bundle_transition_duration(
+                transition_parameters["symptomaticPeriod"]
+            )
+        else:
+            isolation_duration = _sample_bundle_transition_duration(
+                transition_parameters["healing"]
+            )
     else:
         max_isolate_in_hours = int(24 * distortion)
         isolation_duration = random.randint(
@@ -325,7 +362,12 @@ def _find_pending_isolation_events(data, subject_id, current_time):
 def set_isolation_time(data, subjects, subject_id, current_time, fine_grained_rng=None, distortion=1.0, parameter_bundle=None):
     transition_parameters = _transition_parameters(parameter_bundle)
     isolate_in = _sample_isolation_delay(fine_grained_rng, distortion, transition_parameters)
-    isolation_duration = _sample_isolation_duration(fine_grained_rng, distortion, transition_parameters)
+    isolation_duration = _sample_isolation_duration(
+        fine_grained_rng,
+        distortion,
+        transition_parameters,
+        subject_symptoms=subjects[subject_id - 1].symptoms,
+    )
     subjects[subject_id-1].state = INFECTIOUS
     enter_time = current_time + isolate_in
     event = dataset.create_event("Enter_Isolation", [subject_id], enter_time, risk_factor=None, result=None)
@@ -354,7 +396,10 @@ def schedule_isolation_after_positive_test(
         return subjects
 
     transition_parameters = _transition_parameters(parameter_bundle)
-    target_enter_time = current_time + _sample_positive_test_isolation_delay(fine_grained_rng)
+    target_enter_time = current_time + _sample_positive_test_isolation_delay(
+        fine_grained_rng,
+        transition_parameters,
+    )
     pending_enter, pending_exit = _find_pending_isolation_events(data, subject_id, current_time)
 
     if pending_enter is None:
@@ -369,7 +414,12 @@ def schedule_isolation_after_positive_test(
         exit_event = dataset.create_event(
             "Exit_Isolation",
             [subject_id],
-            target_enter_time + _sample_isolation_duration(fine_grained_rng, distortion, transition_parameters),
+            target_enter_time + _sample_isolation_duration(
+                fine_grained_rng,
+                distortion,
+                transition_parameters,
+                subject_symptoms=subjects[subject_id - 1].symptoms,
+            ),
             risk_factor=None,
             result=None,
         )
@@ -383,7 +433,12 @@ def schedule_isolation_after_positive_test(
             exit_event = dataset.create_event(
                 "Exit_Isolation",
                 [subject_id],
-                target_enter_time + _sample_isolation_duration(fine_grained_rng, distortion, transition_parameters),
+                target_enter_time + _sample_isolation_duration(
+                    fine_grained_rng,
+                    distortion,
+                    transition_parameters,
+                    subject_symptoms=subjects[subject_id - 1].symptoms,
+                ),
                 risk_factor=None,
                 result=None,
             )

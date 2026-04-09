@@ -39,6 +39,8 @@ PARAMETER_FAMILY_ORDER = (
     "symptoms",
     "isolating",
     "symptomsOnset",
+    "notificationToIsolation",
+    "symptomaticPeriod",
 )
 PARAMETER_LEVEL_ORDER = ("lower", "mid", "upper")
 
@@ -48,6 +50,8 @@ FAMILY_ABBREVIATIONS = {
     "symptoms": "sym",
     "isolating": "iso",
     "symptomsOnset": "onset",
+    "notificationToIsolation": "notif",
+    "symptomaticPeriod": "symdur",
 }
 
 LEVEL_ABBREVIATIONS = {
@@ -158,6 +162,26 @@ def _extract_numeric_values(row):
     return values
 
 
+def _parse_decimal_cell(cell_value, grouped_decimal_scale=None):
+    normalized = str(cell_value).strip()
+    if not normalized:
+        raise ValueError("Expected a numeric cell, found an empty value.")
+
+    if "." in normalized:
+        return float(normalized)
+
+    if grouped_decimal_scale is not None:
+        digits = normalized.replace(",", "")
+        return float(digits) / (10 ** grouped_decimal_scale)
+
+    comma_count = normalized.count(",")
+    if comma_count == 0:
+        return float(normalized)
+    if comma_count == 1:
+        return float(normalized.replace(",", "."))
+    raise ValueError(f"Ambiguous localized numeric value: {cell_value}")
+
+
 def _cell_text(cell):
     paragraphs = []
     for paragraph in cell.findall("text:p", ODS_NAMESPACES):
@@ -242,6 +266,7 @@ def _parse_distribution_sheet(rows, sheet_name):
 
         level = recent_labeled_levels[hour_block_index]
         parsed_levels[level] = {
+            "unit_measure": "hours",
             "erlang_stages": int(round(numeric_values[0])),
             "erlang_lambda": float(numeric_values[1]),
             "exponential_lambda": float(numeric_values[2]),
@@ -265,7 +290,7 @@ def _parse_symptoms_sheet(rows):
         numeric_values = _extract_numeric_values(row)
         if not numeric_values:
             continue
-        transition = {"true": float(numeric_values[0])}
+        transition = {"unit_measure": "probability", "true": float(numeric_values[0])}
         if len(numeric_values) > 1:
             transition["false"] = float(numeric_values[1])
         parsed_levels[level] = transition
@@ -274,6 +299,53 @@ def _parse_symptoms_sheet(rows):
     if missing_levels:
         raise ValueError(
             f"Missing symptomatic-probability rows: {', '.join(missing_levels)}"
+        )
+    return parsed_levels
+
+
+def _parse_day_distribution_sheet(rows, sheet_name):
+    parsed_levels = {}
+    for row in rows:
+        level = _extract_level_label(row)
+        unit = _extract_unit_label(row)
+        if level is None or unit != "days":
+            continue
+        parsed_levels[level] = {
+            "unit_measure": "days",
+            "erlang_stages": int(round(_parse_decimal_cell(row[5]))),
+            "erlang_lambda": _parse_decimal_cell(row[6]),
+            "exponential_lambda": _parse_decimal_cell(row[7]),
+        }
+
+    missing_levels = [level for level in PARAMETER_LEVEL_ORDER if level not in parsed_levels]
+    if missing_levels:
+        raise ValueError(
+            f"Missing day-based rows for {sheet_name}: {', '.join(missing_levels)}"
+        )
+    return parsed_levels
+
+
+def _parse_notification_to_isolation_sheet(rows):
+    parsed_levels = {}
+    for row in rows:
+        level = _extract_level_label(row)
+        unit = _extract_unit_label(row)
+        if level is None or unit != "days":
+            continue
+        parsed_levels[level] = {
+            "unit_measure": "days",
+            "distribution": "hyperexponential",
+            "p1": _parse_decimal_cell(row[7], grouped_decimal_scale=5),
+            "p2": _parse_decimal_cell(row[8], grouped_decimal_scale=5),
+            "lambda1": _parse_decimal_cell(row[9], grouped_decimal_scale=5),
+            "lambda2": _parse_decimal_cell(row[10], grouped_decimal_scale=5),
+        }
+
+    missing_levels = [level for level in PARAMETER_LEVEL_ORDER if level not in parsed_levels]
+    if missing_levels:
+        raise ValueError(
+            "Missing day-based rows for notification-to-isolation: "
+            + ", ".join(missing_levels)
         )
     return parsed_levels
 
@@ -289,11 +361,13 @@ def load_parameter_space_from_ods(path):
         "symptoms": _parse_symptoms_sheet(tables["symptoms"]),
         "isolating": _parse_distribution_sheet(tables["isolating"], "isolating"),
         "symptomsOnset": _parse_distribution_sheet(tables["symptomsOnset"], "symptomsOnset"),
+        "notificationToIsolation": _parse_notification_to_isolation_sheet(tables["notification-to-isolation"]),
+        "symptomaticPeriod": _parse_day_distribution_sheet(tables["symptomatic_period"], "symptomatic_period"),
     }
     return {
         "source_path": os.path.abspath(path),
         "source_format": "ods",
-        "unit_measure": "hours",
+        "unit_measure": "mixed",
         "levels": list(PARAMETER_LEVEL_ORDER),
         "transitions": transitions,
     }
@@ -353,6 +427,8 @@ def manifest_row_for_bundle(bundle):
         "symptoms_level": bundle["levels"]["symptoms"],
         "isolating_level": bundle["levels"]["isolating"],
         "symptoms_onset_level": bundle["levels"]["symptomsOnset"],
+        "notification_to_isolation_level": bundle["levels"]["notificationToIsolation"],
+        "symptomatic_period_level": bundle["levels"]["symptomaticPeriod"],
     }
     for family in PARAMETER_FAMILY_ORDER:
         transition = bundle["transitions"][family]
@@ -409,8 +485,9 @@ This file documents the parameters used by `sweep_pipeline.py` to create the dat
 ## Parameter Cases
 
 - The sweep loads the lower/mid/upper parameter values from the ODS spreadsheet.
-- For the distribution sheets, the hour-based rows are used.
-- This is the correct unit for the active Python simulation because event times and transition durations are tracked in hours, and the transition lambdas are consumed as per-hour rates.
+- The hour-based rows are used for `infectiousness`, `healing`, `isolating`, and `symptomsOnset`.
+- The day-based rows are used for `notification-to-isolation` and `symptomatic_period`, then converted to hours inside the simulator after sampling.
+- The `symptomatic_period` rows are day-based because that sheet is only provided in days in the ODS file.
 - The `symptoms` sheet is unitless and is used as a probability.
 
 ## Per-Run Dataset Parameters
@@ -1190,6 +1267,8 @@ def write_aggregate_outputs(output_root, summaries):
             "symptoms_level": parameter_levels.get("symptoms"),
             "isolating_level": parameter_levels.get("isolating"),
             "symptoms_onset_level": parameter_levels.get("symptomsOnset"),
+            "notification_to_isolation_level": parameter_levels.get("notificationToIsolation"),
+            "symptomatic_period_level": parameter_levels.get("symptomaticPeriod"),
             "dataset_events": summary.get("dataset_events"),
             "convergence_iterations": summary.get("convergence", {}).get("iterations"),
             "convergence_reached": summary.get("convergence", {}).get("reached"),
