@@ -87,11 +87,20 @@ def compute_confidence_intervals(current_state, confidence=0.95):
     return {"epsilon": float(epsilon), "band": dkw_band}
 
 
-def plot_dkw_bands(current_state, dkw_result, output_dir, granularity=1.0, dataset_label=""):
+def plot_dkw_bands(
+    current_state,
+    dkw_result,
+    output_dir,
+    granularity=1.0,
+    dataset_label="",
+    save_plots=True,
+):
     if not current_state:
         raise ValueError("Error: current_state cannot be empty.")
     if "band" not in dkw_result:
         raise ValueError("Error: dkw_result must contain a 'band' entry.")
+    if not save_plots:
+        return
 
     os.makedirs(output_dir, exist_ok=True)
     subjects = sorted(list(current_state.keys()), key=int)
@@ -206,6 +215,7 @@ def run_dataset_simulations(
     time_step_hours=None,
     max_runtime_seconds=None,
     parameter_bundle=None,
+    save_plots=True,
 ):
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
@@ -334,6 +344,7 @@ def run_dataset_simulations(
         output_dir=plots_dir,
         granularity=granularity,
         dataset_label=f"{effective_label}_t{timelimit}_{rep_done}reps",
+        save_plots=save_plots,
     )
     dkw_csv_path = os.path.join(
         plots_dir,

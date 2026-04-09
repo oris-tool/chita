@@ -40,32 +40,11 @@ public class STPNAnalysis {
     private static final int OBSERVATION_CURVE_CACHE_VERSION = 1;
     private static final int OBSERVATION_CURVE_TIME_LIMIT_DAYS = 60;
     private static final double OBSERVATION_CURVE_BASE_DT_DAYS = 0.05;
-    private static final String ACTIVE_OBSERVATION_CURVE_SCENARIO = "mid";
+    private static final String DEFAULT_ANALYSIS_PARAMETER_CASE_ID =
+            "inf_mid__heal_mid__sym_mid__iso_mid__onset_mid__notif_mid__symdur_mid";
     private static final double TEST_GAMMA_SHAPE = 7.85;
     private static final double TEST_GAMMA_SCALE = 2.14;
     private static final double TEST_GAMMA_SCALING = 0.94;
-
-    private static final CurveScenario LOWER_CURVE_SCENARIO = new CurveScenario(
-            "lower",
-            0.601,
-            new ErlangExponentialParams(2, 0.61472, 0.33939),
-            new ErlangExponentialParams(1, 0.47539, 0.20980),
-            0.96812, 0.03188, 10.19072, 0.33560
-    );
-    private static final CurveScenario MID_CURVE_SCENARIO = new CurveScenario(
-            "mid",
-            0.649,
-            new ErlangExponentialParams(2, 0.54129, 0.32205),
-            new ErlangExponentialParams(2, 0.60118, 0.21962),
-            0.88188, 0.11812, 4.64146, 0.62170
-    );
-    private static final CurveScenario UPPER_CURVE_SCENARIO = new CurveScenario(
-            "upper",
-            0.693,
-            new ErlangExponentialParams(2, 0.60444, 0.23860),
-            new ErlangExponentialParams(3, 0.65074, 0.23365),
-            0.75307, 0.24693, 2.64235, 0.86642
-    );
 
     private static final class ErlangExponentialParams {
         final int erlangStages;
@@ -139,6 +118,180 @@ public class STPNAnalysis {
         }
     }
 
+    private static final class GeneralizedErlangSpec {
+        final String unitMeasure;
+        final int erlangStages;
+        final double erlangRate;
+        final double exponentialRate;
+
+        GeneralizedErlangSpec(String unitMeasure, int erlangStages, double erlangRate, double exponentialRate) {
+            if (erlangStages <= 0) {
+                throw new IllegalArgumentException("erlangStages must be greater than 0.");
+            }
+            this.unitMeasure = normalizeUnitMeasure(unitMeasure);
+            this.erlangStages = erlangStages;
+            this.erlangRate = erlangRate;
+            this.exponentialRate = exponentialRate;
+        }
+
+        ErlangExponentialParams toPerHourParams() {
+            return new ErlangExponentialParams(
+                    erlangStages,
+                    convertRate(erlangRate, unitMeasure, "hours"),
+                    convertRate(exponentialRate, unitMeasure, "hours")
+            );
+        }
+
+        ErlangExponentialParams toPerDayParams() {
+            return new ErlangExponentialParams(
+                    erlangStages,
+                    convertRate(erlangRate, unitMeasure, "days"),
+                    convertRate(exponentialRate, unitMeasure, "days")
+            );
+        }
+
+        String signature() {
+            return String.format(
+                    Locale.US,
+                    "unit=%s,n=%d,l1=%.12f,l2=%.12f",
+                    unitMeasure,
+                    erlangStages,
+                    erlangRate,
+                    exponentialRate
+            );
+        }
+    }
+
+    private static final class HyperExponentialParams {
+        final double p1;
+        final double p2;
+        final double lambda1;
+        final double lambda2;
+
+        HyperExponentialParams(double p1, double p2, double lambda1, double lambda2) {
+            this.p1 = p1;
+            this.p2 = p2;
+            this.lambda1 = lambda1;
+            this.lambda2 = lambda2;
+        }
+
+        String signature() {
+            return String.format(
+                    Locale.US,
+                    "p=%.12f,%.12f;l=%.12f,%.12f",
+                    p1,
+                    p2,
+                    lambda1,
+                    lambda2
+            );
+        }
+    }
+
+    private static final class HyperExponentialSpec {
+        final String unitMeasure;
+        final double p1;
+        final double p2;
+        final double lambda1;
+        final double lambda2;
+
+        HyperExponentialSpec(String unitMeasure, double p1, double p2, double lambda1, double lambda2) {
+            this.unitMeasure = normalizeUnitMeasure(unitMeasure);
+            this.p1 = p1;
+            this.p2 = p2;
+            this.lambda1 = lambda1;
+            this.lambda2 = lambda2;
+        }
+
+        HyperExponentialParams toPerDayParams() {
+            return new HyperExponentialParams(
+                    p1,
+                    p2,
+                    convertRate(lambda1, unitMeasure, "days"),
+                    convertRate(lambda2, unitMeasure, "days")
+            );
+        }
+
+        String signature() {
+            return String.format(
+                    Locale.US,
+                    "unit=%s,p=%.12f,%.12f;l=%.12f,%.12f",
+                    unitMeasure,
+                    p1,
+                    p2,
+                    lambda1,
+                    lambda2
+            );
+        }
+    }
+
+    private static final class AnalysisParameters {
+        final String caseId;
+        final GeneralizedErlangSpec infectiousness;
+        final GeneralizedErlangSpec healing;
+        final double symptomaticProbability;
+        final GeneralizedErlangSpec isolating;
+        final GeneralizedErlangSpec symptomsOnset;
+        final HyperExponentialSpec notificationToIsolation;
+        final GeneralizedErlangSpec symptomaticPeriod;
+
+        AnalysisParameters(
+                String caseId,
+                GeneralizedErlangSpec infectiousness,
+                GeneralizedErlangSpec healing,
+                double symptomaticProbability,
+                GeneralizedErlangSpec isolating,
+                GeneralizedErlangSpec symptomsOnset,
+                HyperExponentialSpec notificationToIsolation,
+                GeneralizedErlangSpec symptomaticPeriod
+        ) {
+            if (symptomaticProbability < 0.0 || symptomaticProbability > 1.0) {
+                throw new IllegalArgumentException("symptomaticProbability must be between 0 and 1.");
+            }
+            if (healing.erlangStages != 1) {
+                throw new IllegalArgumentException(
+                        "The Java STPN model expects the healing transition to use exactly one Erlang stage."
+                );
+            }
+            this.caseId = caseId;
+            this.infectiousness = infectiousness;
+            this.healing = healing;
+            this.symptomaticProbability = symptomaticProbability;
+            this.isolating = isolating;
+            this.symptomsOnset = symptomsOnset;
+            this.notificationToIsolation = notificationToIsolation;
+            this.symptomaticPeriod = symptomaticPeriod;
+        }
+
+        CurveScenario curveScenario() {
+            HyperExponentialParams notificationPerDay = notificationToIsolation.toPerDayParams();
+            return new CurveScenario(
+                    caseId,
+                    symptomaticProbability,
+                    symptomsOnset.toPerDayParams(),
+                    symptomaticPeriod.toPerDayParams(),
+                    notificationPerDay.p1,
+                    notificationPerDay.p2,
+                    notificationPerDay.lambda1,
+                    notificationPerDay.lambda2
+            );
+        }
+
+        String signature() {
+            return String.format(
+                    Locale.US,
+                    "case=%s;infectiousness={%s};healing={%s};symptoms=%.12f;isolating={%s};onset={%s};notification={%s};symptomatic_period={%s}",
+                    caseId,
+                    infectiousness.signature(),
+                    healing.signature(),
+                    symptomaticProbability,
+                    isolating.signature(),
+                    symptomsOnset.signature(),
+                    notificationToIsolation.signature(),
+                    symptomaticPeriod.signature()
+            );
+        }
+    }
+
     private static final class ObservationCurves {
         final double[] phi;
         final double[] theta;
@@ -156,7 +309,18 @@ public class STPNAnalysis {
     }
 
     @SuppressWarnings("unchecked")
-    public static <R, S> TransientSolution<R, S> buildModel(int samples, float step) {
+    public static <R, S> TransientSolution<R, S> buildModel(
+            int samples,
+            float step,
+            AnalysisParameters analysisParameters
+    ) {
+        ErlangExponentialParams isolating = analysisParameters.isolating.toPerHourParams();
+        ErlangExponentialParams healing = analysisParameters.healing.toPerHourParams();
+        ErlangExponentialParams infectiousness = analysisParameters.infectiousness.toPerHourParams();
+        ErlangExponentialParams symptomsOnset = analysisParameters.symptomsOnset.toPerHourParams();
+        double symptomaticProbability = analysisParameters.symptomaticProbability;
+        double asymptomaticProbability = clamp01(1.0 - symptomaticProbability);
+
         PetriNet net = new PetriNet();
         Marking marking = new Marking();
 
@@ -226,20 +390,50 @@ public class STPNAnalysis {
         marking.setTokens(_infectiousness, 0);
         marking.setTokens(_isolating, 0);
         marking.setTokens(_symptomsonset, 0);
-        Isolating_erlang.addFeature(StochasticTransitionFeature.newErlangInstance(3, new BigDecimal("0.0336325")));
-        Isolating_exp.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.016447083", net)));
+        Isolating_erlang.addFeature(StochasticTransitionFeature.newErlangInstance(
+                isolating.erlangStages,
+                new BigDecimal(Double.toString(isolating.erlangRate))
+        ));
+        Isolating_exp.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                new BigDecimal("1"),
+                MarkingExpr.from(Double.toString(isolating.exponentialRate), net)
+        ));
         effectiveContact.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("1", net)));
         effectiveContact.addFeature(new Priority(0));
-        healing_exp1.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.0055816667", net)));
-        healing_exp2.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.01115625", net)));
-        infectiousness_erl.addFeature(StochasticTransitionFeature.newErlangInstance(2, new BigDecimal("0.060879")));
-        infectiousness_exp.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.02051375", net)));
-        noSymptoms.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.351", net)));
+        healing_exp1.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                new BigDecimal("1"),
+                MarkingExpr.from(Double.toString(healing.exponentialRate), net)
+        ));
+        healing_exp2.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                new BigDecimal("1"),
+                MarkingExpr.from(Double.toString(healing.erlangRate), net)
+        ));
+        infectiousness_erl.addFeature(StochasticTransitionFeature.newErlangInstance(
+                infectiousness.erlangStages,
+                new BigDecimal(Double.toString(infectiousness.erlangRate))
+        ));
+        infectiousness_exp.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                new BigDecimal("1"),
+                MarkingExpr.from(Double.toString(infectiousness.exponentialRate), net)
+        ));
+        noSymptoms.addFeature(StochasticTransitionFeature.newDeterministicInstance(
+                new BigDecimal("0"),
+                MarkingExpr.from(Double.toString(asymptomaticProbability), net)
+        ));
         noSymptoms.addFeature(new Priority(0));
-        symptoms.addFeature(StochasticTransitionFeature.newDeterministicInstance(new BigDecimal("0"), MarkingExpr.from("0.649", net)));
+        symptoms.addFeature(StochasticTransitionFeature.newDeterministicInstance(
+                new BigDecimal("0"),
+                MarkingExpr.from(Double.toString(symptomaticProbability), net)
+        ));
         symptoms.addFeature(new Priority(0));
-        symptomsonset_erl.addFeature(StochasticTransitionFeature.newErlangInstance(2, new BigDecimal("0.02255375")));
-        symptomsonset_exp.addFeature(StochasticTransitionFeature.newExponentialInstance(new BigDecimal("1"), MarkingExpr.from("0.01341875", net)));
+        symptomsonset_erl.addFeature(StochasticTransitionFeature.newErlangInstance(
+                symptomsOnset.erlangStages,
+                new BigDecimal(Double.toString(symptomsOnset.erlangRate))
+        ));
+        symptomsonset_exp.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                new BigDecimal("1"),
+                MarkingExpr.from(Double.toString(symptomsOnset.exponentialRate), net)
+        ));
 
         // Run analysis
         TreeTransient analysis = TreeTransient.builder()
@@ -290,17 +484,130 @@ public class STPNAnalysis {
         return Math.max(0.0, Math.min(1.0, value));
     }
 
-    private static CurveScenario activeCurveScenario() {
-        if (ACTIVE_OBSERVATION_CURVE_SCENARIO.equals("lower")) {
-            return LOWER_CURVE_SCENARIO;
+    private static AnalysisParameters defaultAnalysisParameters() {
+        return new AnalysisParameters(
+                DEFAULT_ANALYSIS_PARAMETER_CASE_ID,
+                new GeneralizedErlangSpec("hours", 2, 0.060879, 0.02051375),
+                new GeneralizedErlangSpec("hours", 1, 0.01115625, 0.0055816667),
+                0.649,
+                new GeneralizedErlangSpec("hours", 3, 0.0336325, 0.016447083),
+                new GeneralizedErlangSpec("hours", 2, 0.02255375, 0.01341875),
+                new HyperExponentialSpec("days", 0.88188, 0.11812, 4.64146, 0.62170),
+                new GeneralizedErlangSpec("days", 2, 0.60118, 0.21962)
+        );
+    }
+
+    private static String normalizeUnitMeasure(String unitMeasure) {
+        String normalized = unitMeasure == null ? "" : unitMeasure.trim().toLowerCase(Locale.ROOT);
+        if (normalized.equals("hour") || normalized.equals("hours")) {
+            return "hours";
         }
-        if (ACTIVE_OBSERVATION_CURVE_SCENARIO.equals("mid")) {
-            return MID_CURVE_SCENARIO;
+        if (normalized.equals("day") || normalized.equals("days")) {
+            return "days";
         }
-        if (ACTIVE_OBSERVATION_CURVE_SCENARIO.equals("upper")) {
-            return UPPER_CURVE_SCENARIO;
+        throw new IllegalArgumentException("Unsupported unit measure: " + unitMeasure);
+    }
+
+    private static double convertRate(double rate, String unitMeasure, String targetUnitMeasure) {
+        String source = normalizeUnitMeasure(unitMeasure);
+        String target = normalizeUnitMeasure(targetUnitMeasure);
+        if (source.equals(target)) {
+            return rate;
         }
-        throw new IllegalArgumentException("Unknown observation curve scenario: " + ACTIVE_OBSERVATION_CURVE_SCENARIO);
+        if (source.equals("hours") && target.equals("days")) {
+            return rate * 24.0;
+        }
+        if (source.equals("days") && target.equals("hours")) {
+            return rate / 24.0;
+        }
+        throw new IllegalArgumentException(
+                "Cannot convert rate from " + unitMeasure + " to " + targetUnitMeasure + "."
+        );
+    }
+
+    private static JsonObject requireJsonObject(JsonObject jsonObject, String key) {
+        if (jsonObject == null || !jsonObject.has(key) || !jsonObject.get(key).isJsonObject()) {
+            throw new IllegalArgumentException("Missing JSON object field '" + key + "'.");
+        }
+        return jsonObject.getAsJsonObject(key);
+    }
+
+    private static String requireString(JsonObject jsonObject, String key) {
+        if (jsonObject == null || !jsonObject.has(key) || jsonObject.get(key).isJsonNull()) {
+            throw new IllegalArgumentException("Missing string field '" + key + "'.");
+        }
+        return jsonObject.get(key).getAsString();
+    }
+
+    private static String optionalString(JsonObject jsonObject, String key, String fallback) {
+        if (jsonObject == null || !jsonObject.has(key) || jsonObject.get(key).isJsonNull()) {
+            return fallback;
+        }
+        return jsonObject.get(key).getAsString();
+    }
+
+    private static int requireInt(JsonObject jsonObject, String key) {
+        if (jsonObject == null || !jsonObject.has(key) || jsonObject.get(key).isJsonNull()) {
+            throw new IllegalArgumentException("Missing integer field '" + key + "'.");
+        }
+        return jsonObject.get(key).getAsInt();
+    }
+
+    private static double requireDouble(JsonObject jsonObject, String key) {
+        if (jsonObject == null || !jsonObject.has(key) || jsonObject.get(key).isJsonNull()) {
+            throw new IllegalArgumentException("Missing numeric field '" + key + "'.");
+        }
+        return jsonObject.get(key).getAsDouble();
+    }
+
+    private static GeneralizedErlangSpec parseGeneralizedErlangSpec(JsonObject transitions, String key) {
+        JsonObject transition = requireJsonObject(transitions, key);
+        return new GeneralizedErlangSpec(
+                requireString(transition, "unit_measure"),
+                requireInt(transition, "erlang_stages"),
+                requireDouble(transition, "erlang_lambda"),
+                requireDouble(transition, "exponential_lambda")
+        );
+    }
+
+    private static HyperExponentialSpec parseHyperExponentialSpec(JsonObject transitions, String key) {
+        JsonObject transition = requireJsonObject(transitions, key);
+        String distribution = optionalString(transition, "distribution", "hyperexponential");
+        if (!distribution.equalsIgnoreCase("hyperexponential")) {
+            throw new IllegalArgumentException(
+                    "Unsupported notification-to-isolation distribution: " + distribution
+            );
+        }
+        return new HyperExponentialSpec(
+                requireString(transition, "unit_measure"),
+                requireDouble(transition, "p1"),
+                requireDouble(transition, "p2"),
+                requireDouble(transition, "lambda1"),
+                requireDouble(transition, "lambda2")
+        );
+    }
+
+    private static AnalysisParameters loadAnalysisParameters(String parameterBundlePath) {
+        if (parameterBundlePath == null || parameterBundlePath.isBlank()) {
+            return defaultAnalysisParameters();
+        }
+
+        JsonObject bundle = JsonFileReader.readJsonFromFile(parameterBundlePath);
+        if (bundle == null) {
+            throw new IllegalArgumentException("Failed to read parameter bundle: " + parameterBundlePath);
+        }
+
+        JsonObject transitions = requireJsonObject(bundle, "transitions");
+        return new AnalysisParameters(
+                optionalString(bundle, "case_id", "custom_parameter_bundle"),
+                parseGeneralizedErlangSpec(transitions, "infectiousness"),
+                parseGeneralizedErlangSpec(transitions, "healing"),
+                requireDouble(requireJsonObject(transitions, "symptoms"), "true"),
+                parseGeneralizedErlangSpec(transitions, "isolating"),
+                parseGeneralizedErlangSpec(transitions, "symptomsOnset"),
+                parseHyperExponentialSpec(transitions, "notificationToIsolation"),
+                parseGeneralizedErlangSpec(transitions, "symptomaticPeriod")
+        );
     }
 
     private static boolean hasObservationCurveOffset(ObservationCurves curves, int offset) {
@@ -324,8 +631,11 @@ public class STPNAnalysis {
         return psiSurvival[elapsedOffsetSincePositiveTest];
     }
 
-    private static ObservationCurves loadOrCreateObservationCurves(float timeStepHours) throws IOException {
-        CurveScenario scenario = activeCurveScenario();
+    private static ObservationCurves loadOrCreateObservationCurves(
+            AnalysisParameters analysisParameters,
+            float timeStepHours
+    ) throws IOException {
+        CurveScenario scenario = analysisParameters.curveScenario();
         int horizonSteps = observationCurveHorizonSteps(timeStepHours);
         Path cachePath = observationCurveCachePath(scenario, timeStepHours);
         ObservationCurves curves = loadObservationCurves(cachePath, scenario, timeStepHours, horizonSteps);
@@ -357,7 +667,8 @@ public class STPNAnalysis {
     }
 
     private static Path observationCurveCachePath(CurveScenario scenario, float timeStepHours) {
-        return Path.of("observation_curves_" + scenario.name + "_step" + timeStepLabel(timeStepHours) + ".csv");
+        String scenarioLabel = scenario.name.replaceAll("[^A-Za-z0-9._-]+", "_");
+        return Path.of("observation_curves_" + scenarioLabel + "_step" + timeStepLabel(timeStepHours) + ".csv");
     }
 
     private static ObservationCurves loadObservationCurves(
@@ -716,6 +1027,95 @@ public class STPNAnalysis {
         return eventsBySubject;
     }
 
+    private static boolean loadStpnSolution(
+            File stpnCsvFile,
+            AnalysisParameters analysisParameters,
+            float timeStepHours,
+            HashMap<Integer, Double> stpnSolutionMap
+    ) {
+        HashMap<String, String> metadata = new HashMap<>();
+        boolean foundHeader = false;
+
+        try (BufferedReader reader = new BufferedReader(new FileReader(stpnCsvFile))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) {
+                    continue;
+                }
+                if (line.startsWith("#")) {
+                    String payload = line.substring(1).trim();
+                    int separator = payload.indexOf('=');
+                    if (separator > 0) {
+                        metadata.put(payload.substring(0, separator).trim(), payload.substring(separator + 1).trim());
+                    }
+                    continue;
+                }
+                if (!foundHeader) {
+                    if (!line.equals("Time,State,Value")) {
+                        return false;
+                    }
+                    foundHeader = true;
+                    continue;
+                }
+
+                String[] parts = line.split(",");
+                if (parts.length != 3) {
+                    return false;
+                }
+                int time = Integer.parseInt(parts[0]);
+                int state = Integer.parseInt(parts[1]);
+                double value = Double.parseDouble(parts[2]);
+                if (state == 0) {
+                    stpnSolutionMap.put(time, value);
+                }
+            }
+        } catch (IOException | NumberFormatException e) {
+            return false;
+        }
+
+        if (!foundHeader || stpnSolutionMap.isEmpty()) {
+            return false;
+        }
+        if (!analysisParameters.signature().equals(metadata.get("parameter_signature"))) {
+            return false;
+        }
+        try {
+            double cachedTimeStepHours = Double.parseDouble(metadata.getOrDefault("time_step_hours", "NaN"));
+            if (Math.abs(cachedTimeStepHours - (double) timeStepHours) > 1e-9) {
+                return false;
+            }
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        return true;
+    }
+
+    private static void writeStpnSolution(
+            File stpnCsvFile,
+            TransientSolution<Integer, Double> solution,
+            AnalysisParameters analysisParameters,
+            float timeStepHours,
+            HashMap<Integer, Double> stpnSolutionMap
+    ) throws IOException {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(stpnCsvFile))) {
+            writer.write("# case_id=" + analysisParameters.caseId);
+            writer.newLine();
+            writer.write("# parameter_signature=" + analysisParameters.signature());
+            writer.newLine();
+            writer.write(String.format(Locale.US, "# time_step_hours=%.12f%n", (double) timeStepHours));
+            writer.write("Time,State,Value");
+            writer.newLine();
+
+            for (int i = 0; i < solution.getSolution().length; i++) {
+                double value = solution.getSolution()[i][0][0];
+                writer.write(i + ",0," + value);
+                writer.newLine();
+                stpnSolutionMap.put(i, value);
+            }
+        }
+    }
+
     private static String getArgValue(String[] args, String name) {
         for (int i = 0; i < args.length - 1; i++) {
             if (args[i].equals(name)) {
@@ -738,7 +1138,9 @@ public class STPNAnalysis {
         if (stpnSolutionPath == null || stpnSolutionPath.isBlank()) {
             stpnSolutionPath = "stpn_solution.csv";
         }
+        String parameterBundlePath = getArgValue(args, "--parameter-bundle");
         boolean precomputeOnly = Arrays.asList(args).contains("--precompute-only");
+        AnalysisParameters analysisParameters = loadAnalysisParameters(parameterBundlePath);
 
 
         LinkedHashSet<String> discoveredJsonFiles = new LinkedHashSet<>();
@@ -755,57 +1157,31 @@ public class STPNAnalysis {
 
         List<String> jsonFiles = new ArrayList<>(discoveredJsonFiles);
         jsonFiles.forEach(System.out::println);
-        ObservationCurves observationCurves = loadOrCreateObservationCurves(time_step);
+        System.out.println("Using analysis parameter bundle: " + analysisParameters.caseId);
+        ObservationCurves observationCurves = loadOrCreateObservationCurves(analysisParameters, time_step);
         int time_limit = 84;
         int curve_time_limit = 63;
 
         HashMap<Integer, Double> stpnSolutionMap = new HashMap<>();
         File stpnCsvFile = new File(stpnSolutionPath);
-        if (!stpnCsvFile.exists()) {
-            System.out.println(stpnCsvFile.getName() + " not found. Generating new solution...");
-
+        boolean loadedExistingSolution = stpnCsvFile.exists()
+                && loadStpnSolution(stpnCsvFile, analysisParameters, time_step, stpnSolutionMap);
+        if (!loadedExistingSolution) {
+            System.out.println(stpnCsvFile.getName() + " not found or stale. Generating new solution...");
             int curveSamples = Math.round((curve_time_limit * 24.0f) / time_step);
-            TransientSolution<Integer, Double> solution = buildModel(curveSamples, time_step);
+            TransientSolution<Integer, Double> solution = buildModel(curveSamples, time_step, analysisParameters);
 
-            try (FileWriter writer = new FileWriter(stpnCsvFile)) {
-                writer.append("Time,State,Value\n"); // CSV Header
-
-                for (int i = 0; i < solution.getSolution().length; i++) {
-                    // Write the primary state (j=0) to the file and map.
-                    double value = solution.getSolution()[i][0][0];
-                    writer.append(i + ",0," + value + "\n");
-                    stpnSolutionMap.put(i, value);
-                }
-                writer.flush();
+            try {
+                stpnSolutionMap.clear();
+                writeStpnSolution(stpnCsvFile, solution, analysisParameters, time_step, stpnSolutionMap);
                 System.out.println("STPN solution saved to " + stpnCsvFile.getName());
             } catch (IOException e) {
                 System.err.println("Error writing STPN solution to CSV file.");
                 e.printStackTrace();
             }
         } else {
-            System.out.println("Loading existing solution from " + stpnCsvFile.getName() + "...");
-            try (BufferedReader reader = new BufferedReader(new FileReader(stpnCsvFile))) {
-                String line;
-                reader.readLine(); // Skip header row
-
-                while ((line = reader.readLine()) != null) {
-                    String[] parts = line.split(",");
-                    if (parts.length == 3) {
-                        int time = Integer.parseInt(parts[0]);
-                        int state = Integer.parseInt(parts[1]);
-                        double value = Double.parseDouble(parts[2]);
-
-                        // Only load data for the primary state (state=0) into our map.
-                        if (state == 0) {
-                            stpnSolutionMap.put(time, value);
-                        }
-                    }
-                }
-                System.out.println("Successfully loaded " + stpnSolutionMap.size() + " time points.");
-            } catch (IOException | NumberFormatException e) {
-                System.err.println("Error reading STPN solution from CSV file. Consider deleting it to regenerate.");
-                e.printStackTrace();
-            }
+            System.out.println("Loaded existing solution from " + stpnCsvFile.getName() + ".");
+            System.out.println("Successfully loaded " + stpnSolutionMap.size() + " time points.");
         }
 
         if (precomputeOnly) {

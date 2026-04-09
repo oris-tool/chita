@@ -1,12 +1,15 @@
 import argparse
+import copy
 import contextlib
 import csv
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import io
 import itertools
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import time
 import traceback
@@ -16,6 +19,7 @@ from xml.etree import ElementTree as ET
 
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 
 import dataset_graph as dataset_generator
 import metrics as ranking_metrics
@@ -32,6 +36,9 @@ BASELINE_ITERATIONS_CAP = 100_000
 MAX_TOP_PRECISION = 7
 TIME_STEP_HOURS = 1.0
 DEFAULT_PARAMETER_ODS_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "new-parameters.ods")
+COMPACT_PLOT_DPI = 80
+GRID_ROWS = 4
+GRID_COLS = 2
 
 PARAMETER_FAMILY_ORDER = (
     "infectiousness",
@@ -43,6 +50,7 @@ PARAMETER_FAMILY_ORDER = (
     "symptomaticPeriod",
 )
 PARAMETER_LEVEL_ORDER = ("lower", "mid", "upper")
+GROUND_TRUTH_PARAMETER_LEVEL = "mid"
 
 FAMILY_ABBREVIATIONS = {
     "infectiousness": "inf",
@@ -109,7 +117,18 @@ def mean_metric_value(metrics_path, metric_name):
     return float(sum(values) / len(values)) if values else math.nan
 
 
-def plot_overlay(series_a, series_b, title, ylabel, output_path, label_a="Analysis", label_b="Simulation"):
+def plot_overlay(
+    series_a,
+    series_b,
+    title,
+    ylabel,
+    output_path,
+    label_a="Analysis",
+    label_b="Simulation",
+    save_plot=True,
+):
+    if not save_plot:
+        return
     plt.figure(figsize=(10, 6))
     plt.plot(series_a, marker="o", label=label_a)
     plt.plot(series_b, marker="x", label=label_b)
@@ -119,7 +138,7 @@ def plot_overlay(series_a, series_b, title, ylabel, output_path, label_a="Analys
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=COMPACT_PLOT_DPI)
     plt.close()
 
 
@@ -128,6 +147,29 @@ def save_series_csv(output_path, columns, rows):
         writer = csv.writer(handle)
         writer.writerow(columns)
         writer.writerows(rows)
+
+
+def chunked(sequence, chunk_size):
+    for start in range(0, len(sequence), chunk_size):
+        yield sequence[start:start + chunk_size]
+
+
+def hide_unused_axes(axes, used_count):
+    for axis in axes[used_count:]:
+        axis.set_visible(False)
+
+
+def resolve_worker_count(requested_workers, task_count):
+    if task_count <= 0:
+        return 1
+    if requested_workers is not None:
+        if requested_workers <= 0:
+            raise ValueError("--max-workers must be greater than 0.")
+        return min(requested_workers, task_count)
+
+    cpu_count = os.cpu_count() or 1
+    default_workers = max(1, cpu_count // 2)
+    return min(default_workers, task_count)
 
 
 def sanitized_time_step_label(time_step_hours):
@@ -419,6 +461,18 @@ def enumerate_parameter_cases(parameter_space, mode="all-combinations"):
     return cases
 
 
+def resolve_uniform_parameter_bundle(parameter_space, level):
+    normalized_level = LEVEL_ALIASES.get(_normalize_label(level))
+    if normalized_level is None:
+        raise ValueError(f"Unsupported parameter level: {level}")
+
+    level_selection = {
+        family: normalized_level
+        for family in PARAMETER_FAMILY_ORDER
+    }
+    return resolve_parameter_bundle(parameter_space, level_selection)
+
+
 def manifest_row_for_bundle(bundle):
     row = {
         "case_id": bundle["case_id"],
@@ -460,9 +514,11 @@ def write_dataset_generation_parameters_markdown(
     seed_base,
     time_step_hours,
     parameter_space,
+    ground_truth_parameter_bundle,
     parameter_case_mode,
     parameter_case_count,
     parameter_manifest_paths,
+    generate_plot_images,
 ):
     content = f"""# Dataset Generation Parameters
 
@@ -476,11 +532,14 @@ This file documents the parameters used by `sweep_pipeline.py` to create the dat
 - `seed_base`: {seed_base}
 - `TIME_STEP_HOURS`: {time_step_hours}
 - `parameter_ods_path`: {parameter_space["source_path"]}
+- `ground_truth_parameter_case_id`: {ground_truth_parameter_bundle["case_id"]}
 - `parameter_case_mode`: {parameter_case_mode}
 - `parameter_case_count`: {parameter_case_count}
 - `parameter_manifest_csv`: {parameter_manifest_paths["csv_path"]}
 - `parameter_manifest_json`: {parameter_manifest_paths["json_path"]}
-- Per-run seed rule: `seed = seed_base + combination_index`
+- `generate_plot_images`: {generate_plot_images}
+- Shared ground-truth seed rule: `seed = seed_base + dataset_combination_index`
+- Per-run baseline seed rule: `seed = seed_base + dataset_combination_index * parameter_case_count + parameter_case_index + 1`
 
 ## Parameter Cases
 
@@ -489,6 +548,12 @@ This file documents the parameters used by `sweep_pipeline.py` to create the dat
 - The day-based rows are used for `notification-to-isolation` and `symptomatic_period`, then converted to hours inside the simulator after sampling.
 - The `symptomatic_period` rows are day-based because that sheet is only provided in days in the ODS file.
 - The `symptoms` sheet is unitless and is used as a probability.
+
+## Parameter Roles
+
+- The dataset-generation step itself does not depend on the lower/mid/upper transition bundle.
+- The converged Python ground-truth run is computed once per `(time_limit_days, n_subjects, total_internal_contacts)` tuple using the fixed median bundle `{ground_truth_parameter_bundle["case_id"]}`.
+- Each swept run then reuses that shared ground truth while applying its own bundle to both the timed Python baseline simulation and the Java analysis.
 
 ## Per-Run Dataset Parameters
 
@@ -528,7 +593,6 @@ These come from `dataset_graph.py`:
 - External events are generated before simulation output is converted into dataset events
 - Internal transmission events come from the epidemic simulation and are supplemented with extra internal contacts when needed to reach the requested total
 - Tests are added independently per subject using the sampler above
-- The dataset-generation step itself does not depend on the lower/mid/upper transition bundle; those parameter cases are applied in the Python simulation runs that produce the ground-truth trajectories
 - The saved dataset metadata also records:
   - `run_name`
   - `dataset_path`
@@ -562,31 +626,38 @@ def create_analysis_subject_curve_plots(
     run_name,
     analysis_path,
     ground_truth_path,
+    baseline_path,
     granularity=1.0,
+    save_plots=True,
 ):
     analysis = normalize_subject_series(read_json(analysis_path))
     ground_truth = normalize_subject_series(read_json(ground_truth_path))
+    baseline = normalize_subject_series(read_json(baseline_path))
 
     analysis_subjects = list(analysis.keys())
     ground_truth_subjects = list(ground_truth.keys())
-    if analysis_subjects != ground_truth_subjects:
-        raise ValueError("Analysis and ground-truth files do not contain the same subjects.")
+    baseline_subjects = list(baseline.keys())
+    if analysis_subjects != ground_truth_subjects or baseline_subjects != ground_truth_subjects:
+        raise ValueError(
+            "Analysis, baseline, and ground-truth files do not contain the same subjects."
+        )
 
     output_dir = ensure_dir(os.path.join(run_dir, "plots", "analysis_subject_curves"))
     dkw_result = compute_confidence_intervals(ground_truth)
     csv_rows = []
     generated_plots = []
-    java_only_plots = []
 
     for subject_id in ground_truth_subjects:
         ground_truth_values = ground_truth[subject_id]
         analysis_values = analysis[subject_id]
+        baseline_values = baseline[subject_id]
         lower = dkw_result["band"][subject_id]["lower"]
         upper = dkw_result["band"][subject_id]["upper"]
 
         if not (
             len(ground_truth_values)
             == len(analysis_values)
+            == len(baseline_values)
             == len(lower)
             == len(upper)
         ):
@@ -594,65 +665,14 @@ def create_analysis_subject_curve_plots(
 
         time_axis = np.arange(len(ground_truth_values)) * granularity
 
-        plt.figure(figsize=(10, 4.5))
-        plt.plot(
-            time_axis,
-            ground_truth_values,
-            linewidth=1.8,
-            color="tab:blue",
-            label="Ground truth mean",
-        )
-        plt.fill_between(
-            time_axis,
-            lower,
-            upper,
-            alpha=0.25,
-            color="tab:blue",
-            label="Ground truth DKW band",
-        )
-        plt.plot(
-            time_axis,
-            analysis_values,
-            linewidth=1.8,
-            color="tab:orange",
-            label="Java analysis",
-        )
-        plt.ylim(0.0, 1.0)
-        plt.xlabel("Time")
-        plt.ylabel("Probability")
-        plt.title(f"Subject {subject_id} Analysis Curve ({run_name})")
-        plt.legend()
-        plt.tight_layout()
-
-        output_name = f"{run_name}_subject_{subject_id}_analysis_curve.png"
-        output_path = os.path.join(output_dir, output_name)
-        plt.savefig(output_path, dpi=150)
-        plt.close()
-        generated_plots.append(output_path)
-
-        plt.figure(figsize=(10, 4.5))
-        plt.plot(
-            time_axis,
-            analysis_values,
-            linewidth=1.8,
-            color="tab:orange",
-            label="Java analysis",
-        )
-        plt.ylim(0.0, 1.0)
-        plt.xlabel("Time")
-        plt.ylabel("Probability")
-        plt.title(f"Subject {subject_id} Java Analysis Curve ({run_name})")
-        plt.legend()
-        plt.tight_layout()
-
-        java_only_name = f"{run_name}_subject_{subject_id}_java_curve.png"
-        java_only_path = os.path.join(output_dir, java_only_name)
-        plt.savefig(java_only_path, dpi=150)
-        plt.close()
-        java_only_plots.append(java_only_path)
-
-        for time_index, (ground_truth_value, lower_value, upper_value, analysis_value) in enumerate(
-            zip(ground_truth_values, lower, upper, analysis_values)
+        for time_index, (
+            ground_truth_value,
+            lower_value,
+            upper_value,
+            analysis_value,
+            baseline_value,
+        ) in enumerate(
+            zip(ground_truth_values, lower, upper, analysis_values, baseline_values)
         ):
             csv_rows.append(
                 [
@@ -663,8 +683,98 @@ def create_analysis_subject_curve_plots(
                     lower_value,
                     upper_value,
                     analysis_value,
+                    baseline_value,
                 ]
             )
+
+    if save_plots:
+        subjects_per_page = GRID_ROWS * GRID_COLS
+        for page_index, subject_page in enumerate(chunked(ground_truth_subjects, subjects_per_page), start=1):
+            fig, axes = plt.subplots(
+                GRID_ROWS,
+                GRID_COLS,
+                figsize=(14, 16),
+                sharex=True,
+                sharey=True,
+            )
+            flat_axes = list(axes.flat)
+            legend_handles = None
+
+            for axis, subject_id in zip(flat_axes, subject_page):
+                ground_truth_values = ground_truth[subject_id]
+                analysis_values = analysis[subject_id]
+                baseline_values = baseline[subject_id]
+                lower = dkw_result["band"][subject_id]["lower"]
+                upper = dkw_result["band"][subject_id]["upper"]
+                time_axis = np.arange(len(ground_truth_values)) * granularity
+
+                ground_truth_line, = axis.plot(
+                    time_axis,
+                    ground_truth_values,
+                    linewidth=1.6,
+                    color="tab:blue",
+                    label="Ground truth mean",
+                )
+                ground_truth_band = axis.fill_between(
+                    time_axis,
+                    lower,
+                    upper,
+                    alpha=0.2,
+                    color="tab:blue",
+                    label="Ground truth DKW band",
+                )
+                analysis_line, = axis.plot(
+                    time_axis,
+                    analysis_values,
+                    linewidth=1.6,
+                    color="tab:orange",
+                    label="Java analysis",
+                )
+                baseline_line, = axis.plot(
+                    time_axis,
+                    baseline_values,
+                    linewidth=1.6,
+                    color="tab:green",
+                    label="Simulation",
+                )
+                axis.set_title(f"Subject {subject_id}")
+                axis.set_ylim(0.0, 1.0)
+                axis.grid(True, alpha=0.3)
+
+                if legend_handles is None:
+                    legend_handles = [
+                        ground_truth_line,
+                        ground_truth_band,
+                        analysis_line,
+                        baseline_line,
+                    ]
+
+            hide_unused_axes(flat_axes, len(subject_page))
+            fig.suptitle(f"{run_name} Subject Curves", fontsize=14)
+            fig.supxlabel("Time")
+            fig.supylabel("Probability")
+            if legend_handles is not None:
+                fig.legend(
+                    legend_handles,
+                    [
+                        "Ground truth mean",
+                        "Ground truth DKW band",
+                        "Java analysis",
+                        "Simulation",
+                    ],
+                    loc="upper center",
+                    ncol=4,
+                    frameon=False,
+                )
+            fig.tight_layout(rect=(0.03, 0.03, 1.0, 0.94))
+
+            output_name = f"{run_name}_analysis_subject_curves.png"
+            if len(ground_truth_subjects) > subjects_per_page:
+                output_name = f"{run_name}_analysis_subject_curves_page_{page_index}.png"
+            output_path = os.path.join(output_dir, output_name)
+            fig.savefig(output_path, dpi=COMPACT_PLOT_DPI)
+            plt.close(fig)
+            generated_plots.append(output_path)
 
     csv_path = os.path.join(output_dir, f"{run_name}_analysis_subject_curves.csv")
     save_series_csv(
@@ -677,6 +787,7 @@ def create_analysis_subject_curve_plots(
             "ground_truth_lower_band",
             "ground_truth_upper_band",
             "analysis_probability",
+            "simulation_probability",
         ],
         csv_rows,
     )
@@ -686,7 +797,7 @@ def create_analysis_subject_curve_plots(
         "csv_path": csv_path,
         "epsilon": dkw_result["epsilon"],
         "plot_paths": generated_plots,
-        "java_curve_plot_paths": java_only_plots,
+        "java_curve_plot_paths": [],
     }
 
 
@@ -701,136 +812,117 @@ def compute_candidate_summary(ground_truth, candidate):
     summary["mrr"] = ranking_metrics.compute_mrr(ground_truth, candidate)
     for top_k in range(1, min(MAX_TOP_PRECISION, len(ground_truth)) + 1):
         precision = ranking_metrics.compute_top_n_precision(ground_truth, candidate, top_k)
-        moving_precision = ranking_metrics.compute_top_n_precision_on_a_moving_window(
-            ground_truth,
-            candidate,
-            top_n=top_k,
-            window_size=1,
-        )
         summary[f"top_{top_k}_precision_mean"] = float(np.mean(precision))
-        summary[f"top_{top_k}_precision_moving_avg_mean"] = float(np.mean(moving_precision))
+        summary[f"top_{top_k}_precision_moving_avg_mean"] = summary[f"top_{top_k}_precision_mean"]
     return summary
 
 
-def create_analysis_vs_simulation_plots(run_dir, run_name, ground_truth_path, analysis_path, baseline_path):
+def create_analysis_vs_simulation_plots(
+    run_dir,
+    run_name,
+    ground_truth_path,
+    analysis_path,
+    baseline_path,
+    save_plots=True,
+):
     ground_truth = read_json(ground_truth_path)
     analysis = read_json(analysis_path)
     baseline = read_json(baseline_path)
 
     output_dir = ensure_dir(os.path.join(run_dir, "plots", "analysis_vs_simulation"))
-    window_size = 1
+    generated_plots = []
 
     tau_analysis, _ = ranking_metrics.compute_kendalls_tau_correlation_per_timestep(ground_truth, analysis)
     tau_baseline, _ = ranking_metrics.compute_kendalls_tau_correlation_per_timestep(ground_truth, baseline)
-    plot_overlay(
-        tau_analysis,
-        tau_baseline,
-        title=f"{run_name} Analysis vs Simulation",
-        ylabel="Kendall's Tau",
-        output_path=os.path.join(output_dir, "kendalls_tau_correlation.png"),
-    )
     save_series_csv(
         os.path.join(output_dir, "kendall_correlation_data.csv"),
         ["timestep", "analysis_kendall", "simulation_kendall"],
         [[index, tau_analysis[index], tau_baseline[index]] for index in range(len(tau_analysis))],
     )
 
-    tau_analysis_moving, _ = ranking_metrics.compute_kendalls_tau_correlation_moving_window(
-        ground_truth, analysis, window_size=window_size
-    )
-    tau_baseline_moving, _ = ranking_metrics.compute_kendalls_tau_correlation_moving_window(
-        ground_truth, baseline, window_size=window_size
-    )
-    plot_overlay(
-        tau_analysis_moving,
-        tau_baseline_moving,
-        title=f"{run_name} Analysis vs Simulation (Moving Avg)",
-        ylabel="Kendall's Tau",
-        output_path=os.path.join(output_dir, "kendalls_tau_correlation_moving_avg.png"),
-    )
-
     spearman_analysis, _ = ranking_metrics.compute_spearmans_correlation_per_timestep(ground_truth, analysis)
     spearman_baseline, _ = ranking_metrics.compute_spearmans_correlation_per_timestep(ground_truth, baseline)
-    plot_overlay(
-        spearman_analysis,
-        spearman_baseline,
-        title=f"{run_name} Analysis vs Simulation",
-        ylabel="Spearman's Rho",
-        output_path=os.path.join(output_dir, "spearmans_correlation.png"),
-    )
     save_series_csv(
         os.path.join(output_dir, "spearman_correlation_data.csv"),
         ["timestep", "analysis_spearman", "simulation_spearman"],
         [[index, spearman_analysis[index], spearman_baseline[index]] for index in range(len(spearman_analysis))],
     )
 
-    spearman_analysis_moving, _ = ranking_metrics.compute_spearman_correlation_moving_window(
-        ground_truth, analysis, window_size=window_size
-    )
-    spearman_baseline_moving, _ = ranking_metrics.compute_spearman_correlation_moving_window(
-        ground_truth, baseline, window_size=window_size
-    )
-    plot_overlay(
-        spearman_analysis_moving,
-        spearman_baseline_moving,
-        title=f"{run_name} Analysis vs Simulation (Moving Avg)",
-        ylabel="Spearman's Rho",
-        output_path=os.path.join(output_dir, "spearmans_correlation_moving_avg.png"),
-    )
-
     scalar_rows = []
     max_top_precision = min(MAX_TOP_PRECISION, len(ground_truth))
+    top_precision_series = []
     for top_k in range(1, max_top_precision + 1):
         analysis_precision = ranking_metrics.compute_top_n_precision(ground_truth, analysis, top_k)
         baseline_precision = ranking_metrics.compute_top_n_precision(ground_truth, baseline, top_k)
-        plot_overlay(
-            analysis_precision,
-            baseline_precision,
-            title=f"{run_name} Analysis vs Simulation Top-{top_k} Precision",
-            ylabel=f"Top-{top_k} Precision",
-            output_path=os.path.join(output_dir, f"top_{top_k}_precision.png"),
-        )
         save_series_csv(
             os.path.join(output_dir, f"top_{top_k}_precision_data.csv"),
             ["timestep", f"analysis_top_{top_k}_precision", f"simulation_top_{top_k}_precision"],
             [[index, analysis_precision[index], baseline_precision[index]] for index in range(len(analysis_precision))],
         )
-
-        analysis_precision_moving = ranking_metrics.compute_top_n_precision_on_a_moving_window(
-            ground_truth, analysis, top_n=top_k, window_size=window_size
-        )
-        baseline_precision_moving = ranking_metrics.compute_top_n_precision_on_a_moving_window(
-            ground_truth, baseline, top_n=top_k, window_size=window_size
-        )
-        plot_overlay(
-            analysis_precision_moving,
-            baseline_precision_moving,
-            title=f"{run_name} Analysis vs Simulation Top-{top_k} Precision (Moving Avg)",
-            ylabel=f"Top-{top_k} Precision",
-            output_path=os.path.join(output_dir, f"top_{top_k}_precision_moving_avg.png"),
-        )
-        save_series_csv(
-            os.path.join(output_dir, f"top_{top_k}_precision_moving_avg_data.csv"),
-            [
-                "timestep",
-                f"analysis_top_{top_k}_precision_moving_avg",
-                f"simulation_top_{top_k}_precision_moving_avg",
-            ],
-            [
-                [index, analysis_precision_moving[index], baseline_precision_moving[index]]
-                for index in range(len(analysis_precision_moving))
-            ],
-        )
+        top_precision_series.append((top_k, analysis_precision, baseline_precision))
 
         scalar_rows.append(
             {
                 "comparison": f"top_{top_k}",
                 "analysis_mean": float(np.mean(analysis_precision)),
                 "simulation_mean": float(np.mean(baseline_precision)),
-                "analysis_moving_avg_mean": float(np.mean(analysis_precision_moving)),
-                "simulation_moving_avg_mean": float(np.mean(baseline_precision_moving)),
+                "analysis_moving_avg_mean": float(np.mean(analysis_precision)),
+                "simulation_moving_avg_mean": float(np.mean(baseline_precision)),
             }
         )
+
+    if save_plots:
+        correlation_path = os.path.join(output_dir, "correlation_plots.png")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharex=True)
+        correlation_specs = [
+            ("Kendall's Tau", tau_analysis, tau_baseline),
+            ("Spearman's Rho", spearman_analysis, spearman_baseline),
+        ]
+        for axis, (title, analysis_series, baseline_series) in zip(axes, correlation_specs):
+            axis.plot(analysis_series, linewidth=1.8, color="tab:orange", label="Analysis")
+            axis.plot(baseline_series, linewidth=1.8, color="tab:green", label="Simulation")
+            axis.set_title(title)
+            axis.set_xlabel("Timestep")
+            axis.grid(True, alpha=0.3)
+        axes[0].set_ylabel("Correlation")
+        axes[0].legend(frameon=False)
+        fig.suptitle(f"{run_name} Correlation Comparison", fontsize=14)
+        fig.tight_layout()
+        fig.savefig(correlation_path, dpi=COMPACT_PLOT_DPI)
+        plt.close(fig)
+        generated_plots.append(correlation_path)
+
+        precision_path = os.path.join(output_dir, "top_precision_grid.png")
+        fig, axes = plt.subplots(
+            GRID_ROWS,
+            GRID_COLS,
+            figsize=(14, 16),
+            sharex=True,
+            sharey=True,
+        )
+        flat_axes = list(axes.flat)
+        for axis, (top_k, analysis_precision, baseline_precision) in zip(flat_axes, top_precision_series):
+            axis.plot(analysis_precision, linewidth=1.8, color="tab:orange", label="Analysis")
+            axis.plot(baseline_precision, linewidth=1.8, color="tab:green", label="Simulation")
+            axis.set_title(f"Top-{top_k} Precision")
+            axis.set_ylim(0.0, 1.0)
+            axis.grid(True, alpha=0.3)
+        hide_unused_axes(flat_axes, len(top_precision_series))
+        fig.suptitle(f"{run_name} Top Precision", fontsize=14)
+        fig.supxlabel("Timestep")
+        fig.supylabel("Precision")
+        if top_precision_series:
+            fig.legend(
+                [flat_axes[0].lines[0], flat_axes[0].lines[1]],
+                ["Analysis", "Simulation"],
+                loc="upper center",
+                ncol=2,
+                frameon=False,
+            )
+        fig.tight_layout(rect=(0.03, 0.03, 1.0, 0.95))
+        fig.savefig(precision_path, dpi=COMPACT_PLOT_DPI)
+        plt.close(fig)
+        generated_plots.append(precision_path)
 
     analysis_summary = compute_candidate_summary(ground_truth, analysis)
     baseline_summary = compute_candidate_summary(ground_truth, baseline)
@@ -852,6 +944,7 @@ def create_analysis_vs_simulation_plots(run_dir, run_name, ground_truth_path, an
         "analysis": analysis_summary,
         "simulation": baseline_summary,
         "output_dir": output_dir,
+        "plot_paths": generated_plots,
     }
 
 
@@ -925,7 +1018,12 @@ def resolve_optional_jar(candidates, jar_name):
     raise RuntimeError(f"Required Java dependency not found: {jar_name}")
 
 
-def run_java_analysis(repo_root, run_dir, time_step_hours=TIME_STEP_HOURS):
+def run_java_analysis(
+    repo_root,
+    run_dir,
+    time_step_hours=TIME_STEP_HOURS,
+    parameter_bundle_path=None,
+):
     class_root = os.path.join(repo_root, "out", "production", "chita-main-test")
     if not os.path.exists(os.path.join(class_root, "com", "chita", "analysis", "STPNAnalysis.class")):
         raise FileNotFoundError("Compiled STPNAnalysis.class not found under out/production/chita-main-test.")
@@ -960,6 +1058,13 @@ def run_java_analysis(repo_root, run_dir, time_step_hours=TIME_STEP_HOURS):
         "--stpn-solution-path",
         stpn_solution_filename,
     ]
+    if parameter_bundle_path is not None:
+        command.extend(
+            [
+                "--parameter-bundle",
+                os.path.abspath(parameter_bundle_path),
+            ]
+        )
     java_analysis_stdout_log_path = os.path.join(run_dir, "java_analysis_stdout.log")
     java_analysis_stderr_log_path = os.path.join(run_dir, "java_analysis_stderr.log")
     java_precompute_stdout_log_path = os.path.join(run_dir, "java_precompute_stdout.log")
@@ -1068,6 +1173,145 @@ def build_run_name(time_limit_days, n_subjects, total_internal_contacts, paramet
     )
 
 
+def build_shared_ground_truth_name(
+    time_limit_days,
+    n_subjects,
+    total_internal_contacts,
+    ground_truth_parameter_bundle,
+):
+    return (
+        f"shared_ground_truth_t{time_limit_days}_s{n_subjects}_c{total_internal_contacts}"
+        f"__{ground_truth_parameter_bundle['case_id']}"
+    )
+
+
+def compute_shared_ground_truth(
+    output_root,
+    time_limit_days,
+    n_subjects,
+    total_internal_contacts,
+    seed,
+    time_step_hours=TIME_STEP_HOURS,
+    ground_truth_parameter_bundle=None,
+    save_plots=True,
+):
+    if ground_truth_parameter_bundle is None:
+        raise ValueError("compute_shared_ground_truth requires a ground_truth_parameter_bundle.")
+
+    shared_name = build_shared_ground_truth_name(
+        time_limit_days,
+        n_subjects,
+        total_internal_contacts,
+        ground_truth_parameter_bundle,
+    )
+    shared_root = ensure_dir(os.path.join(output_root, "_shared_ground_truth"))
+    shared_dir = ensure_dir(os.path.join(shared_root, shared_name))
+    fine_grained = time_step_hours < 1.0
+    ground_truth_parameter_bundle_path = os.path.join(shared_dir, "ground_truth_parameter_bundle.json")
+    write_json(ground_truth_parameter_bundle_path, ground_truth_parameter_bundle)
+
+    dataset_path, dataset_payload = generate_dataset(
+        shared_dir,
+        shared_name,
+        time_limit_days,
+        n_subjects,
+        total_internal_contacts,
+        seed,
+    )
+    convergence_result = run_dataset_simulations(
+        dataset_path=dataset_path,
+        run_until_convergence=True,
+        iterations_cap=CONVERGENCE_ITERATIONS_CAP,
+        convergence_threshold=CONVERGENCE_THRESHOLD,
+        fine_grained=fine_grained,
+        time_step_hours=time_step_hours,
+        dataset_label=shared_name,
+        seed=seed,
+        prune_after_positive_test=False,
+        export_observed_simulation=True,
+        pruning_seed=seed,
+        parameter_bundle=ground_truth_parameter_bundle,
+        save_plots=False,
+    )
+
+    summary = {
+        "run_name": shared_name,
+        "run_dir": shared_dir,
+        "time_limit": time_limit_days,
+        "n_subjects": n_subjects,
+        "total_internal_contacts": total_internal_contacts,
+        "seed": seed,
+        "time_step_hours": time_step_hours,
+        "dataset_path": dataset_path,
+        "dataset_events": len(dataset_payload["events"]),
+        "effective_dataset_path": convergence_result["effective_dataset_path"],
+        "pruned_dataset_path": convergence_result["pruned_dataset_path"],
+        "positive_test_pruning": convergence_result["positive_test_pruning"],
+        "ground_truth_parameter_case_id": ground_truth_parameter_bundle["case_id"],
+        "ground_truth_parameter_levels": ground_truth_parameter_bundle["levels"],
+        "ground_truth_parameter_unit_measure": ground_truth_parameter_bundle["unit_measure"],
+        "ground_truth_parameter_bundle_path": ground_truth_parameter_bundle_path,
+        "status": "completed",
+        "completed_at": datetime.now().isoformat(timespec="seconds"),
+        "convergence": {
+            "threshold": CONVERGENCE_THRESHOLD,
+            "iterations": convergence_result["rep_done"],
+            "reached": convergence_result["convergence_reached"],
+            "scores": convergence_result["convergence_scores"],
+            "ground_truth_path": convergence_result["averaged_results_path"],
+            "observed_simulated_path": convergence_result["observed_simulated_path"],
+            "effective_dataset_path": convergence_result["effective_dataset_path"],
+            "pruned_dataset_path": convergence_result["pruned_dataset_path"],
+            "granularity": convergence_result.get("granularity", time_step_hours),
+            "time_step_hours": convergence_result.get("time_step_hours", time_step_hours),
+            "actual_runtime_seconds": convergence_result.get("actual_runtime_seconds"),
+            "suppressed_stdout_log_path": convergence_result.get("suppressed_stdout_log_path"),
+            "parameterization": "fixed_mid_bundle",
+            "parameter_case_id": ground_truth_parameter_bundle["case_id"],
+            "parameter_levels": ground_truth_parameter_bundle["levels"],
+            "parameter_bundle_path": ground_truth_parameter_bundle_path,
+        },
+    }
+    write_json(os.path.join(shared_dir, "shared_ground_truth_summary.json"), summary)
+    return summary
+
+
+def prepare_run_inputs_from_shared_ground_truth(run_dir, run_name, shared_ground_truth):
+    shared_dataset_path = shared_ground_truth["dataset_path"]
+    local_dataset_path = os.path.join(run_dir, os.path.basename(shared_dataset_path))
+    shutil.copy2(shared_dataset_path, local_dataset_path)
+
+    shared_observed_simulated_path = shared_ground_truth["convergence"]["observed_simulated_path"]
+    local_observed_simulated_path = None
+    if shared_observed_simulated_path:
+        local_observed_simulated_path = os.path.join(
+            run_dir,
+            os.path.basename(shared_observed_simulated_path),
+        )
+        shutil.copy2(shared_observed_simulated_path, local_observed_simulated_path)
+
+    write_json(
+        os.path.join(run_dir, "dataset_metadata.json"),
+        {
+            "run_name": run_name,
+            "dataset_path": local_dataset_path,
+            "shared_dataset_path": shared_dataset_path,
+            "shared_observed_simulated_path": shared_observed_simulated_path,
+            "local_observed_simulated_path": local_observed_simulated_path,
+            "n_subjects": shared_ground_truth["n_subjects"],
+            "time_limit": shared_ground_truth["time_limit"],
+            "n_contacts": shared_ground_truth["total_internal_contacts"],
+            "seed": shared_ground_truth["seed"],
+        },
+    )
+    return {
+        "dataset_path": local_dataset_path,
+        "shared_dataset_path": shared_dataset_path,
+        "observed_simulated_path": local_observed_simulated_path,
+        "shared_observed_simulated_path": shared_observed_simulated_path,
+    }
+
+
 def run_single_pipeline(
     repo_root,
     output_root,
@@ -1077,9 +1321,16 @@ def run_single_pipeline(
     seed,
     time_step_hours=TIME_STEP_HOURS,
     parameter_bundle=None,
+    ground_truth_parameter_bundle=None,
+    shared_ground_truth=None,
+    save_plots=True,
 ):
     if parameter_bundle is None:
         raise ValueError("run_single_pipeline requires a parameter_bundle.")
+    if ground_truth_parameter_bundle is None:
+        raise ValueError("run_single_pipeline requires a ground_truth_parameter_bundle.")
+    if shared_ground_truth is None:
+        raise ValueError("run_single_pipeline requires a shared_ground_truth.")
 
     run_name = build_run_name(
         time_limit_days,
@@ -1091,6 +1342,9 @@ def run_single_pipeline(
     fine_grained = time_step_hours < 1.0
     parameter_bundle_path = os.path.join(run_dir, "parameter_bundle.json")
     write_json(parameter_bundle_path, parameter_bundle)
+    ground_truth_parameter_bundle_path = shared_ground_truth["ground_truth_parameter_bundle_path"]
+    run_inputs = prepare_run_inputs_from_shared_ground_truth(run_dir, run_name, shared_ground_truth)
+    dataset_path = run_inputs["dataset_path"]
 
     summary = {
         "run_name": run_name,
@@ -1098,83 +1352,38 @@ def run_single_pipeline(
         "time_limit": time_limit_days,
         "n_subjects": n_subjects,
         "total_internal_contacts": total_internal_contacts,
-        "seed": seed,
+        "seed": shared_ground_truth["seed"],
+        "baseline_seed": seed,
         "time_step_hours": time_step_hours,
+        "shared_ground_truth_run_dir": shared_ground_truth["run_dir"],
         "parameter_case_id": parameter_bundle["case_id"],
         "parameter_levels": parameter_bundle["levels"],
         "parameter_unit_measure": parameter_bundle["unit_measure"],
         "parameter_bundle_path": parameter_bundle_path,
+        "ground_truth_parameter_case_id": ground_truth_parameter_bundle["case_id"],
+        "ground_truth_parameter_levels": ground_truth_parameter_bundle["levels"],
+        "ground_truth_parameter_unit_measure": ground_truth_parameter_bundle["unit_measure"],
+        "ground_truth_parameter_bundle_path": ground_truth_parameter_bundle_path,
+        "dataset_path": dataset_path,
+        "shared_dataset_path": run_inputs["shared_dataset_path"],
+        "shared_observed_simulated_path": run_inputs["shared_observed_simulated_path"],
         "status": "running",
     }
     write_json(os.path.join(run_dir, "run_summary.json"), summary)
+    summary["dataset_events"] = shared_ground_truth["dataset_events"]
+    summary["effective_dataset_path"] = shared_ground_truth["effective_dataset_path"]
+    summary["pruned_dataset_path"] = shared_ground_truth["pruned_dataset_path"]
+    summary["positive_test_pruning"] = shared_ground_truth["positive_test_pruning"]
+    convergence_result = copy.deepcopy(shared_ground_truth["convergence"])
+    summary["convergence"] = convergence_result
 
-    dataset_path, dataset_payload = generate_dataset(
+    java_result = run_java_analysis(
+        repo_root,
         run_dir,
-        run_name,
-        time_limit_days,
-        n_subjects,
-        total_internal_contacts,
-        seed,
-    )
-    summary["dataset_path"] = dataset_path
-    summary["dataset_events"] = len(dataset_payload["events"])
-
-    convergence_result = run_dataset_simulations(
-        dataset_path=dataset_path,
-        run_until_convergence=True,
-        iterations_cap=CONVERGENCE_ITERATIONS_CAP,
-        convergence_threshold=CONVERGENCE_THRESHOLD,
-        fine_grained=fine_grained,
         time_step_hours=time_step_hours,
-        dataset_label=run_name,
-        seed=seed,
-        prune_after_positive_test=False,
-        export_observed_simulation=True,
-        pruning_seed=seed,
-        parameter_bundle=parameter_bundle,
+        parameter_bundle_path=parameter_bundle_path,
     )
-    summary["effective_dataset_path"] = convergence_result["effective_dataset_path"]
-    summary["pruned_dataset_path"] = convergence_result["pruned_dataset_path"]
-    summary["positive_test_pruning"] = convergence_result["positive_test_pruning"]
-    summary["convergence"] = {
-        "threshold": CONVERGENCE_THRESHOLD,
-        "iterations": convergence_result["rep_done"],
-        "reached": convergence_result["convergence_reached"],
-        "scores": convergence_result["convergence_scores"],
-        "ground_truth_path": convergence_result["averaged_results_path"],
-        "observed_simulated_path": convergence_result["observed_simulated_path"],
-        "effective_dataset_path": convergence_result["effective_dataset_path"],
-        "pruned_dataset_path": convergence_result["pruned_dataset_path"],
-        "time_step_hours": convergence_result.get("time_step_hours", time_step_hours),
-        "actual_runtime_seconds": convergence_result.get("actual_runtime_seconds"),
-        "suppressed_stdout_log_path": convergence_result.get("suppressed_stdout_log_path"),
-    }
-
-    java_result = run_java_analysis(repo_root, run_dir, time_step_hours=time_step_hours)
     analysis_path = find_generated_file(run_dir, "_tracks_it3.json")
-    analysis_curve_plots = create_analysis_subject_curve_plots(
-        run_dir=run_dir,
-        run_name=run_name,
-        analysis_path=analysis_path,
-        ground_truth_path=convergence_result["averaged_results_path"],
-        granularity=convergence_result.get("granularity", 1.0),
-    )
-    summary["analysis"] = {
-        "analysis_path": analysis_path,
-        "stpn_solution_path": java_result["stpn_solution_path"],
-        "analysis_runtime_seconds": java_result["analysis_runtime_seconds"],
-        "analysis_wall_runtime_seconds": java_result["analysis_wall_runtime_seconds"],
-        "analysis_runtime_excludes_overhead": java_result["analysis_runtime_excludes_overhead"],
-        "stpn_precomputation_runtime_seconds": java_result["stpn_precomputation_runtime_seconds"],
-        "stpn_precomputation_performed": java_result["stpn_precomputation_performed"],
-        "parameterization": "fixed_java_defaults",
-        "java_analysis_stdout_log_path": java_result["java_analysis_stdout_log_path"],
-        "java_analysis_stderr_log_path": java_result["java_analysis_stderr_log_path"],
-        "java_precompute_stdout_log_path": java_result["java_precompute_stdout_log_path"],
-        "java_precompute_stderr_log_path": java_result["java_precompute_stderr_log_path"],
-        "subject_curve_plots": analysis_curve_plots,
-    }
-
     baseline_runtime_budget_seconds = max(2.0 * java_result["analysis_runtime_seconds"], 0.0)
     baseline_result = run_dataset_simulations(
         dataset_path=dataset_path,
@@ -1189,7 +1398,36 @@ def run_single_pipeline(
         pruning_seed=seed,
         max_runtime_seconds=baseline_runtime_budget_seconds,
         parameter_bundle=parameter_bundle,
+        save_plots=False,
     )
+    analysis_curve_plots = create_analysis_subject_curve_plots(
+        run_dir=run_dir,
+        run_name=run_name,
+        analysis_path=analysis_path,
+        ground_truth_path=convergence_result["ground_truth_path"],
+        baseline_path=baseline_result["averaged_results_path"],
+        granularity=convergence_result.get("granularity", 1.0),
+        save_plots=save_plots,
+    )
+    summary["analysis"] = {
+        "analysis_path": analysis_path,
+        "stpn_solution_path": java_result["stpn_solution_path"],
+        "analysis_runtime_seconds": java_result["analysis_runtime_seconds"],
+        "analysis_wall_runtime_seconds": java_result["analysis_wall_runtime_seconds"],
+        "analysis_runtime_excludes_overhead": java_result["analysis_runtime_excludes_overhead"],
+        "stpn_precomputation_runtime_seconds": java_result["stpn_precomputation_runtime_seconds"],
+        "stpn_precomputation_performed": java_result["stpn_precomputation_performed"],
+        "parameterization": "swept_parameter_bundle",
+        "parameter_case_id": parameter_bundle["case_id"],
+        "parameter_levels": parameter_bundle["levels"],
+        "parameter_bundle_path": parameter_bundle_path,
+        "input_observed_simulated_path": run_inputs["observed_simulated_path"],
+        "java_analysis_stdout_log_path": java_result["java_analysis_stdout_log_path"],
+        "java_analysis_stderr_log_path": java_result["java_analysis_stderr_log_path"],
+        "java_precompute_stdout_log_path": java_result["java_precompute_stdout_log_path"],
+        "java_precompute_stderr_log_path": java_result["java_precompute_stderr_log_path"],
+        "subject_curve_plots": analysis_curve_plots,
+    }
     summary["baseline"] = {
         "iterations": baseline_result["rep_done"],
         "baseline_path": baseline_result["averaged_results_path"],
@@ -1200,6 +1438,10 @@ def run_single_pipeline(
         "runtime_budget_seconds": baseline_runtime_budget_seconds,
         "actual_runtime_seconds": baseline_result.get("actual_runtime_seconds"),
         "suppressed_stdout_log_path": baseline_result.get("suppressed_stdout_log_path"),
+        "parameterization": "swept_parameter_bundle",
+        "parameter_case_id": parameter_bundle["case_id"],
+        "parameter_levels": parameter_bundle["levels"],
+        "parameter_bundle_path": parameter_bundle_path,
     }
 
     precision_dir = ensure_dir(os.path.join(run_dir, "precision_metrics"))
@@ -1209,17 +1451,19 @@ def run_single_pipeline(
     with contextlib.redirect_stdout(metrics_stdout):
         process_and_save(
             analysis_path,
-            convergence_result["averaged_results_path"],
+            convergence_result["ground_truth_path"],
             M=10,
             metrics_output=prediction_metrics_path,
             plots_dir=os.path.join(precision_dir, "numericalAnalysis", "plots"),
+            save_plots=save_plots,
         )
         process_and_save(
             baseline_result["averaged_results_path"],
-            convergence_result["averaged_results_path"],
+            convergence_result["ground_truth_path"],
             M=10,
             metrics_output=baseline_metrics_path,
             plots_dir=os.path.join(precision_dir, "simulatedBaseline", "plots"),
+            save_plots=save_plots,
         )
     with open(os.path.join(precision_dir, "metrics_stdout.log"), "w", encoding="utf-8") as handle:
         handle.write(metrics_stdout.getvalue())
@@ -1227,9 +1471,10 @@ def run_single_pipeline(
     comparison_summary = create_analysis_vs_simulation_plots(
         run_dir,
         run_name,
-        convergence_result["averaged_results_path"],
+        convergence_result["ground_truth_path"],
         analysis_path,
         baseline_result["averaged_results_path"],
+        save_plots=save_plots,
     )
 
     summary["precision_metrics"] = {
@@ -1262,6 +1507,8 @@ def write_aggregate_outputs(output_root, summaries):
             "total_internal_contacts": summary["total_internal_contacts"],
             "time_step_hours": summary.get("time_step_hours"),
             "parameter_case_id": summary.get("parameter_case_id"),
+            "ground_truth_parameter_case_id": summary.get("ground_truth_parameter_case_id"),
+            "baseline_seed": summary.get("baseline_seed"),
             "infectiousness_level": parameter_levels.get("infectiousness"),
             "healing_level": parameter_levels.get("healing"),
             "symptoms_level": parameter_levels.get("symptoms"),
@@ -1329,6 +1576,20 @@ def main():
             "runs only the three lower/mid/upper bundles."
         ),
     )
+    parser.add_argument(
+        "--skip-plot-images",
+        action="store_true",
+        help="Skip PNG plot generation and keep only CSV/JSON outputs for a faster sweep.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of parameter-case workers to run in parallel. "
+            "Defaults to about half of the available CPU cores."
+        ),
+    )
     args = parser.parse_args()
     if args.time_step_hours <= 0:
         raise ValueError("--time-step-hours must be greater than 0.")
@@ -1336,6 +1597,10 @@ def main():
     repo_root = os.path.abspath(os.path.dirname(__file__))
     output_root = ensure_dir(os.path.abspath(args.output_root))
     parameter_space = load_parameter_space_from_ods(os.path.abspath(args.parameter_ods_path))
+    ground_truth_parameter_bundle = resolve_uniform_parameter_bundle(
+        parameter_space,
+        GROUND_TRUTH_PARAMETER_LEVEL,
+    )
     parameter_cases = enumerate_parameter_cases(
         parameter_space,
         mode=args.parameter_case_mode,
@@ -1346,57 +1611,190 @@ def main():
         seed_base=args.seed_base,
         time_step_hours=args.time_step_hours,
         parameter_space=parameter_space,
+        ground_truth_parameter_bundle=ground_truth_parameter_bundle,
         parameter_case_mode=args.parameter_case_mode,
         parameter_case_count=len(parameter_cases),
         parameter_manifest_paths=parameter_manifest_paths,
+        generate_plot_images=not args.skip_plot_images,
     )
 
     summaries = []
-    combinations = itertools.product(
+    dataset_combinations = list(itertools.product(
         TIME_LIMITS,
         N_SUBJECTS,
         TOTAL_INTERNAL_CONTACTS,
-        parameter_cases,
-    )
-    for index, (time_limit_days, n_subjects, total_internal_contacts, parameter_bundle) in enumerate(combinations):
-        seed = args.seed_base + index
-        try:
-            summary = run_single_pipeline(
-                repo_root=repo_root,
-                output_root=output_root,
-                time_limit_days=time_limit_days,
-                n_subjects=n_subjects,
-                total_internal_contacts=total_internal_contacts,
-                seed=seed,
-                time_step_hours=args.time_step_hours,
-                parameter_bundle=parameter_bundle,
-            )
-        except Exception as exc:
-            run_name = build_run_name(
-                time_limit_days,
-                n_subjects,
-                total_internal_contacts,
-                parameter_bundle,
-            )
-            run_dir = ensure_dir(os.path.join(output_root, run_name))
-            summary = {
-                "run_name": run_name,
-                "run_dir": run_dir,
-                "status": "failed",
-                "time_limit": time_limit_days,
-                "n_subjects": n_subjects,
-                "total_internal_contacts": total_internal_contacts,
-                "seed": seed,
-                "time_step_hours": args.time_step_hours,
-                "parameter_case_id": parameter_bundle["case_id"],
-                "parameter_levels": parameter_bundle["levels"],
-                "parameter_unit_measure": parameter_bundle["unit_measure"],
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            }
-            write_json(os.path.join(run_dir, "run_summary.json"), summary)
-        summaries.append(summary)
-        write_aggregate_outputs(output_root, summaries)
+    ))
+    parameter_case_count = len(parameter_cases)
+    worker_count = resolve_worker_count(args.max_workers, parameter_case_count)
+    total_progress_steps = len(dataset_combinations) * (parameter_case_count + 1)
+
+    with tqdm(total=total_progress_steps, desc="Sweep progress", unit="step") as progress_bar:
+        for dataset_index, (time_limit_days, n_subjects, total_internal_contacts) in enumerate(dataset_combinations):
+            dataset_label = f"t{time_limit_days}/s{n_subjects}/c{total_internal_contacts}"
+            shared_ground_truth_seed = args.seed_base + dataset_index
+            progress_bar.set_postfix_str(f"{dataset_label} | shared ground truth")
+            try:
+                shared_ground_truth = compute_shared_ground_truth(
+                    output_root=output_root,
+                    time_limit_days=time_limit_days,
+                    n_subjects=n_subjects,
+                    total_internal_contacts=total_internal_contacts,
+                    seed=shared_ground_truth_seed,
+                    time_step_hours=args.time_step_hours,
+                    ground_truth_parameter_bundle=ground_truth_parameter_bundle,
+                    save_plots=not args.skip_plot_images,
+                )
+            except Exception as exc:
+                shared_traceback = traceback.format_exc()
+                progress_bar.update(1)
+                for parameter_index, parameter_bundle in enumerate(parameter_cases):
+                    baseline_seed = (
+                        args.seed_base
+                        + dataset_index * parameter_case_count
+                        + parameter_index
+                        + 1
+                    )
+                    run_name = build_run_name(
+                        time_limit_days,
+                        n_subjects,
+                        total_internal_contacts,
+                        parameter_bundle,
+                    )
+                    run_dir = ensure_dir(os.path.join(output_root, run_name))
+                    summary = {
+                        "run_name": run_name,
+                        "run_dir": run_dir,
+                        "status": "failed",
+                        "time_limit": time_limit_days,
+                        "n_subjects": n_subjects,
+                        "total_internal_contacts": total_internal_contacts,
+                        "seed": shared_ground_truth_seed,
+                        "baseline_seed": baseline_seed,
+                        "time_step_hours": args.time_step_hours,
+                        "parameter_case_id": parameter_bundle["case_id"],
+                        "parameter_levels": parameter_bundle["levels"],
+                        "parameter_unit_measure": parameter_bundle["unit_measure"],
+                        "ground_truth_parameter_case_id": ground_truth_parameter_bundle["case_id"],
+                        "ground_truth_parameter_levels": ground_truth_parameter_bundle["levels"],
+                        "ground_truth_parameter_unit_measure": ground_truth_parameter_bundle["unit_measure"],
+                        "error": f"Shared ground truth failed: {exc}",
+                        "traceback": shared_traceback,
+                    }
+                    write_json(os.path.join(run_dir, "run_summary.json"), summary)
+                    summaries.append(summary)
+                    write_aggregate_outputs(output_root, summaries)
+                    progress_bar.set_postfix_str(
+                        f"{dataset_label} | {parameter_bundle['case_id']} failed (shared GT)"
+                    )
+                    progress_bar.update(1)
+                continue
+
+            progress_bar.update(1)
+            task_specs = []
+            for parameter_index, parameter_bundle in enumerate(parameter_cases):
+                baseline_seed = (
+                    args.seed_base
+                    + dataset_index * parameter_case_count
+                    + parameter_index
+                    + 1
+                )
+                task_specs.append(
+                    {
+                        "parameter_bundle": parameter_bundle,
+                        "baseline_seed": baseline_seed,
+                    }
+                )
+
+            completed_cases = 0
+            if worker_count == 1:
+                task_iterable = [(task_spec, None) for task_spec in task_specs]
+            else:
+                executor = ProcessPoolExecutor(max_workers=worker_count)
+                future_to_task = {
+                    executor.submit(
+                        run_single_pipeline,
+                        repo_root=repo_root,
+                        output_root=output_root,
+                        time_limit_days=time_limit_days,
+                        n_subjects=n_subjects,
+                        total_internal_contacts=total_internal_contacts,
+                        seed=task_spec["baseline_seed"],
+                        time_step_hours=args.time_step_hours,
+                        parameter_bundle=task_spec["parameter_bundle"],
+                        ground_truth_parameter_bundle=ground_truth_parameter_bundle,
+                        shared_ground_truth=shared_ground_truth,
+                        save_plots=not args.skip_plot_images,
+                    ): task_spec
+                    for task_spec in task_specs
+                }
+                task_iterable = ((future_to_task[future], future) for future in as_completed(future_to_task))
+
+            try:
+                for task_spec, future in task_iterable:
+                    parameter_bundle = task_spec["parameter_bundle"]
+                    baseline_seed = task_spec["baseline_seed"]
+                    progress_bar.set_postfix_str(
+                        f"{dataset_label} | {completed_cases}/{parameter_case_count} cases done"
+                    )
+                    try:
+                        if future is None:
+                            summary = run_single_pipeline(
+                                repo_root=repo_root,
+                                output_root=output_root,
+                                time_limit_days=time_limit_days,
+                                n_subjects=n_subjects,
+                                total_internal_contacts=total_internal_contacts,
+                                seed=baseline_seed,
+                                time_step_hours=args.time_step_hours,
+                                parameter_bundle=parameter_bundle,
+                                ground_truth_parameter_bundle=ground_truth_parameter_bundle,
+                                shared_ground_truth=shared_ground_truth,
+                                save_plots=not args.skip_plot_images,
+                            )
+                        else:
+                            summary = future.result()
+                    except Exception as exc:
+                        run_name = build_run_name(
+                            time_limit_days,
+                            n_subjects,
+                            total_internal_contacts,
+                            parameter_bundle,
+                        )
+                        run_dir = ensure_dir(os.path.join(output_root, run_name))
+                        summary = {
+                            "run_name": run_name,
+                            "run_dir": run_dir,
+                            "status": "failed",
+                            "time_limit": time_limit_days,
+                            "n_subjects": n_subjects,
+                            "total_internal_contacts": total_internal_contacts,
+                            "seed": shared_ground_truth_seed,
+                            "baseline_seed": baseline_seed,
+                            "time_step_hours": args.time_step_hours,
+                            "shared_ground_truth_run_dir": shared_ground_truth["run_dir"],
+                            "parameter_case_id": parameter_bundle["case_id"],
+                            "parameter_levels": parameter_bundle["levels"],
+                            "parameter_unit_measure": parameter_bundle["unit_measure"],
+                            "ground_truth_parameter_case_id": ground_truth_parameter_bundle["case_id"],
+                            "ground_truth_parameter_levels": ground_truth_parameter_bundle["levels"],
+                            "ground_truth_parameter_unit_measure": ground_truth_parameter_bundle["unit_measure"],
+                            "ground_truth_parameter_bundle_path": shared_ground_truth["ground_truth_parameter_bundle_path"],
+                            "error": str(exc),
+                            "traceback": traceback.format_exc() if future is None else "".join(
+                                traceback.format_exception(type(exc), exc, exc.__traceback__)
+                            ),
+                        }
+                        write_json(os.path.join(run_dir, "run_summary.json"), summary)
+                    summaries.append(summary)
+                    write_aggregate_outputs(output_root, summaries)
+                    completed_cases += 1
+                    progress_bar.set_postfix_str(
+                        f"{dataset_label} | {completed_cases}/{parameter_case_count} cases done"
+                    )
+                    progress_bar.update(1)
+            finally:
+                if worker_count != 1:
+                    executor.shutdown(wait=True, cancel_futures=False)
 
 
 if __name__ == "__main__":
