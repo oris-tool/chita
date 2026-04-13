@@ -75,8 +75,8 @@ def _sample_bundle_transition_duration(transition_spec):
     lambdas.append(exponential_lambda)
     sampled_duration = float(sample_generalized_erlang(lambdas))
     unit_measure = str(transition_spec.get("unit_measure", "hours")).strip().lower()
-    if unit_measure in {"day", "days"}:
-        return sampled_duration * HOURS_PER_DAY
+    # if unit_measure in {"day", "days"}:
+    #     return sampled_duration * HOURS_PER_DAY
     return sampled_duration
 
 
@@ -90,8 +90,8 @@ def _sample_bundle_hyper_exp_duration(transition_spec):
         )
     )
     unit_measure = str(transition_spec.get("unit_measure", "hours")).strip().lower()
-    if unit_measure in {"day", "days"}:
-        return sampled_duration * HOURS_PER_DAY
+    # if unit_measure in {"day", "days"}:
+    #     return sampled_duration * HOURS_PER_DAY
     return sampled_duration
 
 class Subject:
@@ -219,7 +219,7 @@ def infect_subject(data, subjects, subject_id, current_time, N, fine_grained_rng
                 if fine_grained_rng is not None:
                     minute = fine_grained_rng.random()
                     event_offset += minute
-                event = dataset.create_event("Symptoms", [subject_id], current_time + event_offset, risk_factor=None, result=None)
+                event = dataset.create_event("Symptoms", [subject_id], current_time + event_offset, risk_factor=None, result=None) #XXX Creazione dei sintomi
                 data["events"].append(event)
 
     if transition_parameters is not None:
@@ -297,10 +297,10 @@ def _sample_positive_test_isolation_delay(fine_grained_rng=None, transition_para
     delay_days = sample_from_hyper_exp(
         psi_parameters["p1"],
         psi_parameters["p2"],
-        psi_parameters["lambda1_per_day"],
-        psi_parameters["lambda2_per_day"],
+        psi_parameters["lambda1_per_day"] / HOURS_PER_DAY,
+        psi_parameters["lambda2_per_day"] / HOURS_PER_DAY,
     )
-    return delay_days * HOURS_PER_DAY
+    return delay_days
 
 
 def _sample_isolation_duration(
@@ -556,7 +556,7 @@ def simulate_one_iteration(
                             distortion,
                             parameter_bundle=parameter_bundle,
                         )
-        elif event_type == "Symptoms":
+        elif event_type == "Symptoms": # XXX Sintomi
             is_symptomatic = False
             for subject in involved_subjects:
                 if subjects[subject - 1].symptoms == SYMPTOMATIC:
@@ -564,7 +564,7 @@ def simulate_one_iteration(
                 elif subjects[subject - 1].symptoms == DEVELOPING_SYMPTOMS:
                     is_symptomatic = random.random() < 0.5
             event["result"] = is_symptomatic
-        elif event_type == "Test":
+        elif event_type == "Test": # XXX Test
             is_positive = False
             for subject in involved_subjects:
                 if subjects[subject - 1].state == INFECTIOUS or subjects[subject - 1].state == ISOLATED:

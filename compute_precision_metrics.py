@@ -1,6 +1,8 @@
 import json
 import os
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -10,6 +12,13 @@ import seaborn as sns
 COMPACT_PLOT_DPI = 80
 GRID_ROWS = 4
 GRID_COLS = 2
+
+
+def _safe_print(*args, **kwargs):
+    try:
+        print(*args, **kwargs)
+    except (OSError, ValueError):
+        pass
 
 
 def calculate_brier_score(p, g):
@@ -202,24 +211,24 @@ def process_and_save(
         )
         save_reliability_grids(dict_p, dict_g, g_subjects, plots_dir)
 
-    print("Coefficients Table per Subject:")
-    print("-" * 45)
-    print(results_df[["Subject", "Brier Score", "ECE"]].to_string(index=False))
-    print("-" * 45)
+    _safe_print("Coefficients Table per Subject:")
+    _safe_print("-" * 45)
+    _safe_print(results_df[["Subject", "Brier Score", "ECE"]].to_string(index=False))
+    _safe_print("-" * 45)
 
     with open(metrics_output, "w", encoding="utf-8") as fm:
         json.dump(metrics_dict, fm, indent=4)
 
-    print(f"\nAll metrics and coordinates saved successfully to: {metrics_output}")
+    _safe_print(f"\nAll metrics and coordinates saved successfully to: {metrics_output}")
     if save_plots:
-        print(f"Compact plot set saved successfully in the directory: ./{plots_dir}/")
+        _safe_print(f"Compact plot set saved successfully in the directory: ./{plots_dir}/")
     else:
-        print("Plot image generation was skipped.")
+        _safe_print("Plot image generation was skipped.")
 
 
 if __name__ == "__main__":
     for experiment_folder in [f for f in os.listdir(".") if os.path.isdir(f) and f.startswith("D")]:
-        print(f"Processing experiment folder: {experiment_folder}")
+        _safe_print(f"Processing experiment folder: {experiment_folder}")
 
         content = os.listdir(experiment_folder)
         baseline_file_path = os.path.basename(
@@ -237,9 +246,9 @@ if __name__ == "__main__":
         )
         ground_truth_file_path = os.path.join(experiment_folder, ground_truth_file_path)
 
-        print(f"  Baseline file: {baseline_file_path}")
-        print(f"  Prediction file: {prediction_file_path}")
-        print(f"  Ground Truth file: {ground_truth_file_path}")
+        _safe_print(f"  Baseline file: {baseline_file_path}")
+        _safe_print(f"  Prediction file: {prediction_file_path}")
+        _safe_print(f"  Ground Truth file: {ground_truth_file_path}")
 
         results_dir = f"{experiment_folder}/precision_metrics"
         process_and_save(

@@ -139,7 +139,7 @@ def simulate_external_introduction(
                     "type": "External",
                     "involved_subjects": [node + 1],
                     "time": float(contact_time),
-                    "risk_factor": rng.uniform(0.0, 0.99),
+                    "risk_factor": rng.uniform(0.0, 1.0),
                     "result": None,
                 }
             )
@@ -149,7 +149,7 @@ def simulate_external_introduction(
             "type": "External",
             "involved_subjects": [infected_node + 1],
             "time": float(introduction_time),
-            "risk_factor": rng.uniform(0.0, 0.99),
+            "risk_factor": rng.uniform(0.0, 1.0),
             "result": None,
         }
     )
@@ -265,7 +265,7 @@ def build_dataset_event_sequence(result):
                 "Internal",
                 sample_internal_group(graph, source, target),
                 introduction_time + time,
-                rng.uniform(0.0, 0.99),
+                rng.uniform(0.0, 1.0),
             )
         )
 

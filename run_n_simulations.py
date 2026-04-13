@@ -26,7 +26,9 @@ import argparse
 import copy
 import time
 from compute_precision_metrics import calculate_brier_score
+import matplotlib
 import numpy as np
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 

@@ -1138,6 +1138,14 @@ public class STPNAnalysis {
         if (stpnSolutionPath == null || stpnSolutionPath.isBlank()) {
             stpnSolutionPath = "stpn_solution.csv";
         }
+        int requestedIterations = 3;
+        String iterationsArg = getArgValue(args, "--iterations");
+        if (iterationsArg != null) {
+            requestedIterations = Integer.parseInt(iterationsArg);
+            if (requestedIterations <= 0) {
+                throw new IllegalArgumentException("iterations must be greater than 0");
+            }
+        }
         String parameterBundlePath = getArgValue(args, "--parameter-bundle");
         boolean precomputeOnly = Arrays.asList(args).contains("--precompute-only");
         AnalysisParameters analysisParameters = loadAnalysisParameters(parameterBundlePath);
@@ -1191,7 +1199,7 @@ public class STPNAnalysis {
         long coreAnalysisStartedAt = System.nanoTime();
         for (int repetition = 0; repetition < 1; repetition++) {
             for (int documentId = 0; documentId < jsonFiles.size(); documentId++) {
-                int n_iterations = 3;
+                int n_iterations = requestedIterations;
                 double[] priorsValues = {0.5, 0.5, 0.5};
                 String filePath = jsonFiles.get(documentId);
                 String documentName = filePath.substring(filePath.lastIndexOf("\\") + 1, filePath.lastIndexOf("."));
@@ -1402,7 +1410,7 @@ public class STPNAnalysis {
 
                                     double newValue = r_int * q * solutionValue * probabilityTrack[sampleTime] + previousValue;
 
-                                    probabilityTrack[sampleTime] *= (1.0 - (r_int * q));
+                                    probabilityTrack[sampleTime] *= (1.0 - (q * r_int)); // This is the old 
                                     currentTrack[sampleTime] = newValue;
                                 }
                                 offset_internal++;

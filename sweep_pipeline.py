@@ -2,7 +2,8 @@ import argparse
 import copy
 import contextlib
 import csv
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import hashlib
 import io
 import itertools
 import json
@@ -17,10 +18,13 @@ import zipfile
 from datetime import datetime
 from xml.etree import ElementTree as ET
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 
+import dataset
 import dataset_graph as dataset_generator
 import metrics as ranking_metrics
 from compute_precision_metrics import process_and_save
@@ -35,6 +39,24 @@ CONVERGENCE_ITERATIONS_CAP = 100_000
 BASELINE_ITERATIONS_CAP = 100_000
 MAX_TOP_PRECISION = 7
 TIME_STEP_HOURS = 1.0
+BASELINE_RUNTIME_MULTIPLIER = 1.0
+REDUCED_PLOT_BUCKET_SIZE = 10
+DATASET_SOURCE_GENERATED = "generated"
+DATASET_SOURCE_D2 = "d2"
+DEFAULT_DATASET_SOURCE = DATASET_SOURCE_GENERATED
+OBSERVED_TEST_ABLATION_NONE = "none"
+OBSERVED_TEST_ABLATION_FIRST_POSITIVE_ONLY = "first-positive-only"
+OBSERVED_TEST_ABLATION_THROUGH_FIRST_POSITIVE = "through-first-positive"
+OBSERVED_TEST_ABLATION_ONE_PER_DAY = "one-per-day"
+OBSERVED_TEST_ABLATION_CHOICES = (
+    OBSERVED_TEST_ABLATION_NONE,
+    OBSERVED_TEST_ABLATION_FIRST_POSITIVE_ONLY,
+    OBSERVED_TEST_ABLATION_THROUGH_FIRST_POSITIVE,
+    OBSERVED_TEST_ABLATION_ONE_PER_DAY,
+)
+JAVA_PRECOMPUTE_CACHE_ROOT = os.path.join("sweeps", "_java_precompute_cache")
+JAVA_PRECOMPUTE_SEED_SWEEP_ROOT = os.path.join("sweeps", "run_84_8_84_parallel_1h")
+JAVA_PRECOMPUTE_SEED_RUN_PREFIX = "run_t84_s8_c84__"
 DEFAULT_PARAMETER_ODS_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "new-parameters.ods")
 COMPACT_PLOT_DPI = 80
 GRID_ROWS = 4
@@ -111,10 +133,41 @@ def read_json(path):
         return json.load(handle)
 
 
+def dataset_generation_method_for_source(dataset_source):
+    if dataset_source == DATASET_SOURCE_D2:
+        return "dataset.create_datasets"
+    if dataset_source == DATASET_SOURCE_GENERATED:
+        return "dataset_graph.simulate_external_introduction"
+    return None
+
+
+def payload_sha256(payload):
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def mean_metric_value(metrics_path, metric_name):
     metrics_payload = read_json(metrics_path)
     values = [subject_metrics[metric_name] for subject_metrics in metrics_payload.values()]
     return float(sum(values) / len(values)) if values else math.nan
+
+
+def finite_float(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
 
 
 def plot_overlay(
@@ -174,6 +227,24 @@ def resolve_worker_count(requested_workers, task_count):
 
 def sanitized_time_step_label(time_step_hours):
     return str(time_step_hours).replace(".", "p")
+
+
+def java_time_step_label(time_step_hours):
+    label = f"{float(time_step_hours):.6f}"
+    while "." in label and label.endswith("0"):
+        label = label[:-1]
+    if label.endswith("."):
+        label = label[:-1]
+    return label.replace("-", "m").replace(".", "p")
+
+
+def java_cache_label(value):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))
+
+
+def safe_path_label(value):
+    label = java_cache_label(value).strip("._-")
+    return label or "value"
 
 
 def _normalize_label(value):
@@ -513,12 +584,19 @@ def write_dataset_generation_parameters_markdown(
     output_root,
     seed_base,
     time_step_hours,
+    baseline_runtime_multiplier,
+    dataset_source,
+    tests_enabled,
+    observed_test_ablation,
+    java_precompute_cache_root,
+    java_precompute_seed_sweep_root,
     parameter_space,
     ground_truth_parameter_bundle,
     parameter_case_mode,
     parameter_case_count,
     parameter_manifest_paths,
     generate_plot_images,
+    reduce_plots,
 ):
     content = f"""# Dataset Generation Parameters
 
@@ -531,6 +609,12 @@ This file documents the parameters used by `sweep_pipeline.py` to create the dat
 - `TOTAL_INTERNAL_CONTACTS`: {TOTAL_INTERNAL_CONTACTS}
 - `seed_base`: {seed_base}
 - `TIME_STEP_HOURS`: {time_step_hours}
+- `baseline_runtime_multiplier`: {baseline_runtime_multiplier}
+- `dataset_source`: {dataset_source}
+- `tests_enabled_in_raw_dataset`: {tests_enabled}
+- `observed_test_ablation`: {observed_test_ablation}
+- `java_precompute_cache_root`: {java_precompute_cache_root}
+- `java_precompute_seed_sweep_root`: {java_precompute_seed_sweep_root}
 - `parameter_ods_path`: {parameter_space["source_path"]}
 - `ground_truth_parameter_case_id`: {ground_truth_parameter_bundle["case_id"]}
 - `parameter_case_mode`: {parameter_case_mode}
@@ -538,6 +622,7 @@ This file documents the parameters used by `sweep_pipeline.py` to create the dat
 - `parameter_manifest_csv`: {parameter_manifest_paths["csv_path"]}
 - `parameter_manifest_json`: {parameter_manifest_paths["json_path"]}
 - `generate_plot_images`: {generate_plot_images}
+- `reduce_plots`: {reduce_plots}
 - Shared ground-truth seed rule: `seed = seed_base + dataset_combination_index`
 - Per-run baseline seed rule: `seed = seed_base + dataset_combination_index * parameter_case_count + parameter_case_index + 1`
 
@@ -552,18 +637,21 @@ This file documents the parameters used by `sweep_pipeline.py` to create the dat
 ## Parameter Roles
 
 - The dataset-generation step itself does not depend on the lower/mid/upper transition bundle.
+- Dataset selection mode: `{dataset_source}`.
+- When `dataset_source` is `d2`, the sweep generates the raw dataset with the same `dataset.create_datasets(...)` recipe used for D2 in `run_n_simulations.py`, then the usual convergence run computes tests, symptoms, and isolation behavior on top of it.
+- Raw test events are {"kept" if tests_enabled else "removed"} before the sweep starts.
+- The shared observed trace copied into each run uses the test-ablation mode `{observed_test_ablation}`. This only changes the evidence file consumed by Java; the raw dataset and the Python baseline simulation inputs stay unchanged.
 - The converged Python ground-truth run is computed once per `(time_limit_days, n_subjects, total_internal_contacts)` tuple using the fixed median bundle `{ground_truth_parameter_bundle["case_id"]}`.
 - Each swept run then reuses that shared ground truth while applying its own bundle to both the timed Python baseline simulation and the Java analysis.
+- For each swept run, the Python baseline runtime budget is `java_analysis_runtime_seconds * baseline_runtime_multiplier`.
+- Java precompute artifacts first try to reuse the known-good files from `java_precompute_seed_sweep_root`, then fall back to the shared cache under `java_precompute_cache_root`, and only recompute when neither source contains the matching bundle.
 
 ## Per-Run Dataset Parameters
 
-For each run, `generate_dataset()` calls `dataset_graph.simulate_external_introduction()` with:
+For each run, `generate_dataset()` uses one of these source-dataset methods:
 
-- `n_nodes = n_subjects`
-- `tmax_after_intro = time_limit_days * 24` hours
-- `max_intro_time = min(48.0, time_limit_days * 24)` hours
-- `total_internal_contacts = selected TOTAL_INTERNAL_CONTACTS value`
-- `seed = derived per-run seed`
+- Default mode: `dataset_graph.simulate_external_introduction()` with `n_nodes = n_subjects`, `tmax_after_intro = time_limit_days * 24`, `max_intro_time = min(48.0, time_limit_days * 24)`, `total_internal_contacts = selected TOTAL_INTERNAL_CONTACTS value`, and `seed = derived per-run seed`.
+- `--d2` mode: `dataset.create_datasets()` with `fine_grained = True`, `internal_contacts = selected TOTAL_INTERNAL_CONTACTS value`, `max_contacts = 6`, and the same derived per-run seed. This matches the raw D2-generation path used in `run_n_simulations.py`.
 
 Datasets are saved with filenames like:
 
@@ -585,14 +673,14 @@ These come from `dataset_graph.py`:
   - `max_group_size = 4`
   - `group_event_probability = 0.35`
 - Number of tests per subject:
-  - `randint(0, 2 * time_limit_days // 7)`
+  - `randint(0, 2 * time_limit_days // 7)`{" (disabled in this sweep)" if not tests_enabled else ""}
 - Event times are stored as floating-point hours in the dataset JSON
 
 ## Dataset Event Construction Notes
 
 - External events are generated before simulation output is converted into dataset events
 - Internal transmission events come from the epidemic simulation and are supplemented with extra internal contacts when needed to reach the requested total
-- Tests are added independently per subject using the sampler above
+- Tests are {"added independently per subject using the sampler above" if tests_enabled else "disabled for this sweep"}
 - The saved dataset metadata also records:
   - `run_name`
   - `dataset_path`
@@ -1018,16 +1106,100 @@ def resolve_optional_jar(candidates, jar_name):
     raise RuntimeError(f"Required Java dependency not found: {jar_name}")
 
 
+def prepare_java_precompute_cache(repo_root, parameter_bundle, time_step_hours, java_class_fingerprint):
+    cache_root = ensure_dir(os.path.join(repo_root, JAVA_PRECOMPUTE_CACHE_ROOT))
+    case_id = parameter_bundle.get("case_id", "parameter_bundle")
+    bundle_fingerprint = payload_sha256(parameter_bundle)
+    cache_key = (
+        f"{safe_path_label(case_id)}"
+        f"__bundle_{bundle_fingerprint[:16]}"
+        f"__ts{sanitized_time_step_label(time_step_hours)}"
+        f"__java_{java_class_fingerprint[:12]}"
+    )
+    cache_dir = ensure_dir(os.path.join(cache_root, cache_key))
+    cached_parameter_bundle_path = os.path.join(cache_dir, "parameter_bundle.json")
+    if not os.path.exists(cached_parameter_bundle_path):
+        write_json(cached_parameter_bundle_path, parameter_bundle)
+
+    manifest_path = os.path.join(cache_dir, "cache_manifest.json")
+    if not os.path.exists(manifest_path):
+        write_json(
+            manifest_path,
+            {
+                "case_id": case_id,
+                "time_step_hours": time_step_hours,
+                "java_precompute_cache_key": cache_key,
+                "parameter_bundle_sha256": bundle_fingerprint,
+                "java_class_sha256": java_class_fingerprint,
+                "parameter_bundle_path": cached_parameter_bundle_path,
+            },
+        )
+
+    observation_curve_filename = (
+        f"observation_curves_{java_cache_label(case_id)}"
+        f"_step{java_time_step_label(time_step_hours)}.csv"
+    )
+    stpn_solution_filename = f"stpn_solution_ts{sanitized_time_step_label(time_step_hours)}.csv"
+    return {
+        "cache_root": cache_root,
+        "cache_dir": cache_dir,
+        "cache_key": cache_key,
+        "manifest_path": manifest_path,
+        "parameter_bundle_path": cached_parameter_bundle_path,
+        "stpn_solution_filename": stpn_solution_filename,
+        "stpn_solution_path": os.path.join(cache_dir, stpn_solution_filename),
+        "observation_curve_filename": observation_curve_filename,
+        "observation_curve_path": os.path.join(cache_dir, observation_curve_filename),
+    }
+
+
+def try_seed_java_precompute_cache(repo_root, parameter_bundle, time_step_hours, cache_entry):
+    seed_root = os.path.join(repo_root, JAVA_PRECOMPUTE_SEED_SWEEP_ROOT)
+    seed_run_dir = os.path.join(
+        seed_root,
+        f"{JAVA_PRECOMPUTE_SEED_RUN_PREFIX}{parameter_bundle['case_id']}",
+    )
+    if not os.path.isdir(seed_run_dir):
+        return None
+
+    seed_parameter_bundle_path = os.path.join(seed_run_dir, "parameter_bundle.json")
+    if not os.path.exists(seed_parameter_bundle_path):
+        return None
+
+    try:
+        seed_parameter_bundle = read_json(seed_parameter_bundle_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if seed_parameter_bundle != parameter_bundle:
+        return None
+
+    seed_stpn_solution_path = os.path.join(seed_run_dir, cache_entry["stpn_solution_filename"])
+    seed_observation_curve_path = os.path.join(seed_run_dir, cache_entry["observation_curve_filename"])
+    if not (os.path.exists(seed_stpn_solution_path) and os.path.exists(seed_observation_curve_path)):
+        return None
+
+    shutil.copy2(seed_stpn_solution_path, cache_entry["stpn_solution_path"])
+    shutil.copy2(seed_observation_curve_path, cache_entry["observation_curve_path"])
+    return {
+        "seed_run_dir": seed_run_dir,
+        "seed_stpn_solution_path": seed_stpn_solution_path,
+        "seed_observation_curve_path": seed_observation_curve_path,
+    }
+
+
 def run_java_analysis(
     repo_root,
     run_dir,
     time_step_hours=TIME_STEP_HOURS,
     parameter_bundle_path=None,
+    parameter_bundle=None,
 ):
     class_root = os.path.join(repo_root, "out", "production", "chita-main-test")
-    if not os.path.exists(os.path.join(class_root, "com", "chita", "analysis", "STPNAnalysis.class")):
+    stpn_analysis_class_path = os.path.join(class_root, "com", "chita", "analysis", "STPNAnalysis.class")
+    if not os.path.exists(stpn_analysis_class_path):
         raise FileNotFoundError("Compiled STPNAnalysis.class not found under out/production/chita-main-test.")
 
+    java_class_fingerprint = file_sha256(stpn_analysis_class_path)
     java_executable = resolve_java_executable()
     gson_jar = resolve_optional_jar(
         [
@@ -1040,6 +1212,28 @@ def run_java_analysis(
         ],
         "gson",
     )
+    shared_precompute_cache = None
+    seed_reuse = None
+    observation_curve_cache_path = None
+    local_observation_curve_path = None
+    stpn_solution_filename = f"stpn_solution_ts{sanitized_time_step_label(time_step_hours)}.csv"
+    stpn_solution_path = os.path.join(run_dir, stpn_solution_filename)
+    effective_parameter_bundle_path = parameter_bundle_path
+    if parameter_bundle is not None:
+        shared_precompute_cache = prepare_java_precompute_cache(
+            repo_root=repo_root,
+            parameter_bundle=parameter_bundle,
+            time_step_hours=time_step_hours,
+            java_class_fingerprint=java_class_fingerprint,
+        )
+        stpn_solution_filename = shared_precompute_cache["stpn_solution_filename"]
+        stpn_solution_path = shared_precompute_cache["stpn_solution_path"]
+        observation_curve_cache_path = shared_precompute_cache["observation_curve_path"]
+        local_observation_curve_path = os.path.join(
+            run_dir,
+            shared_precompute_cache["observation_curve_filename"],
+        )
+        effective_parameter_bundle_path = shared_precompute_cache["parameter_bundle_path"]
     classpath = os.pathsep.join(
         [
             class_root,
@@ -1047,7 +1241,6 @@ def run_java_analysis(
             gson_jar,
         ]
     )
-    stpn_solution_filename = f"stpn_solution_ts{sanitized_time_step_label(time_step_hours)}.csv"
     command = [
         java_executable,
         "-cp",
@@ -1056,25 +1249,26 @@ def run_java_analysis(
         "--time-step",
         str(time_step_hours),
         "--stpn-solution-path",
-        stpn_solution_filename,
+        os.path.abspath(stpn_solution_path),
     ]
-    if parameter_bundle_path is not None:
+    if effective_parameter_bundle_path is not None:
         command.extend(
             [
                 "--parameter-bundle",
-                os.path.abspath(parameter_bundle_path),
+                os.path.abspath(effective_parameter_bundle_path),
             ]
         )
     java_analysis_stdout_log_path = os.path.join(run_dir, "java_analysis_stdout.log")
     java_analysis_stderr_log_path = os.path.join(run_dir, "java_analysis_stderr.log")
-    java_precompute_stdout_log_path = os.path.join(run_dir, "java_precompute_stdout.log")
-    java_precompute_stderr_log_path = os.path.join(run_dir, "java_precompute_stderr.log")
+    precompute_log_dir = shared_precompute_cache["cache_dir"] if shared_precompute_cache is not None else run_dir
+    java_precompute_stdout_log_path = os.path.join(precompute_log_dir, "java_precompute_stdout.log")
+    java_precompute_stderr_log_path = os.path.join(precompute_log_dir, "java_precompute_stderr.log")
 
-    def execute_java_command(extra_args=None, stdout_log_path=None, stderr_log_path=None):
+    def execute_java_command(extra_args=None, stdout_log_path=None, stderr_log_path=None, working_dir=None):
         started_at = time.perf_counter()
         result = subprocess.run(
             command + ([] if extra_args is None else extra_args),
-            cwd=run_dir,
+            cwd=run_dir if working_dir is None else working_dir,
             capture_output=True,
             text=True,
             check=False,
@@ -1100,10 +1294,39 @@ def run_java_analysis(
             return None
         return float(match.group(1))
 
-    stpn_solution_path = os.path.join(run_dir, stpn_solution_filename)
     precomputation_runtime_seconds = 0.0
     precomputation_performed = False
-    if not os.path.exists(stpn_solution_path):
+    java_precompute_cache_hit = False
+    if shared_precompute_cache is not None:
+        java_precompute_cache_hit = (
+            os.path.exists(stpn_solution_path)
+            and os.path.exists(observation_curve_cache_path)
+        )
+        if not java_precompute_cache_hit:
+            seed_reuse = try_seed_java_precompute_cache(
+                repo_root=repo_root,
+                parameter_bundle=parameter_bundle,
+                time_step_hours=time_step_hours,
+                cache_entry=shared_precompute_cache,
+            )
+            java_precompute_cache_hit = (
+                os.path.exists(stpn_solution_path)
+                and os.path.exists(observation_curve_cache_path)
+            )
+        if not java_precompute_cache_hit:
+            _, precomputation_runtime_seconds = execute_java_command(
+                ["--precompute-only"],
+                stdout_log_path=java_precompute_stdout_log_path,
+                stderr_log_path=java_precompute_stderr_log_path,
+                working_dir=shared_precompute_cache["cache_dir"],
+            )
+            precomputation_performed = True
+        if not os.path.exists(observation_curve_cache_path):
+            raise FileNotFoundError(
+                f"Expected observation curve cache file after precompute: {observation_curve_cache_path}"
+            )
+        shutil.copy2(observation_curve_cache_path, local_observation_curve_path)
+    elif not os.path.exists(stpn_solution_path):
         _, precomputation_runtime_seconds = execute_java_command(
             ["--precompute-only"],
             stdout_log_path=java_precompute_stdout_log_path,
@@ -1132,6 +1355,14 @@ def run_java_analysis(
         "analysis_runtime_excludes_overhead": analysis_core_runtime_seconds is not None,
         "stpn_precomputation_runtime_seconds": precomputation_runtime_seconds,
         "stpn_precomputation_performed": precomputation_performed,
+        "java_precompute_cache_root": shared_precompute_cache["cache_root"] if shared_precompute_cache is not None else None,
+        "java_precompute_cache_dir": shared_precompute_cache["cache_dir"] if shared_precompute_cache is not None else None,
+        "java_precompute_cache_key": shared_precompute_cache["cache_key"] if shared_precompute_cache is not None else None,
+        "java_precompute_cache_manifest_path": shared_precompute_cache["manifest_path"] if shared_precompute_cache is not None else None,
+        "java_precompute_cache_hit": shared_precompute_cache is not None and not precomputation_performed,
+        "java_precompute_seed_run_dir": None if seed_reuse is None else seed_reuse["seed_run_dir"],
+        "observation_curve_cache_path": observation_curve_cache_path,
+        "local_observation_curve_path": local_observation_curve_path,
         "java_analysis_stdout_log_path": java_analysis_stdout_log_path,
         "java_analysis_stderr_log_path": java_analysis_stderr_log_path,
         "java_precompute_stdout_log_path": java_precompute_stdout_log_path if precomputation_performed else None,
@@ -1139,28 +1370,203 @@ def run_java_analysis(
     }
 
 
-def generate_dataset(run_dir, run_name, time_limit_days, n_subjects, total_internal_contacts, seed):
-    result = dataset_generator.simulate_external_introduction(
-        n_nodes=n_subjects,
-        tmax_after_intro=float(time_limit_days * 24),
-        max_intro_time=min(48.0, float(time_limit_days * 24)),
-        total_internal_contacts=total_internal_contacts,
-        seed=seed,
+def generate_d2_style_source_dataset(run_dir, time_limit_days, n_subjects, total_internal_contacts, seed):
+    d2_source_dir = ensure_dir(os.path.join(run_dir, "_d2_style_source"))
+    dataset_prefix = os.path.join(
+        d2_source_dir,
+        f"dataset_s{n_subjects}_t{time_limit_days}",
     )
+    with contextlib.redirect_stdout(io.StringIO()):
+        created_files = dataset.create_datasets(
+            dataset_prefix,
+            [n_subjects],
+            [time_limit_days],
+            seed=seed,
+            fine_grained=True,
+            internal_contacts={total_internal_contacts},
+            max_contacts=6,
+        )
+    if len(created_files) != 1:
+        raise RuntimeError(
+            "Expected exactly one D2-style dataset to be generated, "
+            f"but got {len(created_files)}: {created_files}"
+        )
+
+    source_dataset_path = created_files[0]
+    if not os.path.exists(source_dataset_path):
+        raise FileNotFoundError(
+            f"D2-style dataset generation did not create the expected file: {source_dataset_path}"
+        )
+    return source_dataset_path, read_json(source_dataset_path)
+
+
+def remove_test_events_from_payload(payload):
+    filtered_events = [event for event in payload["events"] if event.get("type") != "Test"]
+    removed_tests = len(payload["events"]) - len(filtered_events)
+    filtered_payload = copy.deepcopy(payload)
+    filtered_payload["events"] = filtered_events
+    return filtered_payload, removed_tests
+
+
+def _observed_test_subject_key(event):
+    return tuple(event.get("involved_subjects", []))
+
+
+def _sort_events_for_serialization(events):
+    return sorted(events, key=lambda event: float(event.get("time", 0.0)))
+
+
+def apply_observed_test_ablation(payload, ablation_mode):
+    normalized_mode = ablation_mode or OBSERVED_TEST_ABLATION_NONE
+    if normalized_mode not in OBSERVED_TEST_ABLATION_CHOICES:
+        raise ValueError(
+            f"Unsupported observed-test ablation mode: {normalized_mode}. "
+            f"Expected one of {OBSERVED_TEST_ABLATION_CHOICES}."
+        )
+
+    filtered_payload = copy.deepcopy(payload)
+    events = list(filtered_payload["events"])
+    test_events = [
+        event for event in events
+        if event.get("type") == "Test"
+    ]
+    positive_before = sum(1 for event in test_events if event.get("result") is True)
+    negative_before = sum(1 for event in test_events if event.get("result") is False)
+    stats = {
+        "mode": normalized_mode,
+        "tests_before": len(test_events),
+        "positive_tests_before": positive_before,
+        "negative_tests_before": negative_before,
+    }
+    if normalized_mode == OBSERVED_TEST_ABLATION_NONE or not test_events:
+        stats.update(
+            {
+                "tests_after": len(test_events),
+                "positive_tests_after": positive_before,
+                "negative_tests_after": negative_before,
+                "tests_removed": 0,
+            }
+        )
+        return filtered_payload, stats
+
+    non_test_events = [
+        event for event in events
+        if event.get("type") != "Test"
+    ]
+    sorted_test_events = _sort_events_for_serialization(test_events)
+    kept_tests = []
+
+    if normalized_mode == OBSERVED_TEST_ABLATION_FIRST_POSITIVE_ONLY:
+        first_positive_by_subject = {}
+        for event in sorted_test_events:
+            if event.get("result") is not True:
+                continue
+            subject_key = _observed_test_subject_key(event)
+            if subject_key not in first_positive_by_subject:
+                first_positive_by_subject[subject_key] = event
+        kept_tests = list(first_positive_by_subject.values())
+    elif normalized_mode == OBSERVED_TEST_ABLATION_THROUGH_FIRST_POSITIVE:
+        locked_subjects = set()
+        for event in sorted_test_events:
+            subject_key = _observed_test_subject_key(event)
+            if subject_key in locked_subjects:
+                continue
+            kept_tests.append(event)
+            if event.get("result") is True:
+                locked_subjects.add(subject_key)
+    elif normalized_mode == OBSERVED_TEST_ABLATION_ONE_PER_DAY:
+        kept_by_subject_day = {}
+        for event in sorted_test_events:
+            subject_key = _observed_test_subject_key(event)
+            day_index = int(math.floor(float(event.get("time", 0.0)) / 24.0))
+            key = (subject_key, day_index)
+            existing_event = kept_by_subject_day.get(key)
+            if existing_event is None:
+                kept_by_subject_day[key] = event
+                continue
+            if existing_event.get("result") is True:
+                continue
+            if event.get("result") is True:
+                kept_by_subject_day[key] = event
+        kept_tests = list(kept_by_subject_day.values())
+    else:
+        raise ValueError(f"Unhandled observed-test ablation mode: {normalized_mode}")
+
+    kept_tests = _sort_events_for_serialization(kept_tests)
+    filtered_payload["events"] = _sort_events_for_serialization(non_test_events + kept_tests)
+    positive_after = sum(1 for event in kept_tests if event.get("result") is True)
+    negative_after = sum(1 for event in kept_tests if event.get("result") is False)
+    stats.update(
+        {
+            "tests_after": len(kept_tests),
+            "positive_tests_after": positive_after,
+            "negative_tests_after": negative_after,
+            "tests_removed": len(test_events) - len(kept_tests),
+        }
+    )
+    return filtered_payload, stats
+
+
+def generate_dataset(
+    repo_root,
+    run_dir,
+    run_name,
+    time_limit_days,
+    n_subjects,
+    total_internal_contacts,
+    seed,
+    dataset_source=DEFAULT_DATASET_SOURCE,
+    disable_tests=False,
+):
     dataset_path = os.path.join(
         run_dir,
         f"dataset_s{n_subjects}_t{time_limit_days}_c{total_internal_contacts}.json",
     )
-    payload = dataset_generator.save_dataset_event_sequence(result, dataset_path)
+    source_dataset_path = None
+    dataset_generation_seed = seed
+    dataset_generation_method = dataset_generation_method_for_source(dataset_source)
+    if dataset_source == DATASET_SOURCE_D2:
+        source_dataset_path, payload = generate_d2_style_source_dataset(
+            run_dir,
+            time_limit_days,
+            n_subjects,
+            total_internal_contacts,
+            seed,
+        )
+        write_json(dataset_path, payload)
+    elif dataset_source == DATASET_SOURCE_GENERATED:
+        result = dataset_generator.simulate_external_introduction(
+            n_nodes=n_subjects,
+            tmax_after_intro=float(time_limit_days * 24),
+            max_intro_time=min(48.0, float(time_limit_days * 24)),
+            total_internal_contacts=total_internal_contacts,
+            seed=seed,
+        )
+        payload = dataset_generator.save_dataset_event_sequence(result, dataset_path)
+    else:
+        raise ValueError(f"Unsupported dataset source: {dataset_source}")
+
+    removed_test_events = 0
+    if disable_tests:
+        payload, removed_test_events = remove_test_events_from_payload(payload)
+        write_json(dataset_path, payload)
+        if source_dataset_path is not None and os.path.abspath(source_dataset_path) != os.path.abspath(dataset_path):
+            write_json(source_dataset_path, payload)
+
     write_json(
         os.path.join(run_dir, "dataset_metadata.json"),
         {
             "run_name": run_name,
             "dataset_path": dataset_path,
+            "dataset_source": dataset_source,
+            "source_dataset_path": source_dataset_path,
+            "dataset_generation_method": dataset_generation_method,
             "n_subjects": payload["n_subjects"],
             "time_limit": payload["time_limit"],
             "n_contacts": payload["n_contacts"],
-            "seed": seed,
+            "seed": dataset_generation_seed,
+            "tests_enabled": not disable_tests,
+            "removed_test_events": removed_test_events,
         },
     )
     return dataset_path, payload
@@ -1186,14 +1592,17 @@ def build_shared_ground_truth_name(
 
 
 def compute_shared_ground_truth(
+    repo_root,
     output_root,
     time_limit_days,
     n_subjects,
     total_internal_contacts,
     seed,
     time_step_hours=TIME_STEP_HOURS,
+    dataset_source=DEFAULT_DATASET_SOURCE,
     ground_truth_parameter_bundle=None,
     save_plots=True,
+    disable_tests=False,
 ):
     if ground_truth_parameter_bundle is None:
         raise ValueError("compute_shared_ground_truth requires a ground_truth_parameter_bundle.")
@@ -1211,12 +1620,15 @@ def compute_shared_ground_truth(
     write_json(ground_truth_parameter_bundle_path, ground_truth_parameter_bundle)
 
     dataset_path, dataset_payload = generate_dataset(
+        repo_root,
         shared_dir,
         shared_name,
         time_limit_days,
         n_subjects,
         total_internal_contacts,
         seed,
+        dataset_source=dataset_source,
+        disable_tests=disable_tests,
     )
     convergence_result = run_dataset_simulations(
         dataset_path=dataset_path,
@@ -1242,8 +1654,12 @@ def compute_shared_ground_truth(
         "total_internal_contacts": total_internal_contacts,
         "seed": seed,
         "time_step_hours": time_step_hours,
+        "dataset_source": dataset_source,
+        "dataset_generation_method": dataset_generation_method_for_source(dataset_source),
         "dataset_path": dataset_path,
         "dataset_events": len(dataset_payload["events"]),
+        "tests_enabled": not disable_tests,
+        "dataset_test_events": len([event for event in dataset_payload["events"] if event["type"] == "Test"]),
         "effective_dataset_path": convergence_result["effective_dataset_path"],
         "pruned_dataset_path": convergence_result["pruned_dataset_path"],
         "positive_test_pruning": convergence_result["positive_test_pruning"],
@@ -1276,25 +1692,69 @@ def compute_shared_ground_truth(
     return summary
 
 
-def prepare_run_inputs_from_shared_ground_truth(run_dir, run_name, shared_ground_truth):
+def prepare_run_inputs_from_shared_ground_truth(
+    run_dir,
+    run_name,
+    shared_ground_truth,
+    observed_test_ablation=OBSERVED_TEST_ABLATION_NONE,
+):
     shared_dataset_path = shared_ground_truth["dataset_path"]
     local_dataset_path = os.path.join(run_dir, os.path.basename(shared_dataset_path))
     shutil.copy2(shared_dataset_path, local_dataset_path)
 
     shared_observed_simulated_path = shared_ground_truth["convergence"]["observed_simulated_path"]
     local_observed_simulated_path = None
+    observed_test_ablation_stats = {
+        "mode": observed_test_ablation,
+        "tests_before": 0,
+        "positive_tests_before": 0,
+        "negative_tests_before": 0,
+        "tests_after": 0,
+        "positive_tests_after": 0,
+        "negative_tests_after": 0,
+        "tests_removed": 0,
+    }
     if shared_observed_simulated_path:
         local_observed_simulated_path = os.path.join(
             run_dir,
             os.path.basename(shared_observed_simulated_path),
         )
         shutil.copy2(shared_observed_simulated_path, local_observed_simulated_path)
+        observed_payload = read_json(local_observed_simulated_path)
+        if observed_test_ablation != OBSERVED_TEST_ABLATION_NONE:
+            observed_payload, observed_test_ablation_stats = apply_observed_test_ablation(
+                observed_payload,
+                observed_test_ablation,
+            )
+            write_json(local_observed_simulated_path, observed_payload)
+        else:
+            observed_test_ablation_stats["mode"] = OBSERVED_TEST_ABLATION_NONE
+            observed_test_ablation_stats["tests_before"] = sum(
+                1
+                for event in observed_payload["events"]
+                if event.get("type") == "Test"
+            )
+            observed_test_ablation_stats["positive_tests_before"] = sum(
+                1
+                for event in observed_payload["events"]
+                if event.get("type") == "Test" and event.get("result") is True
+            )
+            observed_test_ablation_stats["negative_tests_before"] = sum(
+                1
+                for event in observed_payload["events"]
+                if event.get("type") == "Test" and event.get("result") is False
+            )
+            observed_test_ablation_stats["tests_after"] = observed_test_ablation_stats["tests_before"]
+            observed_test_ablation_stats["positive_tests_after"] = observed_test_ablation_stats["positive_tests_before"]
+            observed_test_ablation_stats["negative_tests_after"] = observed_test_ablation_stats["negative_tests_before"]
 
     write_json(
         os.path.join(run_dir, "dataset_metadata.json"),
         {
             "run_name": run_name,
             "dataset_path": local_dataset_path,
+            "dataset_source": shared_ground_truth.get("dataset_source", DEFAULT_DATASET_SOURCE),
+            "dataset_generation_method": shared_ground_truth.get("dataset_generation_method"),
             "shared_dataset_path": shared_dataset_path,
             "shared_observed_simulated_path": shared_observed_simulated_path,
             "local_observed_simulated_path": local_observed_simulated_path,
@@ -1302,6 +1762,10 @@ def prepare_run_inputs_from_shared_ground_truth(run_dir, run_name, shared_ground
             "time_limit": shared_ground_truth["time_limit"],
             "n_contacts": shared_ground_truth["total_internal_contacts"],
             "seed": shared_ground_truth["seed"],
+            "tests_enabled": shared_ground_truth.get("tests_enabled", True),
+            "dataset_test_events": shared_ground_truth.get("dataset_test_events"),
+            "observed_test_ablation": observed_test_ablation,
+            "observed_test_ablation_stats": observed_test_ablation_stats,
         },
     )
     return {
@@ -1309,6 +1773,8 @@ def prepare_run_inputs_from_shared_ground_truth(run_dir, run_name, shared_ground
         "shared_dataset_path": shared_dataset_path,
         "observed_simulated_path": local_observed_simulated_path,
         "shared_observed_simulated_path": shared_observed_simulated_path,
+        "observed_test_ablation": observed_test_ablation,
+        "observed_test_ablation_stats": observed_test_ablation_stats,
     }
 
 
@@ -1320,9 +1786,11 @@ def run_single_pipeline(
     total_internal_contacts,
     seed,
     time_step_hours=TIME_STEP_HOURS,
+    baseline_runtime_multiplier=BASELINE_RUNTIME_MULTIPLIER,
     parameter_bundle=None,
     ground_truth_parameter_bundle=None,
     shared_ground_truth=None,
+    observed_test_ablation=OBSERVED_TEST_ABLATION_NONE,
     save_plots=True,
 ):
     if parameter_bundle is None:
@@ -1343,7 +1811,12 @@ def run_single_pipeline(
     parameter_bundle_path = os.path.join(run_dir, "parameter_bundle.json")
     write_json(parameter_bundle_path, parameter_bundle)
     ground_truth_parameter_bundle_path = shared_ground_truth["ground_truth_parameter_bundle_path"]
-    run_inputs = prepare_run_inputs_from_shared_ground_truth(run_dir, run_name, shared_ground_truth)
+    run_inputs = prepare_run_inputs_from_shared_ground_truth(
+        run_dir,
+        run_name,
+        shared_ground_truth,
+        observed_test_ablation=observed_test_ablation,
+    )
     dataset_path = run_inputs["dataset_path"]
 
     summary = {
@@ -1355,6 +1828,13 @@ def run_single_pipeline(
         "seed": shared_ground_truth["seed"],
         "baseline_seed": seed,
         "time_step_hours": time_step_hours,
+        "baseline_runtime_multiplier": baseline_runtime_multiplier,
+        "dataset_source": shared_ground_truth.get("dataset_source", DEFAULT_DATASET_SOURCE),
+        "dataset_generation_method": shared_ground_truth.get("dataset_generation_method"),
+        "tests_enabled": shared_ground_truth.get("tests_enabled", True),
+        "dataset_test_events": shared_ground_truth.get("dataset_test_events"),
+        "observed_test_ablation": run_inputs["observed_test_ablation"],
+        "observed_test_ablation_stats": run_inputs["observed_test_ablation_stats"],
         "shared_ground_truth_run_dir": shared_ground_truth["run_dir"],
         "parameter_case_id": parameter_bundle["case_id"],
         "parameter_levels": parameter_bundle["levels"],
@@ -1382,9 +1862,13 @@ def run_single_pipeline(
         run_dir,
         time_step_hours=time_step_hours,
         parameter_bundle_path=parameter_bundle_path,
+        parameter_bundle=parameter_bundle,
     )
     analysis_path = find_generated_file(run_dir, "_tracks_it3.json")
-    baseline_runtime_budget_seconds = max(2.0 * java_result["analysis_runtime_seconds"], 0.0)
+    baseline_runtime_budget_seconds = max(
+        baseline_runtime_multiplier * java_result["analysis_runtime_seconds"],
+        0.0,
+    )
     baseline_result = run_dataset_simulations(
         dataset_path=dataset_path,
         rep=BASELINE_ITERATIONS_CAP,
@@ -1417,6 +1901,14 @@ def run_single_pipeline(
         "analysis_runtime_excludes_overhead": java_result["analysis_runtime_excludes_overhead"],
         "stpn_precomputation_runtime_seconds": java_result["stpn_precomputation_runtime_seconds"],
         "stpn_precomputation_performed": java_result["stpn_precomputation_performed"],
+        "java_precompute_cache_root": java_result["java_precompute_cache_root"],
+        "java_precompute_cache_dir": java_result["java_precompute_cache_dir"],
+        "java_precompute_cache_key": java_result["java_precompute_cache_key"],
+        "java_precompute_cache_manifest_path": java_result["java_precompute_cache_manifest_path"],
+        "java_precompute_cache_hit": java_result["java_precompute_cache_hit"],
+        "java_precompute_seed_run_dir": java_result["java_precompute_seed_run_dir"],
+        "observation_curve_cache_path": java_result["observation_curve_cache_path"],
+        "local_observation_curve_path": java_result["local_observation_curve_path"],
         "parameterization": "swept_parameter_bundle",
         "parameter_case_id": parameter_bundle["case_id"],
         "parameter_levels": parameter_bundle["levels"],
@@ -1435,6 +1927,7 @@ def run_single_pipeline(
         "effective_dataset_path": baseline_result["effective_dataset_path"],
         "pruned_dataset_path": baseline_result["pruned_dataset_path"],
         "time_step_hours": baseline_result.get("time_step_hours", time_step_hours),
+        "runtime_multiplier": baseline_runtime_multiplier,
         "runtime_budget_seconds": baseline_runtime_budget_seconds,
         "actual_runtime_seconds": baseline_result.get("actual_runtime_seconds"),
         "suppressed_stdout_log_path": baseline_result.get("suppressed_stdout_log_path"),
@@ -1502,10 +1995,18 @@ def write_aggregate_outputs(output_root, summaries):
         row = {
             "run_name": summary["run_name"],
             "status": summary["status"],
+            "dataset_source": summary.get("dataset_source"),
+            "dataset_generation_method": summary.get("dataset_generation_method"),
             "time_limit": summary["time_limit"],
             "n_subjects": summary["n_subjects"],
             "total_internal_contacts": summary["total_internal_contacts"],
             "time_step_hours": summary.get("time_step_hours"),
+            "baseline_runtime_multiplier": summary.get("baseline_runtime_multiplier"),
+            "observed_test_ablation": summary.get("observed_test_ablation"),
+            "observed_test_events_before": summary.get("observed_test_ablation_stats", {}).get("tests_before"),
+            "observed_test_events_after": summary.get("observed_test_ablation_stats", {}).get("tests_after"),
+            "observed_positive_tests_before": summary.get("observed_test_ablation_stats", {}).get("positive_tests_before"),
+            "observed_positive_tests_after": summary.get("observed_test_ablation_stats", {}).get("positive_tests_after"),
             "parameter_case_id": summary.get("parameter_case_id"),
             "ground_truth_parameter_case_id": summary.get("ground_truth_parameter_case_id"),
             "baseline_seed": summary.get("baseline_seed"),
@@ -1523,6 +2024,8 @@ def write_aggregate_outputs(output_root, summaries):
             "java_analysis_wall_runtime_seconds": summary.get("analysis", {}).get("analysis_wall_runtime_seconds"),
             "java_analysis_runtime_excludes_overhead": summary.get("analysis", {}).get("analysis_runtime_excludes_overhead"),
             "stpn_precomputation_runtime_seconds": summary.get("analysis", {}).get("stpn_precomputation_runtime_seconds"),
+            "java_precompute_cache_hit": summary.get("analysis", {}).get("java_precompute_cache_hit"),
+            "java_precompute_seed_run_dir": summary.get("analysis", {}).get("java_precompute_seed_run_dir"),
             "baseline_runtime_budget_seconds": summary.get("baseline", {}).get("runtime_budget_seconds"),
             "baseline_actual_runtime_seconds": summary.get("baseline", {}).get("actual_runtime_seconds"),
             "baseline_iterations": summary.get("baseline", {}).get("iterations"),
@@ -1547,6 +2050,161 @@ def write_aggregate_outputs(output_root, summaries):
         writer.writerows(csv_rows)
 
 
+def select_summaries_for_reduced_plots(summaries):
+    ranked = []
+    for summary in summaries:
+        if summary.get("status") != "completed":
+            continue
+        spearman = finite_float(
+            summary.get("comparison_metrics", {}).get("analysis", {}).get("spearman")
+        )
+        if spearman is None:
+            continue
+        ranked.append((spearman, summary))
+
+    ranked.sort(key=lambda item: (item[0], item[1].get("run_name", "")))
+    if not ranked:
+        return [], []
+
+    bucket_size = min(REDUCED_PLOT_BUCKET_SIZE, len(ranked))
+    median_bucket_size = min(REDUCED_PLOT_BUCKET_SIZE, len(ranked))
+    median_center = len(ranked) // 2
+    median_start = max(
+        0,
+        min(len(ranked) - median_bucket_size, median_center - median_bucket_size // 2),
+    )
+
+    selected_by_run = {}
+
+    def add_selected(summary, reason):
+        run_name = summary["run_name"]
+        info = selected_by_run.setdefault(
+            run_name,
+            {
+                "summary": summary,
+                "reasons": [],
+                "analysis_spearman": finite_float(
+                    summary.get("comparison_metrics", {}).get("analysis", {}).get("spearman")
+                ),
+            },
+        )
+        if reason not in info["reasons"]:
+            info["reasons"].append(reason)
+
+    for _, summary in ranked[:bucket_size]:
+        add_selected(summary, "worst_10")
+    for _, summary in ranked[-bucket_size:]:
+        add_selected(summary, "best_10")
+    for _, summary in ranked[median_start:median_start + median_bucket_size]:
+        add_selected(summary, "median_10")
+    for _, summary in ranked:
+        if summary.get("parameter_case_id") == summary.get("ground_truth_parameter_case_id"):
+            add_selected(summary, "mid_parameter_case")
+
+    selected_summaries = [
+        item["summary"]
+        for item in sorted(
+            selected_by_run.values(),
+            key=lambda item: (
+                item["analysis_spearman"] if item["analysis_spearman"] is not None else float("inf"),
+                item["summary"]["run_name"],
+            ),
+        )
+    ]
+    manifest_rows = [
+        {
+            "run_name": item["summary"]["run_name"],
+            "run_dir": item["summary"]["run_dir"],
+            "parameter_case_id": item["summary"].get("parameter_case_id"),
+            "analysis_spearman": item["analysis_spearman"],
+            "selection_reasons": "|".join(item["reasons"]),
+        }
+        for item in sorted(
+            selected_by_run.values(),
+            key=lambda item: (
+                item["analysis_spearman"] if item["analysis_spearman"] is not None else float("inf"),
+                item["summary"]["run_name"],
+            ),
+        )
+    ]
+    return selected_summaries, manifest_rows
+
+
+def write_reduced_plot_selection(output_root, manifest_rows):
+    selection_json_path = os.path.join(output_root, "reduced_plot_selection.json")
+    selection_csv_path = os.path.join(output_root, "reduced_plot_selection.csv")
+    write_json(selection_json_path, manifest_rows)
+    with open(selection_csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=list(manifest_rows[0].keys()) if manifest_rows else ["run_name"],
+        )
+        writer.writeheader()
+        writer.writerows(manifest_rows)
+    return {
+        "json_path": selection_json_path,
+        "csv_path": selection_csv_path,
+    }
+
+
+def regenerate_run_plots(summary):
+    if summary.get("status") != "completed":
+        return summary
+
+    run_dir = summary["run_dir"]
+    run_name = summary["run_name"]
+    ground_truth_path = summary["convergence"]["ground_truth_path"]
+    analysis_path = summary["analysis"]["analysis_path"]
+    baseline_path = summary["baseline"]["baseline_path"]
+    granularity = summary["convergence"].get("granularity", 1.0)
+
+    analysis_curve_plots = create_analysis_subject_curve_plots(
+        run_dir=run_dir,
+        run_name=run_name,
+        analysis_path=analysis_path,
+        ground_truth_path=ground_truth_path,
+        baseline_path=baseline_path,
+        granularity=granularity,
+        save_plots=True,
+    )
+    summary["analysis"]["subject_curve_plots"] = analysis_curve_plots
+
+    precision_dir = ensure_dir(os.path.join(run_dir, "precision_metrics"))
+    prediction_metrics_path = summary["precision_metrics"]["prediction_metrics_path"]
+    baseline_metrics_path = summary["precision_metrics"]["baseline_metrics_path"]
+    metrics_stdout = io.StringIO()
+    with contextlib.redirect_stdout(metrics_stdout):
+        process_and_save(
+            analysis_path,
+            ground_truth_path,
+            M=10,
+            metrics_output=prediction_metrics_path,
+            plots_dir=os.path.join(precision_dir, "numericalAnalysis", "plots"),
+            save_plots=True,
+        )
+        process_and_save(
+            baseline_path,
+            ground_truth_path,
+            M=10,
+            metrics_output=baseline_metrics_path,
+            plots_dir=os.path.join(precision_dir, "simulatedBaseline", "plots"),
+            save_plots=True,
+        )
+    with open(os.path.join(precision_dir, "metrics_stdout.log"), "w", encoding="utf-8") as handle:
+        handle.write(metrics_stdout.getvalue())
+
+    summary["comparison_metrics"] = create_analysis_vs_simulation_plots(
+        run_dir,
+        run_name,
+        ground_truth_path,
+        analysis_path,
+        baseline_path,
+        save_plots=True,
+    )
+    write_json(os.path.join(run_dir, "run_summary.json"), summary)
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run the full CHITA sweep pipeline.")
     parser.add_argument(
@@ -1560,6 +2218,16 @@ def main():
         type=float,
         default=TIME_STEP_HOURS,
         help="Shared time step in hours for both Python simulation and Java analysis.",
+    )
+    parser.add_argument(
+        "--baseline-runtime-multiplier",
+        type=float,
+        default=BASELINE_RUNTIME_MULTIPLIER,
+        help=(
+            "Multiplier applied to the measured Java analysis runtime to set the "
+            "Python baseline simulation runtime budget. Use 1.0 to match the "
+            "analysis runtime."
+        ),
     )
     parser.add_argument(
         "--parameter-ods-path",
@@ -1577,9 +2245,41 @@ def main():
         ),
     )
     parser.add_argument(
+        "--d2",
+        action="store_true",
+        help=(
+            "Generate the raw source dataset with the same D2-style recipe used in "
+            "run_n_simulations.py, then continue with the normal sweep pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--disable-tests",
+        action="store_true",
+        help="Remove all raw Test events from the generated dataset before running the sweep.",
+    )
+    parser.add_argument(
+        "--observed-test-ablation",
+        choices=OBSERVED_TEST_ABLATION_CHOICES,
+        default=OBSERVED_TEST_ABLATION_NONE,
+        help=(
+            "Optional filtering applied only to the shared observed_simulated.json copied "
+            "into each run for Java analysis. The raw dataset and Python baseline inputs "
+            "remain unchanged."
+        ),
+    )
+    parser.add_argument(
         "--skip-plot-images",
         action="store_true",
         help="Skip PNG plot generation and keep only CSV/JSON outputs for a faster sweep.",
+    )
+    parser.add_argument(
+        "--reduce-plots",
+        action="store_true",
+        help=(
+            "Defer plot generation and only render plots for the 10 worst cases, "
+            "10 best cases, the mid-parameter case, and 10 cases around the median "
+            "based on Java analysis Spearman correlation."
+        ),
     )
     parser.add_argument(
         "--max-workers",
@@ -1593,9 +2293,13 @@ def main():
     args = parser.parse_args()
     if args.time_step_hours <= 0:
         raise ValueError("--time-step-hours must be greater than 0.")
+    if args.baseline_runtime_multiplier < 0:
+        raise ValueError("--baseline-runtime-multiplier must be greater than or equal to 0.")
 
     repo_root = os.path.abspath(os.path.dirname(__file__))
     output_root = ensure_dir(os.path.abspath(args.output_root))
+    save_plots_during_run = not args.skip_plot_images and not args.reduce_plots
+    dataset_source = DATASET_SOURCE_D2 if args.d2 else DATASET_SOURCE_GENERATED
     parameter_space = load_parameter_space_from_ods(os.path.abspath(args.parameter_ods_path))
     ground_truth_parameter_bundle = resolve_uniform_parameter_bundle(
         parameter_space,
@@ -1610,12 +2314,19 @@ def main():
         output_root=output_root,
         seed_base=args.seed_base,
         time_step_hours=args.time_step_hours,
+        baseline_runtime_multiplier=args.baseline_runtime_multiplier,
+        dataset_source=dataset_source,
+        tests_enabled=not args.disable_tests,
+        observed_test_ablation=args.observed_test_ablation,
+        java_precompute_cache_root=os.path.abspath(os.path.join(repo_root, JAVA_PRECOMPUTE_CACHE_ROOT)),
+        java_precompute_seed_sweep_root=os.path.abspath(os.path.join(repo_root, JAVA_PRECOMPUTE_SEED_SWEEP_ROOT)),
         parameter_space=parameter_space,
         ground_truth_parameter_bundle=ground_truth_parameter_bundle,
         parameter_case_mode=args.parameter_case_mode,
         parameter_case_count=len(parameter_cases),
         parameter_manifest_paths=parameter_manifest_paths,
         generate_plot_images=not args.skip_plot_images,
+        reduce_plots=args.reduce_plots,
     )
 
     summaries = []
@@ -1635,14 +2346,17 @@ def main():
             progress_bar.set_postfix_str(f"{dataset_label} | shared ground truth")
             try:
                 shared_ground_truth = compute_shared_ground_truth(
+                    repo_root=repo_root,
                     output_root=output_root,
                     time_limit_days=time_limit_days,
                     n_subjects=n_subjects,
                     total_internal_contacts=total_internal_contacts,
                     seed=shared_ground_truth_seed,
                     time_step_hours=args.time_step_hours,
+                    dataset_source=dataset_source,
                     ground_truth_parameter_bundle=ground_truth_parameter_bundle,
-                    save_plots=not args.skip_plot_images,
+                    save_plots=save_plots_during_run,
+                    disable_tests=args.disable_tests,
                 )
             except Exception as exc:
                 shared_traceback = traceback.format_exc()
@@ -1665,12 +2379,16 @@ def main():
                         "run_name": run_name,
                         "run_dir": run_dir,
                         "status": "failed",
+                        "dataset_source": dataset_source,
+                        "dataset_generation_method": dataset_generation_method_for_source(dataset_source),
                         "time_limit": time_limit_days,
                         "n_subjects": n_subjects,
                         "total_internal_contacts": total_internal_contacts,
                         "seed": shared_ground_truth_seed,
                         "baseline_seed": baseline_seed,
                         "time_step_hours": args.time_step_hours,
+                        "baseline_runtime_multiplier": args.baseline_runtime_multiplier,
+                        "observed_test_ablation": args.observed_test_ablation,
                         "parameter_case_id": parameter_bundle["case_id"],
                         "parameter_levels": parameter_bundle["levels"],
                         "parameter_unit_measure": parameter_bundle["unit_measure"],
@@ -1706,10 +2424,16 @@ def main():
                 )
 
             completed_cases = 0
+            executor = None
             if worker_count == 1:
                 task_iterable = [(task_spec, None) for task_spec in task_specs]
             else:
-                executor = ProcessPoolExecutor(max_workers=worker_count)
+                try:
+                    executor = ProcessPoolExecutor(max_workers=worker_count)
+                except PermissionError:
+                    # Some Windows environments disallow the pipe setup used by
+                    # ProcessPoolExecutor. Fall back to threads so the sweep can continue.
+                    executor = ThreadPoolExecutor(max_workers=worker_count)
                 future_to_task = {
                     executor.submit(
                         run_single_pipeline,
@@ -1720,10 +2444,12 @@ def main():
                         total_internal_contacts=total_internal_contacts,
                         seed=task_spec["baseline_seed"],
                         time_step_hours=args.time_step_hours,
+                        baseline_runtime_multiplier=args.baseline_runtime_multiplier,
+                        observed_test_ablation=args.observed_test_ablation,
                         parameter_bundle=task_spec["parameter_bundle"],
                         ground_truth_parameter_bundle=ground_truth_parameter_bundle,
                         shared_ground_truth=shared_ground_truth,
-                        save_plots=not args.skip_plot_images,
+                        save_plots=save_plots_during_run,
                     ): task_spec
                     for task_spec in task_specs
                 }
@@ -1746,10 +2472,12 @@ def main():
                                 total_internal_contacts=total_internal_contacts,
                                 seed=baseline_seed,
                                 time_step_hours=args.time_step_hours,
+                                baseline_runtime_multiplier=args.baseline_runtime_multiplier,
+                                observed_test_ablation=args.observed_test_ablation,
                                 parameter_bundle=parameter_bundle,
                                 ground_truth_parameter_bundle=ground_truth_parameter_bundle,
                                 shared_ground_truth=shared_ground_truth,
-                                save_plots=not args.skip_plot_images,
+                                save_plots=save_plots_during_run,
                             )
                         else:
                             summary = future.result()
@@ -1765,12 +2493,16 @@ def main():
                             "run_name": run_name,
                             "run_dir": run_dir,
                             "status": "failed",
+                            "dataset_source": dataset_source,
+                            "dataset_generation_method": dataset_generation_method_for_source(dataset_source),
                             "time_limit": time_limit_days,
                             "n_subjects": n_subjects,
                             "total_internal_contacts": total_internal_contacts,
                             "seed": shared_ground_truth_seed,
                             "baseline_seed": baseline_seed,
                             "time_step_hours": args.time_step_hours,
+                            "baseline_runtime_multiplier": args.baseline_runtime_multiplier,
+                            "observed_test_ablation": args.observed_test_ablation,
                             "shared_ground_truth_run_dir": shared_ground_truth["run_dir"],
                             "parameter_case_id": parameter_bundle["case_id"],
                             "parameter_levels": parameter_bundle["levels"],
@@ -1793,8 +2525,16 @@ def main():
                     )
                     progress_bar.update(1)
             finally:
-                if worker_count != 1:
+                if executor is not None:
                     executor.shutdown(wait=True, cancel_futures=False)
+
+    if args.reduce_plots:
+        selected_summaries, manifest_rows = select_summaries_for_reduced_plots(summaries)
+        write_reduced_plot_selection(output_root, manifest_rows)
+        if not args.skip_plot_images:
+            for summary in selected_summaries:
+                regenerate_run_plots(summary)
+            write_aggregate_outputs(output_root, summaries)
 
 
 if __name__ == "__main__":
