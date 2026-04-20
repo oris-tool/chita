@@ -375,6 +375,8 @@ def _transition_value(transition_spec, key):
         "exponential_lambda": ["lambdaExp", "lambda_exp"],
         "p1": ["p"],
         "p2": [],
+        "true": ["p"],
+        "false": [],
     }
     for alias in alias_map.get(key, []):
         if alias in transition_spec:
@@ -384,6 +386,10 @@ def _transition_value(transition_spec, key):
 
     # Raw hyperexponential specs often provide only p; derive p2 as 1-p.
     if key == "p2" and "p" in transition_spec:
+        return 1.0 - float(transition_spec["p"])
+
+    # Raw switch specs often provide only p; derive false as 1-p.
+    if key == "false" and "p" in transition_spec:
         return 1.0 - float(transition_spec["p"])
 
     legacy_key = key.replace("_", " ")
