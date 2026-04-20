@@ -367,6 +367,25 @@ def _transition_parameters(parameter_bundle):
 def _transition_value(transition_spec, key):
     if key in transition_spec:
         return transition_spec[key]
+
+    # Backward-compatible aliases for raw parameter bundles used by sweep scripts.
+    alias_map = {
+        "erlang_stages": ["n"],
+        "erlang_lambda": ["lambdaErl", "lambda_erl"],
+        "exponential_lambda": ["lambdaExp", "lambda_exp"],
+        "p1": ["p"],
+        "p2": [],
+    }
+    for alias in alias_map.get(key, []):
+        if alias in transition_spec:
+            if key == "p1" and alias == "p":
+                return float(transition_spec[alias])
+            return transition_spec[alias]
+
+    # Raw hyperexponential specs often provide only p; derive p2 as 1-p.
+    if key == "p2" and "p" in transition_spec:
+        return 1.0 - float(transition_spec["p"])
+
     legacy_key = key.replace("_", " ")
     if legacy_key in transition_spec:
         return transition_spec[legacy_key]
