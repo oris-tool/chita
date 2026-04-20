@@ -56,9 +56,9 @@ def _resolve_java_artifacts(repo_root):
 
     gson_jar = resolve_optional_jar(
         [
-            os.path.join(repo_root, "lib__", "gson.jar"),
-            os.path.join(repo_root, "lib__", "gson-2.13.1.jar"),
-            os.path.join(repo_root, "lib__", "gson-2.11.0.jar"),
+            os.path.join(repo_root, "lib", "gson.jar"),
+            os.path.join(repo_root, "lib", "gson-2.13.1.jar"),
+            os.path.join(repo_root, "lib", "gson-2.11.0.jar"),
             os.path.join(
                 os.path.expanduser("~"),
                 ".m2",
@@ -101,7 +101,7 @@ def _resolve_java_artifacts(repo_root):
     classpath = os.pathsep.join(
         [
             class_root,
-            os.path.join(repo_root, "lib__", "*"),
+            os.path.join(repo_root, "lib", "*"),
             gson_jar,
         ]
     )
