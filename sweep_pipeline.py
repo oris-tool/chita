@@ -34,13 +34,14 @@ from run_n_simulations import compute_confidence_intervals, run_dataset_simulati
 TIME_LIMITS = [84]
 N_SUBJECTS = [8]
 TOTAL_INTERNAL_CONTACTS = [84]
-CONVERGENCE_THRESHOLD = 1e-5
+CONVERGENCE_THRESHOLD = 1e-6
 CONVERGENCE_ITERATIONS_CAP = 100_000
 BASELINE_ITERATIONS_CAP = 100_000
 MAX_TOP_PRECISION = 7
 TIME_STEP_HOURS = 1.0
 BASELINE_RUNTIME_MULTIPLIER = 1.0
 REDUCED_PLOT_BUCKET_SIZE = 10
+DEFAULT_INCLUDE_MOVING_AVG_METRICS = True
 DATASET_SOURCE_GENERATED = "generated"
 DATASET_SOURCE_D2 = "d2"
 DEFAULT_DATASET_SOURCE = DATASET_SOURCE_GENERATED
@@ -585,6 +586,7 @@ def write_dataset_generation_parameters_markdown(
     seed_base,
     time_step_hours,
     baseline_runtime_multiplier,
+    include_moving_avg_metrics,
     dataset_source,
     tests_enabled,
     observed_test_ablation,
@@ -610,6 +612,7 @@ This file documents the parameters used by `sweep_pipeline.py` to create the dat
 - `seed_base`: {seed_base}
 - `TIME_STEP_HOURS`: {time_step_hours}
 - `baseline_runtime_multiplier`: {baseline_runtime_multiplier}
+- `moving_avg_metrics_enabled`: {include_moving_avg_metrics}
 - `dataset_source`: {dataset_source}
 - `tests_enabled_in_raw_dataset`: {tests_enabled}
 - `observed_test_ablation`: {observed_test_ablation}
@@ -889,7 +892,7 @@ def create_analysis_subject_curve_plots(
     }
 
 
-def compute_candidate_summary(ground_truth, candidate):
+def compute_candidate_summary(ground_truth, candidate, include_moving_avg_metrics=True):
     summary = {}
     tau, p_value_tau = ranking_metrics.compute_kendalls_tau_correlation(ground_truth, candidate)
     spearman, p_value_sp = ranking_metrics.compute_spearmans_correlation(ground_truth, candidate)
@@ -901,7 +904,8 @@ def compute_candidate_summary(ground_truth, candidate):
     for top_k in range(1, min(MAX_TOP_PRECISION, len(ground_truth)) + 1):
         precision = ranking_metrics.compute_top_n_precision(ground_truth, candidate, top_k)
         summary[f"top_{top_k}_precision_mean"] = float(np.mean(precision))
-        summary[f"top_{top_k}_precision_moving_avg_mean"] = summary[f"top_{top_k}_precision_mean"]
+        if include_moving_avg_metrics:
+            summary[f"top_{top_k}_precision_moving_avg_mean"] = summary[f"top_{top_k}_precision_mean"]
     return summary
 
 
@@ -911,6 +915,7 @@ def create_analysis_vs_simulation_plots(
     ground_truth_path,
     analysis_path,
     baseline_path,
+    include_moving_avg_metrics=True,
     save_plots=True,
 ):
     ground_truth = read_json(ground_truth_path)
@@ -954,10 +959,11 @@ def create_analysis_vs_simulation_plots(
                 "comparison": f"top_{top_k}",
                 "analysis_mean": float(np.mean(analysis_precision)),
                 "simulation_mean": float(np.mean(baseline_precision)),
-                "analysis_moving_avg_mean": float(np.mean(analysis_precision)),
-                "simulation_moving_avg_mean": float(np.mean(baseline_precision)),
             }
         )
+        if include_moving_avg_metrics:
+            scalar_rows[-1]["analysis_moving_avg_mean"] = float(np.mean(analysis_precision))
+            scalar_rows[-1]["simulation_moving_avg_mean"] = float(np.mean(baseline_precision))
 
     if save_plots:
         correlation_path = os.path.join(output_dir, "correlation_plots.png")
@@ -1012,8 +1018,16 @@ def create_analysis_vs_simulation_plots(
         plt.close(fig)
         generated_plots.append(precision_path)
 
-    analysis_summary = compute_candidate_summary(ground_truth, analysis)
-    baseline_summary = compute_candidate_summary(ground_truth, baseline)
+    analysis_summary = compute_candidate_summary(
+        ground_truth,
+        analysis,
+        include_moving_avg_metrics=include_moving_avg_metrics,
+    )
+    baseline_summary = compute_candidate_summary(
+        ground_truth,
+        baseline,
+        include_moving_avg_metrics=include_moving_avg_metrics,
+    )
     save_series_csv(
         os.path.join(output_dir, "metrics_results.csv"),
         ["metric", "analysis", "simulation"],
@@ -1601,6 +1615,7 @@ def compute_shared_ground_truth(
     time_step_hours=TIME_STEP_HOURS,
     dataset_source=DEFAULT_DATASET_SOURCE,
     ground_truth_parameter_bundle=None,
+    include_moving_avg_metrics=DEFAULT_INCLUDE_MOVING_AVG_METRICS,
     save_plots=True,
     disable_tests=False,
 ):
@@ -1643,7 +1658,7 @@ def compute_shared_ground_truth(
         export_observed_simulation=True,
         pruning_seed=seed,
         parameter_bundle=ground_truth_parameter_bundle,
-        save_plots=False,
+        save_plots=save_plots,
     )
 
     summary = {
@@ -1656,6 +1671,7 @@ def compute_shared_ground_truth(
         "time_step_hours": time_step_hours,
         "dataset_source": dataset_source,
         "dataset_generation_method": dataset_generation_method_for_source(dataset_source),
+        "moving_avg_metrics_enabled": include_moving_avg_metrics,
         "dataset_path": dataset_path,
         "dataset_events": len(dataset_payload["events"]),
         "tests_enabled": not disable_tests,
@@ -1791,6 +1807,7 @@ def run_single_pipeline(
     ground_truth_parameter_bundle=None,
     shared_ground_truth=None,
     observed_test_ablation=OBSERVED_TEST_ABLATION_NONE,
+    include_moving_avg_metrics=DEFAULT_INCLUDE_MOVING_AVG_METRICS,
     save_plots=True,
 ):
     if parameter_bundle is None:
@@ -1831,6 +1848,7 @@ def run_single_pipeline(
         "baseline_runtime_multiplier": baseline_runtime_multiplier,
         "dataset_source": shared_ground_truth.get("dataset_source", DEFAULT_DATASET_SOURCE),
         "dataset_generation_method": shared_ground_truth.get("dataset_generation_method"),
+        "moving_avg_metrics_enabled": include_moving_avg_metrics,
         "tests_enabled": shared_ground_truth.get("tests_enabled", True),
         "dataset_test_events": shared_ground_truth.get("dataset_test_events"),
         "observed_test_ablation": run_inputs["observed_test_ablation"],
@@ -1941,6 +1959,7 @@ def run_single_pipeline(
     prediction_metrics_path = os.path.join(precision_dir, "metrics_prediction.json")
     baseline_metrics_path = os.path.join(precision_dir, "metrics_baseline.json")
     metrics_stdout = io.StringIO()
+    t0_metrics = time.time()
     with contextlib.redirect_stdout(metrics_stdout):
         process_and_save(
             analysis_path,
@@ -1958,6 +1977,8 @@ def run_single_pipeline(
             plots_dir=os.path.join(precision_dir, "simulatedBaseline", "plots"),
             save_plots=save_plots,
         )
+    t1_metrics = time.time()
+    metrics_runtime_seconds = t1_metrics - t0_metrics
     with open(os.path.join(precision_dir, "metrics_stdout.log"), "w", encoding="utf-8") as handle:
         handle.write(metrics_stdout.getvalue())
 
@@ -1967,6 +1988,7 @@ def run_single_pipeline(
         convergence_result["ground_truth_path"],
         analysis_path,
         baseline_result["averaged_results_path"],
+        include_moving_avg_metrics=include_moving_avg_metrics,
         save_plots=save_plots,
     )
 
@@ -1977,8 +1999,10 @@ def run_single_pipeline(
         "prediction_mean_ece": mean_metric_value(prediction_metrics_path, "ECE"),
         "baseline_mean_brier": mean_metric_value(baseline_metrics_path, "Brier Score"),
         "baseline_mean_ece": mean_metric_value(baseline_metrics_path, "ECE"),
+        "metrics_runtime_seconds": metrics_runtime_seconds,
     }
     summary["comparison_metrics"] = comparison_summary
+    summary["moving_avg_metrics_enabled"] = include_moving_avg_metrics
     summary["status"] = "completed"
     summary["completed_at"] = datetime.now().isoformat(timespec="seconds")
     write_json(os.path.join(run_dir, "run_summary.json"), summary)
@@ -2002,6 +2026,7 @@ def write_aggregate_outputs(output_root, summaries):
             "total_internal_contacts": summary["total_internal_contacts"],
             "time_step_hours": summary.get("time_step_hours"),
             "baseline_runtime_multiplier": summary.get("baseline_runtime_multiplier"),
+            "moving_avg_metrics_enabled": summary.get("moving_avg_metrics_enabled"),
             "observed_test_ablation": summary.get("observed_test_ablation"),
             "observed_test_events_before": summary.get("observed_test_ablation_stats", {}).get("tests_before"),
             "observed_test_events_after": summary.get("observed_test_ablation_stats", {}).get("tests_after"),
@@ -2051,28 +2076,9 @@ def write_aggregate_outputs(output_root, summaries):
 
 
 def select_summaries_for_reduced_plots(summaries):
-    ranked = []
-    for summary in summaries:
-        if summary.get("status") != "completed":
-            continue
-        spearman = finite_float(
-            summary.get("comparison_metrics", {}).get("analysis", {}).get("spearman")
-        )
-        if spearman is None:
-            continue
-        ranked.append((spearman, summary))
-
-    ranked.sort(key=lambda item: (item[0], item[1].get("run_name", "")))
-    if not ranked:
+    completed = [summary for summary in summaries if summary.get("status") == "completed"]
+    if not completed:
         return [], []
-
-    bucket_size = min(REDUCED_PLOT_BUCKET_SIZE, len(ranked))
-    median_bucket_size = min(REDUCED_PLOT_BUCKET_SIZE, len(ranked))
-    median_center = len(ranked) // 2
-    median_start = max(
-        0,
-        min(len(ranked) - median_bucket_size, median_center - median_bucket_size // 2),
-    )
 
     selected_by_run = {}
 
@@ -2086,46 +2092,77 @@ def select_summaries_for_reduced_plots(summaries):
                 "analysis_spearman": finite_float(
                     summary.get("comparison_metrics", {}).get("analysis", {}).get("spearman")
                 ),
+                "analysis_tau": finite_float(
+                    summary.get("comparison_metrics", {}).get("analysis", {}).get("tau")
+                ),
             },
         )
         if reason not in info["reasons"]:
             info["reasons"].append(reason)
 
-    for _, summary in ranked[:bucket_size]:
-        add_selected(summary, "worst_10")
-    for _, summary in ranked[-bucket_size:]:
-        add_selected(summary, "best_10")
-    for _, summary in ranked[median_start:median_start + median_bucket_size]:
-        add_selected(summary, "median_10")
-    for _, summary in ranked:
+    def add_metric_buckets(metric_name, metric_getter):
+        ranked = []
+        for summary in completed:
+            metric_value = metric_getter(summary)
+            if metric_value is None:
+                continue
+            ranked.append((metric_value, summary))
+
+        ranked.sort(key=lambda item: (item[0], item[1].get("run_name", "")))
+        if not ranked:
+            return
+
+        bucket_size = min(REDUCED_PLOT_BUCKET_SIZE, len(ranked))
+        median_bucket_size = min(REDUCED_PLOT_BUCKET_SIZE, len(ranked))
+        median_center = len(ranked) // 2
+        median_start = max(
+            0,
+            min(len(ranked) - median_bucket_size, median_center - median_bucket_size // 2),
+        )
+
+        for _, summary in ranked[:bucket_size]:
+            add_selected(summary, f"worst_10_{metric_name}")
+        for _, summary in ranked[-bucket_size:]:
+            add_selected(summary, f"best_10_{metric_name}")
+        for _, summary in ranked[median_start:median_start + median_bucket_size]:
+            add_selected(summary, f"median_10_{metric_name}")
+
+    add_metric_buckets(
+        "spearman_analysis",
+        lambda summary: finite_float(
+            summary.get("comparison_metrics", {}).get("analysis", {}).get("spearman")
+        ),
+    )
+    add_metric_buckets(
+        "kendall_analysis",
+        lambda summary: finite_float(
+            summary.get("comparison_metrics", {}).get("analysis", {}).get("tau")
+        ),
+    )
+
+    for summary in completed:
         if summary.get("parameter_case_id") == summary.get("ground_truth_parameter_case_id"):
             add_selected(summary, "mid_parameter_case")
 
-    selected_summaries = [
-        item["summary"]
-        for item in sorted(
-            selected_by_run.values(),
-            key=lambda item: (
-                item["analysis_spearman"] if item["analysis_spearman"] is not None else float("inf"),
-                item["summary"]["run_name"],
-            ),
-        )
-    ]
+    sorted_items = sorted(
+        selected_by_run.values(),
+        key=lambda item: (
+            item["analysis_spearman"] if item["analysis_spearman"] is not None else float("inf"),
+            item["analysis_tau"] if item["analysis_tau"] is not None else float("inf"),
+            item["summary"]["run_name"],
+        ),
+    )
+    selected_summaries = [item["summary"] for item in sorted_items]
     manifest_rows = [
         {
             "run_name": item["summary"]["run_name"],
             "run_dir": item["summary"]["run_dir"],
             "parameter_case_id": item["summary"].get("parameter_case_id"),
             "analysis_spearman": item["analysis_spearman"],
+            "analysis_tau": item["analysis_tau"],
             "selection_reasons": "|".join(item["reasons"]),
         }
-        for item in sorted(
-            selected_by_run.values(),
-            key=lambda item: (
-                item["analysis_spearman"] if item["analysis_spearman"] is not None else float("inf"),
-                item["summary"]["run_name"],
-            ),
-        )
+        for item in sorted_items
     ]
     return selected_summaries, manifest_rows
 
@@ -2157,6 +2194,7 @@ def regenerate_run_plots(summary):
     analysis_path = summary["analysis"]["analysis_path"]
     baseline_path = summary["baseline"]["baseline_path"]
     granularity = summary["convergence"].get("granularity", 1.0)
+    include_moving_avg_metrics = summary.get("moving_avg_metrics_enabled", DEFAULT_INCLUDE_MOVING_AVG_METRICS)
 
     analysis_curve_plots = create_analysis_subject_curve_plots(
         run_dir=run_dir,
@@ -2199,6 +2237,7 @@ def regenerate_run_plots(summary):
         ground_truth_path,
         analysis_path,
         baseline_path,
+        include_moving_avg_metrics=include_moving_avg_metrics,
         save_plots=True,
     )
     write_json(os.path.join(run_dir, "run_summary.json"), summary)
@@ -2273,12 +2312,18 @@ def main():
         help="Skip PNG plot generation and keep only CSV/JSON outputs for a faster sweep.",
     )
     parser.add_argument(
+        "--disable-moving-avg-metrics",
+        action="store_true",
+        help="Skip computing the moving-average summary metrics in the sweep outputs.",
+    )
+    parser.add_argument(
         "--reduce-plots",
         action="store_true",
         help=(
             "Defer plot generation and only render plots for the 10 worst cases, "
             "10 best cases, the mid-parameter case, and 10 cases around the median "
-            "based on Java analysis Spearman correlation."
+            "based on Java analysis Spearman and Kendall correlation (selected runs "
+            "still generate the full per-run curve and comparison plots)."
         ),
     )
     parser.add_argument(
@@ -2299,6 +2344,7 @@ def main():
     repo_root = os.path.abspath(os.path.dirname(__file__))
     output_root = ensure_dir(os.path.abspath(args.output_root))
     save_plots_during_run = not args.skip_plot_images and not args.reduce_plots
+    include_moving_avg_metrics = not args.disable_moving_avg_metrics
     dataset_source = DATASET_SOURCE_D2 if args.d2 else DATASET_SOURCE_GENERATED
     parameter_space = load_parameter_space_from_ods(os.path.abspath(args.parameter_ods_path))
     ground_truth_parameter_bundle = resolve_uniform_parameter_bundle(
@@ -2315,6 +2361,7 @@ def main():
         seed_base=args.seed_base,
         time_step_hours=args.time_step_hours,
         baseline_runtime_multiplier=args.baseline_runtime_multiplier,
+        include_moving_avg_metrics=include_moving_avg_metrics,
         dataset_source=dataset_source,
         tests_enabled=not args.disable_tests,
         observed_test_ablation=args.observed_test_ablation,
@@ -2355,6 +2402,7 @@ def main():
                     time_step_hours=args.time_step_hours,
                     dataset_source=dataset_source,
                     ground_truth_parameter_bundle=ground_truth_parameter_bundle,
+                    include_moving_avg_metrics=include_moving_avg_metrics,
                     save_plots=save_plots_during_run,
                     disable_tests=args.disable_tests,
                 )
@@ -2388,6 +2436,7 @@ def main():
                         "baseline_seed": baseline_seed,
                         "time_step_hours": args.time_step_hours,
                         "baseline_runtime_multiplier": args.baseline_runtime_multiplier,
+                        "moving_avg_metrics_enabled": include_moving_avg_metrics,
                         "observed_test_ablation": args.observed_test_ablation,
                         "parameter_case_id": parameter_bundle["case_id"],
                         "parameter_levels": parameter_bundle["levels"],
@@ -2474,6 +2523,7 @@ def main():
                                 time_step_hours=args.time_step_hours,
                                 baseline_runtime_multiplier=args.baseline_runtime_multiplier,
                                 observed_test_ablation=args.observed_test_ablation,
+                                include_moving_avg_metrics=include_moving_avg_metrics,
                                 parameter_bundle=parameter_bundle,
                                 ground_truth_parameter_bundle=ground_truth_parameter_bundle,
                                 shared_ground_truth=shared_ground_truth,
@@ -2502,6 +2552,7 @@ def main():
                             "baseline_seed": baseline_seed,
                             "time_step_hours": args.time_step_hours,
                             "baseline_runtime_multiplier": args.baseline_runtime_multiplier,
+                            "moving_avg_metrics_enabled": include_moving_avg_metrics,
                             "observed_test_ablation": args.observed_test_ablation,
                             "shared_ground_truth_run_dir": shared_ground_truth["run_dir"],
                             "parameter_case_id": parameter_bundle["case_id"],

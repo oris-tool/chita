@@ -1334,15 +1334,20 @@ public class STPNAnalysis {
                             double highestRisk = 0.0;
                             String secondHighestRiskSubject = null;
                             double secondHighestRisk = 0.0;
+                            
+                            // To prevent ping-pong feedback loops at the exact same event timestamp,
+                            // we must sample the risk from strictly *before* the event occurs.
+                            int priorTime = Math.max(0, eventTime - 1);
+                            
                             for (String subject : involvedSubjects) { // get the highest risk subject
-                                double subjectRisk = previousTracks.getSample(subject, eventTime);
+                                double subjectRisk = previousTracks.getSample(subject, priorTime);
                                 if (subjectRisk > highestRisk) {
                                     highestRisk = subjectRisk;
                                     highestRiskSubject = subject;
                                 }
                             }
-                            for (String subject : involvedSubjects) { // get the second highest risk subject. This is used to update ~P for the highest risk subject
-                                double subjectRisk = previousTracks.getSample(subject, eventTime);
+                            for (String subject : involvedSubjects) { // get the second highest risk subject.
+                                double subjectRisk = previousTracks.getSample(subject, priorTime);
                                 if (subjectRisk > secondHighestRisk && subjectRisk < highestRisk) {
                                     secondHighestRisk = subjectRisk;
                                     secondHighestRiskSubject = subject;

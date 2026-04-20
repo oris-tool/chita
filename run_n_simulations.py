@@ -314,7 +314,7 @@ def run_dataset_simulations(
                 }
                 if iteration_index == 0:
                     last_state = current_state
-                elif iteration_index % convergence_check_every == 0:
+                elif rep_done % convergence_check_every == 0:
                     conv_check = check_convergence(
                         current_state=current_state,
                         last_state=last_state,
@@ -324,6 +324,23 @@ def run_dataset_simulations(
                     if convergence_reached:
                         break
                     last_state = current_state
+                    
+            if rep_done % 1000 == 0:
+                current_state = {
+                    subject_id: [avg_state[subject_id][time_index] / rep_done for time_index in range(horizon)]
+                    for subject_id in range(1, n_subjects + 1)
+                }
+                intermediate_confidence_intervals = compute_confidence_intervals(current_state)
+                intermediate_label = dataset_label or os.path.basename(dataset_dir)
+                intermediate_plots_dir = os.path.join(dataset_dir, "plots", "intermediate")
+                plot_dkw_bands(
+                    current_state=current_state,
+                    dkw_result=intermediate_confidence_intervals,
+                    output_dir=intermediate_plots_dir,
+                    granularity=granularity,
+                    dataset_label=f"{intermediate_label}_t{timelimit}_{rep_done}reps",
+                    save_plots=save_plots,
+                )
 
             if progress_bar is not None:
                 progress_bar.update(1)

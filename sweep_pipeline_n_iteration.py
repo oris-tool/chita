@@ -45,6 +45,46 @@ PARALLEL_BACKEND_CHOICES = (
     PARALLEL_BACKEND_PROCESS,
 )
 
+METRIC_SELECTION_BUCKET_SIZE = 10
+LEVEL_LABELS_IT = {
+    "lower": "basso",
+    "mid": "medio",
+    "upper": "alto",
+}
+
+COMPACT_RESULT_COLUMNS = [
+    "run_id",
+    "infectiousness_level",
+    "healing_level",
+    "symptoms_level",
+    "isolating_level",
+    "symptoms_onset_level",
+    "notification_to_isolation_level",
+    "symptomatic_period_level",
+    "java_runtime_seconds",
+    "simulation_runtime_seconds",
+    "simulation_runs",
+    "kendall_analysis",
+    "kendall_simulation",
+    "spearman_analysis",
+    "spearman_simulation",
+    "top_1_accuracy_analysis",
+    "top_1_accuracy_simulation",
+    "top_2_accuracy_analysis",
+    "top_2_accuracy_simulation",
+    "top_3_accuracy_analysis",
+    "top_3_accuracy_simulation",
+    "top_4_accuracy_analysis",
+    "top_4_accuracy_simulation",
+    "mrr_analysis",
+    "mrr_simulation",
+    "brier_score_analysis",
+    "brier_score_simulation",
+    "ece_analysis",
+    "ece_simulation",
+    "note",
+]
+
 
 def parse_java_iterations(values):
     if not values:
@@ -106,6 +146,7 @@ def write_iteration_sweep_markdown(
     seed_base,
     time_step_hours,
     baseline_runtime_multiplier,
+    include_moving_avg_metrics,
     dataset_source,
     tests_enabled,
     observed_test_ablation,
@@ -131,6 +172,7 @@ This file documents the parameters used by `sweep_pipeline_n_iteration.py`.
 - `seed_base`: {seed_base}
 - `time_step_hours`: {time_step_hours}
 - `baseline_runtime_multiplier`: {baseline_runtime_multiplier}
+- `moving_avg_metrics_enabled`: {include_moving_avg_metrics}
 - `dataset_source`: {dataset_source}
 - `tests_enabled_in_raw_dataset`: {tests_enabled}
 - `observed_test_ablation`: {observed_test_ablation}
@@ -396,135 +438,137 @@ def resolve_parallel_backend(parallel_backend):
     return parallel_backend
 
 
-def create_iteration_metric_artifacts(bundle_dir, bundle_label, iteration_records, save_plots=True):
-    completed_records = sorted(
-        [record for record in iteration_records if record.get("status") == "completed"],
-        key=lambda record: record["java_iterations"],
+def to_italian_level(level):
+    return LEVEL_LABELS_IT.get(level, level)
+
+
+def metric_selection_manifest_rows(rows, metric_key):
+    candidates = [
+        row for row in rows
+        if sp.finite_float(row.get(metric_key)) is not None
+    ]
+    candidates.sort(key=lambda row: (float(row[metric_key]), row["run_id"]))
+    if not candidates:
+        return []
+
+    bucket_size = min(METRIC_SELECTION_BUCKET_SIZE, len(candidates))
+    median_center = len(candidates) // 2
+    median_start = max(
+        0,
+        min(len(candidates) - bucket_size, median_center - bucket_size // 2),
     )
 
-    all_rows = []
-    for record in sorted(iteration_records, key=lambda record: record["java_iterations"]):
-        all_rows.append(
-            [
-                record.get("java_iterations"),
-                record.get("status"),
-                record.get("analysis", {}).get("analysis_runtime_seconds"),
-                record.get("analysis", {}).get("analysis_wall_runtime_seconds"),
-                record.get("baseline", {}).get("runtime_budget_seconds"),
-                record.get("baseline", {}).get("actual_runtime_seconds"),
-                record.get("baseline", {}).get("iterations"),
-                record.get("comparison_metrics", {}).get("analysis", {}).get("tau"),
-                record.get("comparison_metrics", {}).get("simulation", {}).get("tau"),
-                record.get("comparison_metrics", {}).get("analysis", {}).get("spearman"),
-                record.get("comparison_metrics", {}).get("simulation", {}).get("spearman"),
-                record.get("comparison_metrics", {}).get("analysis", {}).get("mrr"),
-                record.get("comparison_metrics", {}).get("simulation", {}).get("mrr"),
-                record.get("precision_metrics", {}).get("prediction_mean_brier"),
-                record.get("precision_metrics", {}).get("baseline_mean_brier"),
-                record.get("precision_metrics", {}).get("prediction_mean_ece"),
-                record.get("precision_metrics", {}).get("baseline_mean_ece"),
-                record.get("run_dir"),
-                record.get("error"),
-            ]
+    selected = {}
+
+    def add(entry, label, rank_index):
+        info = selected.setdefault(
+            entry["run_id"],
+            {
+                "row": entry,
+                "labels": [],
+            },
         )
+        info["labels"].append(f"{label} {rank_index}")
 
-    summary_csv_path = os.path.join(bundle_dir, "iteration_sweep_summary.csv")
-    sp.save_series_csv(
-        summary_csv_path,
-        [
-            "java_iterations",
-            "status",
-            "java_analysis_runtime_seconds",
-            "java_analysis_wall_runtime_seconds",
-            "baseline_runtime_budget_seconds",
-            "baseline_actual_runtime_seconds",
-            "baseline_iterations",
-            "analysis_tau",
-            "simulation_tau",
-            "analysis_spearman",
-            "simulation_spearman",
-            "analysis_mrr",
-            "simulation_mrr",
-            "prediction_mean_brier",
-            "baseline_mean_brier",
-            "prediction_mean_ece",
-            "baseline_mean_ece",
-            "run_dir",
-            "error",
-        ],
-        all_rows,
-    )
+    for idx, entry in enumerate(reversed(candidates[-bucket_size:]), start=1):
+        add(entry, "Top", idx)
+    for idx, entry in enumerate(candidates[:bucket_size], start=1):
+        add(entry, "Worst", idx)
+    for idx, entry in enumerate(candidates[median_start:median_start + bucket_size], start=1):
+        add(entry, "Mid", idx)
 
-    kendall_csv_path = os.path.join(bundle_dir, "kendall_vs_iterations.csv")
-    sp.save_series_csv(
-        kendall_csv_path,
-        ["java_iterations", "analysis_kendall", "simulation_kendall"],
-        [
-            [
-                record["java_iterations"],
-                record["comparison_metrics"]["analysis"]["tau"],
-                record["comparison_metrics"]["simulation"]["tau"],
-            ]
-            for record in completed_records
-        ],
-    )
+    return [
+        {
+            "run_id": info["row"]["run_id"],
+            "analysis_value": info["row"].get(metric_key),
+            "labels": info["labels"],
+        }
+        for info in sorted(selected.values(), key=lambda item: item["row"]["run_id"])
+    ]
 
-    spearman_csv_path = os.path.join(bundle_dir, "spearman_vs_iterations.csv")
-    sp.save_series_csv(
-        spearman_csv_path,
-        ["java_iterations", "analysis_spearman", "simulation_spearman"],
-        [
-            [
-                record["java_iterations"],
-                record["comparison_metrics"]["analysis"]["spearman"],
-                record["comparison_metrics"]["simulation"]["spearman"],
-            ]
-            for record in completed_records
-        ],
-    )
 
-    plot_paths = []
-    if save_plots and completed_records:
-        figure_path = os.path.join(bundle_dir, "correlation_vs_iterations.png")
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4.8), sharex=True)
-        plot_specs = [
-            ("Kendall's Tau", "tau", axes[0]),
-            ("Spearman's Rho", "spearman", axes[1]),
-        ]
-        x_values = [record["java_iterations"] for record in completed_records]
-        for title, metric_name, axis in plot_specs:
-            axis.plot(
-                x_values,
-                [record["comparison_metrics"]["analysis"][metric_name] for record in completed_records],
-                marker="o",
-                linewidth=1.8,
-                color="tab:orange",
-                label="Java analysis",
-            )
-            axis.plot(
-                x_values,
-                [record["comparison_metrics"]["simulation"][metric_name] for record in completed_records],
-                marker="x",
-                linewidth=1.8,
-                color="tab:green",
-                label="Simulation baseline",
-            )
-            axis.set_title(title)
-            axis.set_xlabel("Java iterations")
-            axis.grid(True, alpha=0.3)
-        axes[0].set_ylabel("Correlation")
-        axes[0].legend(frameon=False)
-        fig.suptitle(f"{bundle_label} Correlation vs Java Iterations", fontsize=14)
-        fig.tight_layout()
-        fig.savefig(figure_path, dpi=sp.COMPACT_PLOT_DPI)
-        plt.close(fig)
-        plot_paths.append(figure_path)
+def build_notes_map(rows):
+    notes_by_run = {}
+    metric_specs = [
+        ("kendall_analysis", "kendall"),
+        ("spearman_analysis", "spearman"),
+    ]
+    for metric_key, metric_label in metric_specs:
+        for selected in metric_selection_manifest_rows(rows, metric_key):
+            notes = notes_by_run.setdefault(selected["run_id"], [])
+            for label in selected["labels"]:
+                notes.append(f"{label} {metric_label.capitalize()}")
+    return notes_by_run
+
+
+def compact_row_from_iteration(bundle_summary, iteration_summary, note_text=""):
+    parameter_levels = bundle_summary.get("parameter_levels", {})
+    analysis_metrics = iteration_summary.get("comparison_metrics", {}).get("analysis", {})
+    simulation_metrics = iteration_summary.get("comparison_metrics", {}).get("simulation", {})
 
     return {
+        "run_id": iteration_summary.get("run_name"),
+        "infectiousness_level": to_italian_level(parameter_levels.get("infectiousness")),
+        "healing_level": to_italian_level(parameter_levels.get("healing")),
+        "symptoms_level": to_italian_level(parameter_levels.get("symptoms")),
+        "isolating_level": to_italian_level(parameter_levels.get("isolating")),
+        "symptoms_onset_level": to_italian_level(parameter_levels.get("symptomsOnset")),
+        "notification_to_isolation_level": to_italian_level(parameter_levels.get("notificationToIsolation")),
+        "symptomatic_period_level": to_italian_level(parameter_levels.get("symptomaticPeriod")),
+        "java_runtime_seconds": iteration_summary.get("analysis", {}).get("analysis_runtime_seconds"),
+        "simulation_runtime_seconds": iteration_summary.get("baseline", {}).get("actual_runtime_seconds"),
+        "simulation_runs": iteration_summary.get("baseline", {}).get("iterations"),
+        "kendall_analysis": analysis_metrics.get("tau"),
+        "kendall_simulation": simulation_metrics.get("tau"),
+        "spearman_analysis": analysis_metrics.get("spearman"),
+        "spearman_simulation": simulation_metrics.get("spearman"),
+        "top_1_accuracy_analysis": analysis_metrics.get("top_1_precision_mean"),
+        "top_1_accuracy_simulation": simulation_metrics.get("top_1_precision_mean"),
+        "top_2_accuracy_analysis": analysis_metrics.get("top_2_precision_mean"),
+        "top_2_accuracy_simulation": simulation_metrics.get("top_2_precision_mean"),
+        "top_3_accuracy_analysis": analysis_metrics.get("top_3_precision_mean"),
+        "top_3_accuracy_simulation": simulation_metrics.get("top_3_precision_mean"),
+        "top_4_accuracy_analysis": analysis_metrics.get("top_4_precision_mean"),
+        "top_4_accuracy_simulation": simulation_metrics.get("top_4_precision_mean"),
+        "mrr_analysis": analysis_metrics.get("mrr"),
+        "mrr_simulation": simulation_metrics.get("mrr"),
+        "brier_score_analysis": iteration_summary.get("precision_metrics", {}).get("prediction_mean_brier"),
+        "brier_score_simulation": iteration_summary.get("precision_metrics", {}).get("baseline_mean_brier"),
+        "ece_analysis": iteration_summary.get("precision_metrics", {}).get("prediction_mean_ece"),
+        "ece_simulation": iteration_summary.get("precision_metrics", {}).get("baseline_mean_ece"),
+        "note": note_text,
+    }
+
+
+def build_compact_rows(bundle_summaries):
+    rows = []
+    for bundle_summary in bundle_summaries:
+        for iteration_summary in bundle_summary.get("iterations", []):
+            rows.append(compact_row_from_iteration(bundle_summary, iteration_summary))
+
+    notes_by_run = build_notes_map(rows)
+    for row in rows:
+        notes = notes_by_run.get(row["run_id"], [])
+        row["note"] = " - ".join(notes)
+    return rows
+
+
+def create_iteration_metric_artifacts(bundle_dir, iteration_records, compact_rows):
+    summary_csv_path = os.path.join(bundle_dir, "iteration_sweep_summary.csv")
+    rows = [
+        row for row in compact_rows
+        if row["run_id"] in {record.get("run_name") for record in iteration_records}
+    ]
+    notes_by_run = build_notes_map(rows)
+    for row in rows:
+        notes = notes_by_run.get(row["run_id"], [])
+        row["note"] = " - ".join(notes)
+    with open(summary_csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=COMPACT_RESULT_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return {
         "summary_csv_path": summary_csv_path,
-        "kendall_csv_path": kendall_csv_path,
-        "spearman_csv_path": spearman_csv_path,
-        "plot_paths": plot_paths,
     }
 
 
@@ -538,6 +582,7 @@ def run_parameter_bundle_iteration_sweep(
     time_step_hours,
     baseline_runtime_multiplier,
     observed_test_ablation,
+    include_moving_avg_metrics,
     java_iterations_values,
     parameter_bundle,
     ground_truth_parameter_bundle,
@@ -626,6 +671,10 @@ def run_parameter_bundle_iteration_sweep(
             "dataset_path": dataset_path,
             "shared_dataset_path": run_inputs["shared_dataset_path"],
             "shared_observed_simulated_path": run_inputs["shared_observed_simulated_path"],
+            "convergence": {
+                "ground_truth_path": shared_ground_truth["convergence"]["ground_truth_path"],
+                "granularity": shared_ground_truth["convergence"].get("granularity", 1.0),
+            },
         }
         sp.write_json(os.path.join(iteration_dir, "run_summary.json"), iteration_summary)
 
@@ -672,6 +721,7 @@ def run_parameter_bundle_iteration_sweep(
             prediction_metrics_path = os.path.join(precision_dir, "metrics_prediction.json")
             baseline_metrics_path = os.path.join(precision_dir, "metrics_baseline.json")
             metrics_stdout = io.StringIO()
+            t0_metrics = time.time()
             with contextlib.redirect_stdout(metrics_stdout):
                 process_and_save(
                     analysis_path,
@@ -698,8 +748,11 @@ def run_parameter_bundle_iteration_sweep(
                 shared_ground_truth["convergence"]["ground_truth_path"],
                 analysis_path,
                 baseline_result["averaged_results_path"],
+                include_moving_avg_metrics=include_moving_avg_metrics,
                 save_plots=save_plots,
             )
+            t1_metrics = time.time()
+            metrics_runtime_seconds = t1_metrics - t0_metrics
 
             iteration_summary["analysis"] = {
                 "analysis_path": analysis_path,
@@ -743,8 +796,10 @@ def run_parameter_bundle_iteration_sweep(
                 "baseline_mean_brier": sp.mean_metric_value(baseline_metrics_path, "Brier Score"),
                 "prediction_mean_ece": sp.mean_metric_value(prediction_metrics_path, "ECE"),
                 "baseline_mean_ece": sp.mean_metric_value(baseline_metrics_path, "ECE"),
+                "metrics_runtime_seconds": metrics_runtime_seconds,
             }
             iteration_summary["comparison_metrics"] = comparison_summary
+            iteration_summary["moving_avg_metrics_enabled"] = include_moving_avg_metrics
             iteration_summary["status"] = "completed"
             iteration_summary["completed_at"] = datetime.now().isoformat(timespec="seconds")
         except Exception as exc:
@@ -758,9 +813,11 @@ def run_parameter_bundle_iteration_sweep(
 
     bundle_summary["aggregate_outputs"] = create_iteration_metric_artifacts(
         bundle_dir=bundle_dir,
-        bundle_label=run_name,
         iteration_records=bundle_summary["iterations"],
-        save_plots=save_plots,
+        compact_rows=[
+            compact_row_from_iteration(bundle_summary, iteration_summary)
+            for iteration_summary in bundle_summary["iterations"]
+        ],
     )
     completed_count = sum(1 for record in bundle_summary["iterations"] if record.get("status") == "completed")
     if completed_count == len(bundle_summary["iterations"]):
@@ -830,176 +887,187 @@ def build_failed_bundle_summary(
 
 
 def write_aggregate_outputs(output_root, bundle_summaries):
-    aggregate_json_path = os.path.join(output_root, "sweep_summary.json")
-    sp.write_json(aggregate_json_path, bundle_summaries)
+    compact_rows = build_compact_rows(bundle_summaries)
 
-    csv_rows = []
-    for bundle_summary in bundle_summaries:
-        parameter_levels = bundle_summary.get("parameter_levels", {})
-        if bundle_summary.get("iterations"):
-            records = bundle_summary["iterations"]
-        else:
-            records = [
-                {
-                    "java_iterations": None,
-                    "status": bundle_summary.get("status"),
-                    "error": bundle_summary.get("error"),
-                }
-            ]
-        for iteration_summary in records:
-            csv_rows.append(
-                {
-                    "run_name": bundle_summary.get("run_name"),
-                    "status": iteration_summary.get("status", bundle_summary.get("status")),
-                    "dataset_source": bundle_summary.get("dataset_source"),
-                    "dataset_generation_method": bundle_summary.get("dataset_generation_method"),
-                    "time_limit": bundle_summary.get("time_limit"),
-                    "n_subjects": bundle_summary.get("n_subjects"),
-                    "total_internal_contacts": bundle_summary.get("total_internal_contacts"),
-                    "time_step_hours": bundle_summary.get("time_step_hours"),
-                    "baseline_runtime_multiplier": bundle_summary.get("baseline_runtime_multiplier"),
-                    "tests_enabled": bundle_summary.get("tests_enabled"),
-                    "observed_test_ablation": bundle_summary.get("observed_test_ablation"),
-                    "parameter_case_id": bundle_summary.get("parameter_case_id"),
-                    "ground_truth_parameter_case_id": bundle_summary.get("ground_truth_parameter_case_id"),
-                    "infectiousness_level": parameter_levels.get("infectiousness"),
-                    "healing_level": parameter_levels.get("healing"),
-                    "symptoms_level": parameter_levels.get("symptoms"),
-                    "isolating_level": parameter_levels.get("isolating"),
-                    "symptoms_onset_level": parameter_levels.get("symptomsOnset"),
-                    "notification_to_isolation_level": parameter_levels.get("notificationToIsolation"),
-                    "symptomatic_period_level": parameter_levels.get("symptomaticPeriod"),
-                    "java_iterations": iteration_summary.get("java_iterations"),
-                    "java_analysis_runtime_seconds": iteration_summary.get("analysis", {}).get("analysis_runtime_seconds"),
-                    "java_analysis_wall_runtime_seconds": iteration_summary.get("analysis", {}).get("analysis_wall_runtime_seconds"),
-                    "java_precompute_cache_hit": iteration_summary.get("analysis", {}).get("java_precompute_cache_hit"),
-                    "baseline_runtime_budget_seconds": iteration_summary.get("baseline", {}).get("runtime_budget_seconds"),
-                    "baseline_actual_runtime_seconds": iteration_summary.get("baseline", {}).get("actual_runtime_seconds"),
-                    "baseline_iterations": iteration_summary.get("baseline", {}).get("iterations"),
-                    "prediction_mean_brier": iteration_summary.get("precision_metrics", {}).get("prediction_mean_brier"),
-                    "baseline_mean_brier": iteration_summary.get("precision_metrics", {}).get("baseline_mean_brier"),
-                    "prediction_mean_ece": iteration_summary.get("precision_metrics", {}).get("prediction_mean_ece"),
-                    "baseline_mean_ece": iteration_summary.get("precision_metrics", {}).get("baseline_mean_ece"),
-                    "analysis_tau": iteration_summary.get("comparison_metrics", {}).get("analysis", {}).get("tau"),
-                    "simulation_tau": iteration_summary.get("comparison_metrics", {}).get("simulation", {}).get("tau"),
-                    "analysis_spearman": iteration_summary.get("comparison_metrics", {}).get("analysis", {}).get("spearman"),
-                    "simulation_spearman": iteration_summary.get("comparison_metrics", {}).get("simulation", {}).get("spearman"),
-                    "analysis_mrr": iteration_summary.get("comparison_metrics", {}).get("analysis", {}).get("mrr"),
-                    "simulation_mrr": iteration_summary.get("comparison_metrics", {}).get("simulation", {}).get("mrr"),
-                    "run_dir": iteration_summary.get("run_dir", bundle_summary.get("run_dir")),
-                    "error": iteration_summary.get("error", bundle_summary.get("error")),
-                }
-            )
+    aggregate_json_path = os.path.join(output_root, "sweep_summary.json")
+    sp.write_json(aggregate_json_path, compact_rows)
 
     csv_path = os.path.join(output_root, "sweep_summary.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as handle:
-        fieldnames = list(csv_rows[0].keys()) if csv_rows else ["run_name"]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=COMPACT_RESULT_COLUMNS)
         writer.writeheader()
-        writer.writerows(csv_rows)
+        writer.writerows(compact_rows)
+
+    return compact_rows
 
 
-def bundle_analysis_spearman_score(bundle_summary):
-    scores = []
-    for iteration_summary in bundle_summary.get("iterations", []):
-        if iteration_summary.get("status") != "completed":
-            continue
-        score = sp.finite_float(
-            iteration_summary.get("comparison_metrics", {}).get("analysis", {}).get("spearman")
-        )
-        if score is not None:
-            scores.append(score)
-    if not scores:
-        return None
-    return float(sum(scores) / len(scores))
+def select_rows_for_metric_plots(rows, metric_key):
+    candidates = [
+        row for row in rows
+        if sp.finite_float(row.get(metric_key)) is not None
+    ]
+    candidates.sort(key=lambda row: (float(row[metric_key]), row["run_id"]))
+    if not candidates:
+        return []
 
-
-def select_bundles_for_reduced_plots(bundle_summaries):
-    ranked = []
-    for bundle_summary in bundle_summaries:
-        if bundle_summary.get("status") not in {"completed", "partial-failure"}:
-            continue
-        score = bundle_analysis_spearman_score(bundle_summary)
-        if score is None:
-            continue
-        ranked.append((score, bundle_summary))
-
-    ranked.sort(key=lambda item: (item[0], item[1].get("run_name", "")))
-    if not ranked:
-        return [], []
-
-    bucket_size = min(sp.REDUCED_PLOT_BUCKET_SIZE, len(ranked))
-    median_bucket_size = min(sp.REDUCED_PLOT_BUCKET_SIZE, len(ranked))
-    median_center = len(ranked) // 2
+    bucket_size = min(METRIC_SELECTION_BUCKET_SIZE, len(candidates))
+    median_center = len(candidates) // 2
     median_start = max(
         0,
-        min(len(ranked) - median_bucket_size, median_center - median_bucket_size // 2),
+        min(len(candidates) - bucket_size, median_center - bucket_size // 2),
     )
 
-    selected_by_run = {}
+    selected = {}
+    for row in candidates[:bucket_size]:
+        selected[row["run_id"]] = row
+    for row in candidates[-bucket_size:]:
+        selected[row["run_id"]] = row
+    for row in candidates[median_start:median_start + bucket_size]:
+        selected[row["run_id"]] = row
+    return sorted(selected.values(), key=lambda row: (float(row[metric_key]), row["run_id"]))
 
-    def add_selected(bundle_summary, reason):
-        run_name = bundle_summary["run_name"]
+
+def create_metric_selection_plot(output_root, rows, metric_label, metric_analysis_key, metric_simulation_key):
+    selected_rows = select_rows_for_metric_plots(rows, metric_analysis_key)
+    if not selected_rows:
+        return None
+
+    base_name = metric_label.lower()
+    csv_path = os.path.join(output_root, f"selected_30_{base_name}.csv")
+    sp.save_series_csv(
+        csv_path,
+        ["run_id", f"{base_name}_analysis", f"{base_name}_simulation", "note"],
+        [
+            [
+                row["run_id"],
+                row.get(metric_analysis_key),
+                row.get(metric_simulation_key),
+                row.get("note", ""),
+            ]
+            for row in selected_rows
+        ],
+    )
+
+    figure_path = os.path.join(output_root, f"selected_30_{base_name}.png")
+    x_values = list(range(1, len(selected_rows) + 1))
+    analysis_values = [row.get(metric_analysis_key) for row in selected_rows]
+    simulation_values = [row.get(metric_simulation_key) for row in selected_rows]
+
+    fig, axis = plt.subplots(figsize=(14, 5.2))
+    axis.plot(x_values, analysis_values, marker="o", linewidth=1.8, color="tab:orange", label="Java analysis")
+    axis.plot(x_values, simulation_values, marker="x", linewidth=1.8, color="tab:green", label="Simulation")
+    axis.set_title(f"Selected 30 Runs by {metric_label}")
+    axis.set_xlabel("Selected run index")
+    axis.set_ylabel(metric_label)
+    axis.grid(True, alpha=0.3)
+    axis.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(figure_path, dpi=sp.COMPACT_PLOT_DPI)
+    plt.close(fig)
+    return {
+        "metric": metric_label,
+        "csv_path": csv_path,
+        "plot_path": figure_path,
+    }
+
+
+def select_iteration_rows_for_reduced_plots(rows):
+    selected_by_run = {}
+    metric_specs = [
+        ("kendall_analysis", "kendall_analysis"),
+        ("spearman_analysis", "spearman_analysis"),
+    ]
+
+    def add_selected(row, reason):
+        run_id = row["run_id"]
         info = selected_by_run.setdefault(
-            run_name,
+            run_id,
             {
-                "summary": bundle_summary,
+                "row": row,
                 "reasons": [],
-                "analysis_spearman_mean": bundle_analysis_spearman_score(bundle_summary),
             },
         )
         if reason not in info["reasons"]:
             info["reasons"].append(reason)
 
-    for _, bundle_summary in ranked[:bucket_size]:
-        add_selected(bundle_summary, "worst_10")
-    for _, bundle_summary in ranked[-bucket_size:]:
-        add_selected(bundle_summary, "best_10")
-    for _, bundle_summary in ranked[median_start:median_start + median_bucket_size]:
-        add_selected(bundle_summary, "median_10")
-    for _, bundle_summary in ranked:
-        if bundle_summary.get("parameter_case_id") == bundle_summary.get("ground_truth_parameter_case_id"):
-            add_selected(bundle_summary, "mid_parameter_case")
+    for metric_key, metric_label in metric_specs:
+        candidates = [
+            row for row in rows
+            if sp.finite_float(row.get(metric_key)) is not None
+        ]
+        candidates.sort(key=lambda row: (float(row[metric_key]), row["run_id"]))
+        if not candidates:
+            continue
 
-    selected_bundles = [
-        item["summary"]
-        for item in sorted(
-            selected_by_run.values(),
-            key=lambda item: (
-                item["analysis_spearman_mean"] if item["analysis_spearman_mean"] is not None else float("inf"),
-                item["summary"]["run_name"],
-            ),
+        bucket_size = min(METRIC_SELECTION_BUCKET_SIZE, len(candidates))
+        median_center = len(candidates) // 2
+        median_start = max(
+            0,
+            min(len(candidates) - bucket_size, median_center - bucket_size // 2),
         )
-    ]
+
+        for row in candidates[:bucket_size]:
+            add_selected(row, f"worst_10_{metric_label}")
+        for row in candidates[-bucket_size:]:
+            add_selected(row, f"best_10_{metric_label}")
+        for row in candidates[median_start:median_start + bucket_size]:
+            add_selected(row, f"median_10_{metric_label}")
+
+    for row in rows:
+        if (
+            row.get("infectiousness_level") == to_italian_level(sp.GROUND_TRUTH_PARAMETER_LEVEL)
+            and row.get("healing_level") == to_italian_level(sp.GROUND_TRUTH_PARAMETER_LEVEL)
+            and row.get("symptoms_level") == to_italian_level(sp.GROUND_TRUTH_PARAMETER_LEVEL)
+            and row.get("isolating_level") == to_italian_level(sp.GROUND_TRUTH_PARAMETER_LEVEL)
+            and row.get("symptoms_onset_level") == to_italian_level(sp.GROUND_TRUTH_PARAMETER_LEVEL)
+            and row.get("notification_to_isolation_level") == to_italian_level(sp.GROUND_TRUTH_PARAMETER_LEVEL)
+            and row.get("symptomatic_period_level") == to_italian_level(sp.GROUND_TRUTH_PARAMETER_LEVEL)
+        ):
+            add_selected(row, "mid_parameter_case")
+
     manifest_rows = [
         {
-            "run_name": item["summary"]["run_name"],
-            "run_dir": item["summary"]["run_dir"],
-            "parameter_case_id": item["summary"].get("parameter_case_id"),
-            "analysis_spearman_mean": item["analysis_spearman_mean"],
-            "selection_reasons": "|".join(item["reasons"]),
+            "run_id": info["row"]["run_id"],
+            "kendall_analysis": info["row"].get("kendall_analysis"),
+            "spearman_analysis": info["row"].get("spearman_analysis"),
+            "selection_reasons": "|".join(info["reasons"]),
         }
-        for item in sorted(
-            selected_by_run.values(),
-            key=lambda item: (
-                item["analysis_spearman_mean"] if item["analysis_spearman_mean"] is not None else float("inf"),
-                item["summary"]["run_name"],
-            ),
-        )
+        for info in sorted(selected_by_run.values(), key=lambda item: item["row"]["run_id"])
     ]
-    return selected_bundles, manifest_rows
+    selected_run_ids = {row["run_id"] for row in manifest_rows}
+    return selected_run_ids, manifest_rows
 
 
-def regenerate_iteration_run_plots(iteration_summary, ground_truth_path, granularity):
+def write_reduced_plot_selection(output_root, manifest_rows):
+    selection_json_path = os.path.join(output_root, "reduced_plot_selection.json")
+    selection_csv_path = os.path.join(output_root, "reduced_plot_selection.csv")
+    sp.write_json(selection_json_path, manifest_rows)
+    with open(selection_csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=list(manifest_rows[0].keys()) if manifest_rows else ["run_id"],
+        )
+        writer.writeheader()
+        writer.writerows(manifest_rows)
+    return {
+        "json_path": selection_json_path,
+        "csv_path": selection_csv_path,
+    }
+
+
+def regenerate_iteration_run_plots(iteration_summary):
     if iteration_summary.get("status") != "completed":
         return iteration_summary
 
     run_dir = iteration_summary["run_dir"]
     run_name = iteration_summary["run_name"]
+    ground_truth_path = iteration_summary["convergence"]["ground_truth_path"]
     analysis_path = iteration_summary["analysis"]["analysis_path"]
     baseline_path = iteration_summary["baseline"]["baseline_path"]
+    granularity = iteration_summary["convergence"].get("granularity", 1.0)
+    include_moving_avg_metrics = iteration_summary.get("moving_avg_metrics_enabled", True)
 
-    iteration_summary["analysis"]["subject_curve_plots"] = sp.create_analysis_subject_curve_plots(
+    analysis_curve_plots = sp.create_analysis_subject_curve_plots(
         run_dir=run_dir,
         run_name=run_name,
         analysis_path=analysis_path,
@@ -1008,6 +1076,7 @@ def regenerate_iteration_run_plots(iteration_summary, ground_truth_path, granula
         granularity=granularity,
         save_plots=True,
     )
+    iteration_summary["analysis"]["subject_curve_plots"] = analysis_curve_plots
 
     precision_dir = sp.ensure_dir(os.path.join(run_dir, "precision_metrics"))
     prediction_metrics_path = iteration_summary["precision_metrics"]["prediction_metrics_path"]
@@ -1039,38 +1108,11 @@ def regenerate_iteration_run_plots(iteration_summary, ground_truth_path, granula
         ground_truth_path,
         analysis_path,
         baseline_path,
+        include_moving_avg_metrics=include_moving_avg_metrics,
         save_plots=True,
     )
     sp.write_json(os.path.join(run_dir, "run_summary.json"), iteration_summary)
     return iteration_summary
-
-
-def regenerate_bundle_plots(bundle_summary):
-    if bundle_summary.get("status") not in {"completed", "partial-failure"}:
-        return bundle_summary
-
-    shared_ground_truth_summary_path = os.path.join(
-        bundle_summary["shared_ground_truth_run_dir"],
-        "shared_ground_truth_summary.json",
-    )
-    shared_ground_truth_summary = sp.read_json(shared_ground_truth_summary_path)
-    ground_truth_path = shared_ground_truth_summary["convergence"]["ground_truth_path"]
-    granularity = shared_ground_truth_summary["convergence"].get("granularity", 1.0)
-
-    regenerated_iterations = []
-    for iteration_summary in bundle_summary.get("iterations", []):
-        regenerated_iterations.append(
-            regenerate_iteration_run_plots(iteration_summary, ground_truth_path, granularity)
-        )
-    bundle_summary["iterations"] = regenerated_iterations
-    bundle_summary["aggregate_outputs"] = create_iteration_metric_artifacts(
-        bundle_dir=bundle_summary["run_dir"],
-        bundle_label=bundle_summary["run_name"],
-        iteration_records=bundle_summary["iterations"],
-        save_plots=True,
-    )
-    sp.write_json(os.path.join(bundle_summary["run_dir"], "bundle_summary.json"), bundle_summary)
-    return bundle_summary
 
 
 def main():
@@ -1145,6 +1187,11 @@ def main():
         help="Skip PNG plot generation and keep only CSV/JSON outputs for a faster sweep.",
     )
     parser.add_argument(
+        "--disable-moving-avg-metrics",
+        action="store_true",
+        help="Skip computing moving-average summary metrics in analysis outputs.",
+    )
+    parser.add_argument(
         "--reduce-plots",
         action="store_true",
         help=(
@@ -1177,7 +1224,8 @@ def main():
 
     repo_root = os.path.abspath(os.path.dirname(__file__))
     output_root = sp.ensure_dir(os.path.abspath(args.output_root))
-    save_plots_during_run = not args.skip_plot_images and not args.reduce_plots
+    save_plots_during_run = not args.skip_plot_images
+    include_moving_avg_metrics = not args.disable_moving_avg_metrics
     dataset_source = sp.DATASET_SOURCE_D2 if args.d2 else sp.DATASET_SOURCE_GENERATED
     parameter_space = sp.load_parameter_space_from_ods(os.path.abspath(args.parameter_ods_path))
     ground_truth_parameter_bundle = sp.resolve_uniform_parameter_bundle(
@@ -1197,6 +1245,7 @@ def main():
         seed_base=args.seed_base,
         time_step_hours=args.time_step_hours,
         baseline_runtime_multiplier=args.baseline_runtime_multiplier,
+        include_moving_avg_metrics=include_moving_avg_metrics,
         dataset_source=dataset_source,
         tests_enabled=not args.disable_tests,
         observed_test_ablation=args.observed_test_ablation,
@@ -1244,6 +1293,7 @@ def main():
                     time_step_hours=args.time_step_hours,
                     dataset_source=dataset_source,
                     ground_truth_parameter_bundle=ground_truth_parameter_bundle,
+                    include_moving_avg_metrics=include_moving_avg_metrics,
                     save_plots=save_plots_during_run,
                     disable_tests=args.disable_tests,
                 )
@@ -1321,6 +1371,7 @@ def main():
                         time_step_hours=args.time_step_hours,
                         baseline_runtime_multiplier=args.baseline_runtime_multiplier,
                         observed_test_ablation=args.observed_test_ablation,
+                        include_moving_avg_metrics=include_moving_avg_metrics,
                         java_iterations_values=java_iterations_values,
                         parameter_bundle=task_spec["parameter_bundle"],
                         ground_truth_parameter_bundle=ground_truth_parameter_bundle,
@@ -1349,6 +1400,7 @@ def main():
                                 time_step_hours=args.time_step_hours,
                                 baseline_runtime_multiplier=args.baseline_runtime_multiplier,
                                 observed_test_ablation=args.observed_test_ablation,
+                                include_moving_avg_metrics=include_moving_avg_metrics,
                                 java_iterations_values=java_iterations_values,
                                 parameter_bundle=parameter_bundle,
                                 ground_truth_parameter_bundle=ground_truth_parameter_bundle,
@@ -1386,13 +1438,53 @@ def main():
                 if executor is not None:
                     executor.shutdown(wait=True)
 
+    compact_rows = write_aggregate_outputs(output_root, summaries)
     if args.reduce_plots:
-        selected_bundles, manifest_rows = select_bundles_for_reduced_plots(summaries)
-        sp.write_reduced_plot_selection(output_root, manifest_rows)
+        selected_run_ids, manifest_rows = select_iteration_rows_for_reduced_plots(compact_rows)
+        write_reduced_plot_selection(output_root, manifest_rows)
         if not args.skip_plot_images:
-            for bundle_summary in selected_bundles:
-                regenerate_bundle_plots(bundle_summary)
-            write_aggregate_outputs(output_root, summaries)
+            for bundle_summary in summaries:
+                changed = False
+                for index, iteration_summary in enumerate(bundle_summary.get("iterations", [])):
+                    if iteration_summary.get("run_name") not in selected_run_ids:
+                        continue
+                    bundle_summary["iterations"][index] = regenerate_iteration_run_plots(iteration_summary)
+                    changed = True
+                if changed:
+                    bundle_summary["aggregate_outputs"] = create_iteration_metric_artifacts(
+                        bundle_dir=bundle_summary["run_dir"],
+                        iteration_records=bundle_summary["iterations"],
+                        compact_rows=[
+                            compact_row_from_iteration(bundle_summary, iteration_summary)
+                            for iteration_summary in bundle_summary["iterations"]
+                        ],
+                    )
+                    sp.write_json(
+                        os.path.join(bundle_summary["run_dir"], "bundle_summary.json"),
+                        bundle_summary,
+                    )
+            compact_rows = write_aggregate_outputs(output_root, summaries)
+
+    if not args.skip_plot_images:
+        kendall_plot = create_metric_selection_plot(
+            output_root=output_root,
+            rows=compact_rows,
+            metric_label="Kendall",
+            metric_analysis_key="kendall_analysis",
+            metric_simulation_key="kendall_simulation",
+        )
+        spearman_plot = create_metric_selection_plot(
+            output_root=output_root,
+            rows=compact_rows,
+            metric_label="Spearman",
+            metric_analysis_key="spearman_analysis",
+            metric_simulation_key="spearman_simulation",
+        )
+        selection_manifest = {
+            "kendall": kendall_plot,
+            "spearman": spearman_plot,
+        }
+        sp.write_json(os.path.join(output_root, "selected_30_metric_plots.json"), selection_manifest)
 
 
 if __name__ == "__main__":

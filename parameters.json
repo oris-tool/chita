@@ -1,0 +1,158 @@
+{
+    "infectiousness" : {
+        "lower" : {
+            "type" : "hypoexponential",
+            "n" : 2,
+            "lambdaErl" : 0.06401125,
+            "lambdaExp" : 0.0208525,
+            "level" : "lower"
+        },
+        "mid": {
+            "type" : "hypoexponential",
+            "n" : 2,
+            "lambdaErl" : 0.060879167,
+            "lambdaExp" : 0.02051375,
+            "level" : "mid"
+        },
+        "upper" : {
+            "type" : "hypoexponential",
+            "n" : 3,
+            "lambdaErl" : 0.05258125,
+            "lambdaExp" : 0.027363333,
+            "level" : "upper"
+        }
+    },
+    "healing" : {
+        "lower" : {
+            "type" : "hypoexponential",
+            "n" : 1,
+            "lambdaErl" : 0.0132925,
+            "lambdaExp" : 0.006650417,
+            "level" : "lower"
+        },
+        "mid": {
+            "type" : "hypoexponential",
+            "n" : 1,
+            "lambdaErl" : 0.01115625,
+            "lambdaExp" : 0.005581667,
+            "level" : "mid"
+
+        },
+        "upper" : {
+            "type" : "hypoexponential",
+            "n" : 1,
+            "lambdaErl" : 0.009394583,
+            "lambdaExp" : 0.0047,
+            "level" : "upper"
+        }
+    },
+    "symptoms" : {
+        "lower" : {
+            "type" : "switch",
+            "p" : 0.601,
+            "level" : "lower"
+        },
+        "mid": {
+            "type" : "switch",
+            "p" : 0.649,
+            "level" : "mid"
+        },
+        "upper" : {
+            "type" : "switch",
+            "p" : 0.693,
+            "level" : "upper"
+        }
+    },
+    "isolating" : {
+         "lower" : {
+            "type" : "hypoexponential",
+            "n" : 2,
+            "lambdaErl" : 0.047055,
+            "lambdaExp" : 0.019570833,
+            "level" : "lower"
+        },
+        "mid": {
+            "type" : "hypoexponential",
+            "n" : 3,
+            "lambdaErl" : 0.0336325,
+            "lambdaExp" : 0.016447083,
+            "level" : "mid"
+        },
+        "upper" : {
+            "type" : "hypoexponential",
+            "n" : 4,
+            "lambdaErl" : 0.030645,
+            "lambdaExp" : 0.01318,
+            "level" : "upper"
+        }
+    },
+    "symptomsOnset":{
+        "lower" : {
+            "type" : "hypoexponential",
+            "n" : 2,
+            "lambdaErl" : 0.025613333,
+            "lambdaExp" : 0.01414125,
+            "level" : "lower"
+        },
+        "mid": {
+            "type" : "hypoexponential",
+            "n" : 2,
+            "lambdaErl" : 0.02255375,
+            "lambdaExp" : 0.01341875,
+            "level" : "mid"
+        },
+        "upper" : {
+            "type" : "hypoexponential",
+            "n" : 2,
+            "lambdaErl" : 0.025185,
+            "lambdaExp" : 0.009941667,
+            "level" : "upper"
+        }
+    },
+    "symptomatic_period":{
+        "lower" : {
+            "type" : "hypoexponential",
+            "n" : 1,
+            "lambdaErl" : 0.019807917,
+            "lambdaExp" : 0.008741667,
+            "level" : "lower"
+        },
+        "mid": {
+            "type" : "hypoexponential",
+            "n" : 2,
+            "lambdaErl" : 0.025049167,
+            "lambdaExp" : 0.009150833,
+            "level" : "mid"
+        },
+        "upper" : {
+            "type" : "hypoexponential",
+            "n" : 3,
+            "lambdaErl" : 0.027114167,
+            "lambdaExp" : 0.009735417,
+            "level" : "upper"
+        }
+    },
+    "notification_to_isolation":{
+        "lower": {
+            "type" : "hyperexponential",
+            "p" : 0.97,
+            "lambda1" : 0.424613333,
+            "lambda2" : 0.013983333,
+            "level" : "lower"
+        },
+        "mid": {
+            "type" : "hyperexponential",
+            "p" : 0.88,
+            "lambda1" : 0.193394167,
+            "lambda2" : 0.025904167,
+            "level" : "mid"
+        },
+        "upper": {
+            "type" : "hyperexponential",
+            "p" : 0.75,
+            "lambda1" :0.110097917,
+            "lambda2" : 0.036100833,
+            "level" : "upper"
+        }
+    }
+}
