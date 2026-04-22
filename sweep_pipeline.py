@@ -719,6 +719,7 @@ def create_analysis_subject_curve_plots(
     ground_truth_path,
     baseline_path,
     granularity=1.0,
+    ground_truth_sample_size=None,
     save_plots=True,
 ):
     analysis = normalize_subject_series(read_json(analysis_path))
@@ -734,7 +735,10 @@ def create_analysis_subject_curve_plots(
         )
 
     output_dir = ensure_dir(os.path.join(run_dir, "plots", "analysis_subject_curves"))
-    dkw_result = compute_confidence_intervals(ground_truth)
+    dkw_result = compute_confidence_intervals(
+        ground_truth,
+        sample_size=ground_truth_sample_size,
+    )
     csv_rows = []
     generated_plots = []
 
@@ -1909,6 +1913,7 @@ def run_single_pipeline(
         ground_truth_path=convergence_result["ground_truth_path"],
         baseline_path=baseline_result["averaged_results_path"],
         granularity=convergence_result.get("granularity", 1.0),
+        ground_truth_sample_size=convergence_result.get("iterations"),
         save_plots=save_plots,
     )
     summary["analysis"] = {
@@ -2203,6 +2208,7 @@ def regenerate_run_plots(summary):
         ground_truth_path=ground_truth_path,
         baseline_path=baseline_path,
         granularity=granularity,
+        ground_truth_sample_size=summary["convergence"].get("iterations"),
         save_plots=True,
     )
     summary["analysis"]["subject_curve_plots"] = analysis_curve_plots

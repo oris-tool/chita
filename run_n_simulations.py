@@ -59,7 +59,7 @@ def check_convergence(current_state, last_state, threshold=1e-4):
             converged = False
     return {"converged" : converged, "scores" : scores}
 
-def compute_confidence_intervals(current_state, confidence=0.95):
+def compute_confidence_intervals(current_state, confidence=0.95, sample_size=None):
     if not current_state:
         raise ValueError("Error: current_state cannot be empty.")
 
@@ -72,12 +72,19 @@ def compute_confidence_intervals(current_state, confidence=0.95):
         if len(current_state[subject_id]) != horizon:
             raise ValueError("Error: all subjects must have trajectories with the same length.")
 
+    if sample_size is None:
+        # Backward-compatible default for callers that do not provide the number
+        # of repetitions used to estimate each trajectory point.
+        sample_size = horizon
+    if sample_size <= 0:
+        raise ValueError("Error: sample_size must be greater than 0.")
+
     alpha = 1 - confidence
     if alpha <= 0 or alpha >= 1:
         raise ValueError("Error: confidence must be between 0 and 1.")
 
     # Dvoretzky-Kiefer-Wolfowitz epsilon for empirical CDF bands.
-    epsilon = np.sqrt(-np.log(alpha / 2) / (2 * horizon))
+    epsilon = np.sqrt(-np.log(alpha / 2) / (2 * float(sample_size)))
     dkw_band = {
         subject_id: {
             "lower": [max(0.0, value - epsilon) for value in current_state[subject_id]],
@@ -330,7 +337,10 @@ def run_dataset_simulations(
                     subject_id: [avg_state[subject_id][time_index] / rep_done for time_index in range(horizon)]
                     for subject_id in range(1, n_subjects + 1)
                 }
-                intermediate_confidence_intervals = compute_confidence_intervals(current_state)
+                intermediate_confidence_intervals = compute_confidence_intervals(
+                    current_state,
+                    sample_size=rep_done,
+                )
                 intermediate_label = dataset_label or os.path.basename(dataset_dir)
                 intermediate_plots_dir = os.path.join(dataset_dir, "plots", "intermediate")
                 plot_dkw_bands(
@@ -354,7 +364,10 @@ def run_dataset_simulations(
         for subject_id in range(1, n_subjects + 1)
     }
 
-    confidence_intervals = compute_confidence_intervals(avg_results)
+    confidence_intervals = compute_confidence_intervals(
+        avg_results,
+        sample_size=rep_done,
+    )
     effective_label = dataset_label or os.path.basename(dataset_dir)
     plots_dir = os.path.join(dataset_dir, "plots")
     plot_dkw_bands(

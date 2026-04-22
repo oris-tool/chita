@@ -149,6 +149,7 @@ def process_and_save(
     metrics_output="metrics.json",
     plots_dir="plots",
     save_plots=True,
+    verbose=True,
 ):
     """
     Reads the two JSON files, calculates metrics, optionally saves compact plots,
@@ -166,6 +167,8 @@ def process_and_save(
 
     results = []
     metrics_dict = {}
+    total_brier_score = 0.0
+    total_ece = 0.0
 
     p_subjects = sorted(list(dict_p.keys()), key=int)
     g_subjects = sorted(list(dict_g.keys()), key=int)
@@ -183,6 +186,8 @@ def process_and_save(
             )
 
         bs, ece = calculate_metrics(p, g, M=M)
+        total_brier_score += bs
+        total_ece += ece
         results.append(
             {
                 "Subject": subject_id,
@@ -200,9 +205,15 @@ def process_and_save(
             ],
         }
 
-    results_df = pd.DataFrame(results)
-    results_df["Subject_num"] = pd.to_numeric(results_df["Subject"])
-    results_df = results_df.sort_values(by="Subject_num").reset_index(drop=True)
+    subject_count = len(results)
+    mean_brier_score = float(total_brier_score / subject_count) if subject_count else float("nan")
+    mean_ece = float(total_ece / subject_count) if subject_count else float("nan")
+
+    results_df = None
+    if save_plots or verbose:
+        results_df = pd.DataFrame(results)
+        results_df["Subject_num"] = pd.to_numeric(results_df["Subject"])
+        results_df = results_df.sort_values(by="Subject_num").reset_index(drop=True)
 
     if save_plots:
         save_metrics_table(
@@ -211,19 +222,30 @@ def process_and_save(
         )
         save_reliability_grids(dict_p, dict_g, g_subjects, plots_dir)
 
-    _safe_print("Coefficients Table per Subject:")
-    _safe_print("-" * 45)
-    _safe_print(results_df[["Subject", "Brier Score", "ECE"]].to_string(index=False))
-    _safe_print("-" * 45)
+    if verbose:
+        _safe_print("Coefficients Table per Subject:")
+        _safe_print("-" * 45)
+        _safe_print(results_df[["Subject", "Brier Score", "ECE"]].to_string(index=False))
+        _safe_print("-" * 45)
 
     with open(metrics_output, "w", encoding="utf-8") as fm:
         json.dump(metrics_dict, fm, indent=4)
 
-    _safe_print(f"\nAll metrics and coordinates saved successfully to: {metrics_output}")
-    if save_plots:
-        _safe_print(f"Compact plot set saved successfully in the directory: ./{plots_dir}/")
-    else:
-        _safe_print("Plot image generation was skipped.")
+    if verbose:
+        _safe_print(f"\nAll metrics and coordinates saved successfully to: {metrics_output}")
+        if save_plots:
+            _safe_print(f"Compact plot set saved successfully in the directory: ./{plots_dir}/")
+        else:
+            _safe_print("Plot image generation was skipped.")
+
+    return {
+        "metrics_output": metrics_output,
+        "plots_dir": plots_dir,
+        "plots_generated": bool(save_plots),
+        "subject_count": subject_count,
+        "mean_brier_score": mean_brier_score,
+        "mean_ece": mean_ece,
+    }
 
 
 if __name__ == "__main__":

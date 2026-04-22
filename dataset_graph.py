@@ -95,16 +95,18 @@ def simulate_external_introduction(
     max_intro_time=48.0,
     tmax_after_intro=2016.0,
     max_external_contacts_per_node=8,
+    effective_external_contacts=1,
     total_internal_contacts=None,
     seed=None,
 ):
     """
     Build a random contact network and simulate SIR diffusion with EoN.
 
-    The disease is introduced from outside the network by infecting one random
-    node at a random time. Since ``EoN.fast_SIR`` starts at time 0, the sample
-    runs the epidemic from the imported case and then shifts the output times
-    so that the introduction happens at the sampled external-arrival time.
+    The disease is introduced from outside the network by selecting one or more
+    already-generated external contacts as effective introductions. Since
+    ``EoN.fast_SIR`` starts at time 0, the sample runs the epidemic from the
+    imported case(s) and then shifts the output times so that the introduction
+    happens at the selected external-arrival time.
 
     Returns:
         dict: Graph, sampled introduction info, and S/I/R time series.
@@ -123,8 +125,10 @@ def simulate_external_introduction(
         for node in range(n_nodes - 1):
             graph.add_edge(node, node + 1)
 
-    infected_node = rng.choice(list(graph.nodes))
-    introduction_time = rng.uniform(0.0, max_intro_time)
+    if int(effective_external_contacts) <= 0:
+        raise ValueError("effective_external_contacts must be greater than 0.")
+
+    requested_effective_contacts = int(effective_external_contacts)
     total_time_limit = tmax_after_intro
 
     external_contacts = []
@@ -144,21 +148,44 @@ def simulate_external_introduction(
                 }
             )
 
-    external_contacts.append(
-        {
-            "type": "External",
-            "involved_subjects": [infected_node + 1],
-            "time": float(introduction_time),
-            "risk_factor": rng.uniform(0.0, 1.0),
-            "result": None,
-        }
-    )
+    if not external_contacts:
+        fallback_node = rng.choice(list(graph.nodes))
+        external_contacts.append(
+            {
+                "type": "External",
+                "involved_subjects": [fallback_node + 1],
+                "time": float(rng.uniform(0.0, total_time_limit)),
+                "risk_factor": rng.uniform(0.0, 1.0),
+                "result": None,
+            }
+        )
+
+    contact_indices_by_node = {}
+    for index, event in enumerate(external_contacts):
+        subject_id = int(event["involved_subjects"][0])
+        node = subject_id - 1
+        contact_indices_by_node.setdefault(node, []).append(index)
+
+    candidate_nodes = sorted(contact_indices_by_node.keys())
+    n_effective_contacts = min(requested_effective_contacts, len(candidate_nodes))
+    introduced_nodes = rng.sample(candidate_nodes, n_effective_contacts)
+    effective_contact_indices = [
+        rng.choice(contact_indices_by_node[node])
+        for node in introduced_nodes
+    ]
+    effective_contacts = [external_contacts[index] for index in effective_contact_indices]
+    introduction_time = min(event["time"] for event in effective_contacts)
+
+    # Align effective introductions to the same external-arrival time.
+    for effective_event in effective_contacts:
+        effective_event["time"] = float(introduction_time)
+        effective_event["result"] = True
 
     simulation = EoN.fast_SIR(
         graph,
         tau=transmission_rate,
         gamma=recovery_rate,
-        initial_infecteds=[infected_node],
+        initial_infecteds=introduced_nodes,
         tmax=tmax_after_intro,
         return_full_data=True,
     )
@@ -171,8 +198,8 @@ def simulate_external_introduction(
 
     if introduction_time > 0.0:
         shifted_times = [0.0, introduction_time] + shifted_times
-        susceptible = [n_nodes, n_nodes - 1] + list(susceptible)
-        infected = [0, 1] + list(infected)
+        susceptible = [n_nodes, n_nodes - n_effective_contacts] + list(susceptible)
+        infected = [0, n_effective_contacts] + list(infected)
         recovered = [0, 0] + list(recovered)
     else:
         susceptible = list(susceptible)
@@ -183,7 +210,9 @@ def simulate_external_introduction(
         "graph": graph,
         "simulation": simulation,
         "introduction_time": introduction_time,
-        "introduced_node": infected_node,
+        "introduced_node": introduced_nodes[0],
+        "introduced_nodes": introduced_nodes,
+        "effective_external_contacts": len(effective_contacts),
         "external_contacts": sorted(external_contacts, key=lambda event: event["time"]),
         "total_internal_contacts": total_internal_contacts,
         "time_limit": total_time_limit,
@@ -199,13 +228,14 @@ def plot_network_and_epidemic(result):
     Plot the contact network and the SIR curves for one simulated outbreak.
     """
     graph = result["graph"]
-    introduced_node = result["introduced_node"]
+    introduced_nodes = result.get("introduced_nodes", [result["introduced_node"]])
+    introduced_nodes_set = set(int(node) for node in introduced_nodes)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
     layout = nx.spring_layout(graph, seed=42)
     node_colors = [
-        "crimson" if node == introduced_node else "lightsteelblue"
+        "crimson" if node in introduced_nodes_set else "lightsteelblue"
         for node in graph.nodes
     ]
     nx.draw_networkx(
@@ -220,7 +250,7 @@ def plot_network_and_epidemic(result):
     )
     axes[0].set_title(
         "Contact network\n"
-        f"external introduction on node {introduced_node} at t={result['introduction_time']:.2f}"
+        f"external introductions on nodes {sorted(introduced_nodes_set)} at t={result['introduction_time']:.2f}"
     )
     axes[0].axis("off")
 
@@ -319,10 +349,14 @@ def save_dataset_event_sequence(result, output_path):
 
 
 if __name__ == "__main__":
-    result = simulate_external_introduction(seed=7, total_internal_contacts=400)
+    result = simulate_external_introduction(
+        seed=7,
+        total_internal_contacts=400,
+        effective_external_contacts=3,
+    )
     print(
         f"External introduction at t={result['introduction_time']:.2f} "
-        f"on node {result['introduced_node']}"
+        f"on nodes {result.get('introduced_nodes', [result['introduced_node']])}"
     )
     print(f"Network: {result['graph'].number_of_nodes()} nodes, {result['graph'].number_of_edges()} edges")
     print(f"External contacts saved: {len(result['external_contacts'])}")

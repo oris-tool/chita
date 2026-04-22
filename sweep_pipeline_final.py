@@ -1,9 +1,12 @@
 import contextlib
+import copy
 import csv
 import io
 import itertools
 import json
+import math
 import os
+import random
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,13 +29,22 @@ QUANTILE = 4
 EXTERNAL_CONTACTS = 100
 TESTS = 100
 SYMPTOMS = 100
-INTERNAL_CONTACTS = [200, 400, 800]
+INTERNAL_CONTACTS = [32, 200, 400, 800]
 SUBJECTS = 8
+EFFECTIVE_EXTERNAL_CONTACTS = 3
 
 RUN_DIR_PREFIX = "sweep_"
 RUN_COMPLETION_SENTINEL = "_run_completed.json"
 PROGRESS_DIR_NAME = "_progress"
 DEFAULT_MAX_WORKERS = max(1, (os.cpu_count() or 1) // 2)
+SAVE_PRECISION_PLOTS = os.environ.get("CHITA_SAVE_PRECISION_PLOTS", "0") == "1"
+LOG_PRECISION_METRICS = os.environ.get("CHITA_LOG_PRECISION_METRICS", "0") == "1"
+CASE_INDEX_BASE = 0
+METRIC_SELECTION_BUCKET_SIZE = 10
+NOISE_FRACTION = 0.05
+NOISE_TIME_SHIFT_HOURS = 6.0
+NOISE_SEED = 30
+NOISE_EVENT_TYPES = ("Internal", "External", "Test", "Symptoms")
 
 LEVEL_LABELS_IT = {
     "lower": "basso",
@@ -42,6 +54,8 @@ LEVEL_LABELS_IT = {
 
 REFERENCE_SWEEP_COLUMNS = [
     "run_id",
+    "parameter_case_code",
+    "parameter_case_id",
     "infectiousness_level",
     "healing_level",
     "symptoms_level",
@@ -111,6 +125,20 @@ def resolve_worker_count(task_count):
 
 def to_italian_level(level):
     return LEVEL_LABELS_IT.get(level, level)
+
+
+def format_case_run_code(case_index):
+    return str(int(case_index))
+
+
+def resolve_case_output_dir(base_dir, parameter_case):
+    preferred_dir = os.path.join(base_dir, parameter_case["case_run_code"])
+    legacy_dir = os.path.join(base_dir, parameter_case["case_id"])
+    if os.path.exists(preferred_dir):
+        return preferred_dir
+    if os.path.exists(legacy_dir):
+        return legacy_dir
+    return preferred_dir
 
 
 def progress_dir(save_path):
@@ -254,7 +282,7 @@ def build_parameter_combinations(parameter_path):
     all_cases = []
     ground_truth_case = None
 
-    for combination in combinations:
+    for case_index, combination in enumerate(combinations, start=CASE_INDEX_BASE):
         current_set = {}
         level_selection = {}
         is_ground_truth_combination = True
@@ -272,6 +300,8 @@ def build_parameter_combinations(parameter_path):
             "parameter_bundle": current_set,
             "levels": level_selection,
             "case_id": normalized["case_id"],
+            "case_index": case_index,
+            "case_run_code": format_case_run_code(case_index),
         }
 
         if is_ground_truth_combination:
@@ -300,6 +330,16 @@ def ensure_python_simulation_input(analysis_dir, dataset_path):
     return destination
 
 
+def ensure_ground_truth_simulation_input(save_path, dataset_path):
+    dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
+    ground_truth_dir = os.path.join(save_path, "ground_truth", dataset_stem)
+    ensure_dir(ground_truth_dir)
+    destination = os.path.join(ground_truth_dir, os.path.basename(dataset_path))
+    if os.path.abspath(destination) != os.path.abspath(dataset_path):
+        shutil.copy2(dataset_path, destination)
+    return destination
+
+
 def find_generated_file(run_dir, suffix):
     matches = [
         os.path.join(run_dir, name)
@@ -320,16 +360,242 @@ def _is_valid_path(path_value):
     return isinstance(path_value, str) and os.path.exists(path_value)
 
 
+def _flip_test_result(value):
+    if isinstance(value, bool):
+        return not value
+
+    if isinstance(value, (int, float)) and float(value).is_integer() and int(value) in (0, 1):
+        return 1 - int(value)
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        positive_aliases = {"positive", "pos", "true", "1"}
+        negative_aliases = {"negative", "neg", "false", "0"}
+        if normalized in positive_aliases:
+            return "negative"
+        if normalized in negative_aliases:
+            return "positive"
+
+    return None
+
+
+def apply_noise_to_dataset(
+    source_dataset_path,
+    noisy_dataset_path,
+    seed_label,
+    removal_fraction=NOISE_FRACTION,
+    time_shift_hours=NOISE_TIME_SHIFT_HOURS,
+):
+    payload = read_json(source_dataset_path)
+    events = copy.deepcopy(payload.get("events", []))
+    rng = random.Random(f"{NOISE_SEED}:{seed_label}")
+    time_limit_days = payload.get("time_limit", 0)
+    time_limit_hours = max(0.0, float(time_limit_days) * 24.0)
+
+    removed_indices = set()
+    removed_by_type = {}
+    for event_type in NOISE_EVENT_TYPES:
+        matching_indices = [index for index, event in enumerate(events) if event.get("type") == event_type]
+        remove_count = min(len(matching_indices), int(len(matching_indices) * removal_fraction))
+        if remove_count > 0:
+            removed_indices.update(rng.sample(matching_indices, remove_count))
+        removed_by_type[event_type] = remove_count
+
+    events = [event for index, event in enumerate(events) if index not in removed_indices]
+
+    shifted_by_type = {}
+    for event_type in NOISE_EVENT_TYPES:
+        matching_indices = [index for index, event in enumerate(events) if event.get("type") == event_type]
+        shift_count = min(len(matching_indices), int(len(matching_indices) * removal_fraction))
+        shifted_by_type[event_type] = shift_count
+        if shift_count == 0:
+            continue
+
+        selected_indices = rng.sample(matching_indices, shift_count)
+        for event_index in selected_indices:
+            original_time = float(events[event_index].get("time", 0.0))
+            shift_delta = time_shift_hours if rng.random() < 0.5 else -time_shift_hours
+            shifted_time = original_time + shift_delta
+            if time_limit_hours > 0.0:
+                shifted_time = min(max(0.0, shifted_time), time_limit_hours)
+            else:
+                shifted_time = max(0.0, shifted_time)
+            events[event_index]["time"] = float(shifted_time)
+
+    test_indices = [index for index, event in enumerate(events) if event.get("type") == "Test"]
+    flip_count = min(len(test_indices), int(len(test_indices) * removal_fraction))
+    flippable_test_indices = [
+        index for index in test_indices if _flip_test_result(events[index].get("result")) is not None
+    ]
+    selected_test_indices = rng.sample(flippable_test_indices, min(flip_count, len(flippable_test_indices)))
+    for event_index in selected_test_indices:
+        flipped = _flip_test_result(events[event_index].get("result"))
+        if flipped is not None:
+            events[event_index]["result"] = flipped
+
+    events.sort(key=lambda event: float(event.get("time", 0.0)))
+    payload["events"] = events
+    if "n_contacts" in payload:
+        payload["n_contacts"] = len([event for event in events if event.get("type") == "Internal"])
+
+    write_json(noisy_dataset_path, payload)
+
+    return {
+        "source_dataset_path": source_dataset_path,
+        "noisy_dataset_path": noisy_dataset_path,
+        "removal_fraction": removal_fraction,
+        "time_shift_hours": time_shift_hours,
+        "removed_by_type": removed_by_type,
+        "shifted_by_type": shifted_by_type,
+        "tests_flipped": len(selected_test_indices),
+        "seed_label": seed_label,
+    }
+
+
+def finite_float(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def append_unique_note(notes_by_run, run_id, note_text):
+    notes = notes_by_run.setdefault(run_id, [])
+    if note_text not in notes:
+        notes.append(note_text)
+
+
+def add_metric_selection_notes(dataset_rows, metric_key, metric_label, notes_by_run):
+    candidates = []
+    for row in dataset_rows:
+        metric_value = finite_float(row.get(metric_key))
+        if metric_value is None:
+            continue
+        candidates.append(
+            {
+                "run_id": row["run_id"],
+                "metric_value": metric_value,
+            }
+        )
+
+    if not candidates:
+        return
+
+    bucket_size = min(METRIC_SELECTION_BUCKET_SIZE, len(candidates))
+    candidates.sort(key=lambda item: (item["metric_value"], item["run_id"]))
+
+    for rank, item in enumerate(reversed(candidates[-bucket_size:]), start=1):
+        append_unique_note(notes_by_run, item["run_id"], f"Top {rank} {metric_label}")
+
+    for rank, item in enumerate(candidates[:bucket_size], start=1):
+        append_unique_note(notes_by_run, item["run_id"], f"Worst {rank} {metric_label}")
+
+    median_value = percentile([item["metric_value"] for item in candidates], 0.50)
+    nearest_to_median = sorted(
+        candidates,
+        key=lambda item: (abs(item["metric_value"] - median_value), item["run_id"]),
+    )[:bucket_size]
+    for rank, item in enumerate(nearest_to_median, start=1):
+        append_unique_note(notes_by_run, item["run_id"], f"Median {rank} {metric_label}")
+
+
+def build_notes_map_per_dataset(comparison_summaries):
+    rows = []
+    for summary in comparison_summaries:
+        analysis_metrics = summary.get("comparison_metrics", {}).get("analysis", {})
+        rows.append(
+            {
+                "run_id": summary.get("run_id"),
+                "dataset_stem": summary.get("dataset_stem"),
+                "kendall_analysis": analysis_metrics.get("tau"),
+                "spearman_analysis": analysis_metrics.get("spearman"),
+            }
+        )
+
+    notes_by_run = {}
+    dataset_stems = sorted({row["dataset_stem"] for row in rows if row.get("dataset_stem") is not None})
+    for dataset_stem in dataset_stems:
+        dataset_rows = [row for row in rows if row.get("dataset_stem") == dataset_stem]
+        add_metric_selection_notes(dataset_rows, "kendall_analysis", "Kendall", notes_by_run)
+        add_metric_selection_notes(dataset_rows, "spearman_analysis", "Spearman", notes_by_run)
+
+    return notes_by_run
+
+
+def apply_notes_to_comparison_summaries(comparison_summaries, notes_by_run):
+    for summary in comparison_summaries:
+        run_id = summary.get("run_id")
+        notes = notes_by_run.get(run_id, [])
+        summary["note"] = " - ".join(notes)
+
+
+def regenerate_selected_run_plots(comparison_summary, time_step_hours, iterations):
+    comparison_dir = comparison_summary["comparison_dir"]
+    run_id = comparison_summary["run_id"]
+    ground_truth_path = comparison_summary["ground_truth_path"]
+
+    java_analysis = comparison_summary.get("java_analysis", {})
+    python_analysis = comparison_summary.get("python_analysis", {})
+    analysis_path = java_analysis.get("analysis_path")
+    baseline_path = python_analysis.get("baseline_path")
+
+    if not _is_valid_path(analysis_path):
+        analysis_path = find_generated_file(comparison_dir, f"_tracks_it{iterations}.json")
+    if not _is_valid_path(ground_truth_path):
+        raise FileNotFoundError(f"Ground-truth path is invalid for run {run_id}: {ground_truth_path}")
+    if not _is_valid_path(baseline_path):
+        raise FileNotFoundError(f"Baseline path is invalid for run {run_id}: {baseline_path}")
+
+    subject_curve_plots = sp.create_analysis_subject_curve_plots(
+        run_dir=comparison_dir,
+        run_name=run_id,
+        analysis_path=analysis_path,
+        ground_truth_path=ground_truth_path,
+        baseline_path=baseline_path,
+        granularity=time_step_hours,
+        ground_truth_sample_size=comparison_summary.get("ground_truth_iterations"),
+        save_plots=True,
+    )
+    comparison_metrics = sp.create_analysis_vs_simulation_plots(
+        run_dir=comparison_dir,
+        run_name=run_id,
+        ground_truth_path=ground_truth_path,
+        analysis_path=analysis_path,
+        baseline_path=baseline_path,
+        include_moving_avg_metrics=True,
+        save_plots=True,
+    )
+
+    comparison_summary.setdefault("java_analysis", {})["analysis_path"] = analysis_path
+    comparison_summary["java_analysis"]["subject_curve_plots"] = subject_curve_plots
+    comparison_summary["comparison_metrics"] = comparison_metrics
+    return comparison_summary
+
+
 def run_precompute_task(save_path, parameter_case, time_step_hours):
-    case_id = parameter_case["case_id"]
+    case_run_code = parameter_case["case_run_code"]
     parameter_bundle = parameter_case["parameter_bundle"]
 
-    summary_path = os.path.join(save_path, "_precompute", case_id, "precompute_summary.json")
+    precompute_base_dir = os.path.join(save_path, "_precompute")
+    precompute_dir = resolve_case_output_dir(precompute_base_dir, parameter_case)
+    summary_path = os.path.join(precompute_dir, "precompute_summary.json")
     if os.path.exists(summary_path):
         cached_summary = read_json(summary_path)
         if _is_valid_path(cached_summary.get("stpn_solution_path")) and _is_valid_path(
             cached_summary.get("observation_curve_path")
         ):
+            changed = False
+            if cached_summary.get("parameter_case_code") != case_run_code:
+                cached_summary["parameter_case_code"] = case_run_code
+                changed = True
+            if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
+                cached_summary["parameter_case_index"] = parameter_case["case_index"]
+                changed = True
+            if changed:
+                write_json(summary_path, cached_summary)
             return cached_summary
 
     precomputed = precompute_stpn_solution(
@@ -340,6 +606,8 @@ def run_precompute_task(save_path, parameter_case, time_step_hours):
     )
     summary = {
         "case_id": precomputed["parameter_bundle"]["case_id"],
+        "parameter_case_code": case_run_code,
+        "parameter_case_index": parameter_case["case_index"],
         "cache_dir": precomputed["cache_dir"],
         "cache_hit": precomputed["cache_hit"],
         "stpn_solution_path": precomputed["stpn_solution_path"],
@@ -351,19 +619,24 @@ def run_precompute_task(save_path, parameter_case, time_step_hours):
 
 def run_java_analysis_task(save_path, dataset_run, parameter_case, time_step_hours, iterations):
     case_id = parameter_case["case_id"]
+    case_run_code = parameter_case["case_run_code"]
     parameter_bundle = parameter_case["parameter_bundle"]
 
-    analysis_dir = os.path.join(
+    analysis_base_dir = os.path.join(
         save_path,
         "java_analysis",
         dataset_run["dataset_stem"],
-        case_id,
     )
+    analysis_dir = resolve_case_output_dir(analysis_base_dir, parameter_case)
     summary_path = os.path.join(analysis_dir, "java_analysis_summary.json")
 
     if os.path.exists(summary_path):
         cached_summary = read_json(summary_path)
         analysis_path = cached_summary.get("analysis_path")
+        cached_observed_path = cached_summary.get("observed_simulated_path")
+        observed_path_matches = _is_valid_path(cached_observed_path) and (
+            os.path.abspath(cached_observed_path) == os.path.abspath(dataset_run["observed_simulated_path"])
+        )
         if not _is_valid_path(analysis_path):
             try:
                 analysis_path = find_generated_file(analysis_dir, f"_tracks_it{iterations}.json")
@@ -372,7 +645,16 @@ def run_java_analysis_task(save_path, dataset_run, parameter_case, time_step_hou
             except FileNotFoundError:
                 analysis_path = None
 
-        if _is_valid_path(analysis_path):
+        if _is_valid_path(analysis_path) and observed_path_matches:
+            changed = False
+            if cached_summary.get("parameter_case_code") != case_run_code:
+                cached_summary["parameter_case_code"] = case_run_code
+                changed = True
+            if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
+                cached_summary["parameter_case_index"] = parameter_case["case_index"]
+                changed = True
+            if changed:
+                write_json(summary_path, cached_summary)
             return cached_summary
 
     ensure_dataset_analysis_input(
@@ -397,6 +679,8 @@ def run_java_analysis_task(save_path, dataset_run, parameter_case, time_step_hou
         "dataset_stem": dataset_run["dataset_stem"],
         "observed_simulated_path": dataset_run["observed_simulated_path"],
         "parameter_case_id": java_result["parameter_bundle"]["case_id"],
+        "parameter_case_code": case_run_code,
+        "parameter_case_index": parameter_case["case_index"],
         "parameter_levels": java_result["parameter_bundle"].get("levels", {}),
         "parameter_bundle_path": java_result["parameter_bundle_path"],
         "stpn_solution_path": java_result["stpn_solution_path"],
@@ -420,20 +704,45 @@ def run_python_analysis_task(
     time_step_hours,
 ):
     case_id = parameter_case["case_id"]
+    case_run_code = parameter_case["case_run_code"]
     parameter_bundle = parameter_case["parameter_bundle"]
 
-    analysis_dir = os.path.join(
+    analysis_base_dir = os.path.join(
         save_path,
         "python_analysis",
         quartile_label,
         dataset_run["dataset_stem"],
-        case_id,
     )
+    analysis_dir = resolve_case_output_dir(analysis_base_dir, parameter_case)
     summary_path = os.path.join(analysis_dir, "python_analysis_summary.json")
 
     if os.path.exists(summary_path):
         cached_summary = read_json(summary_path)
-        if _is_valid_path(cached_summary.get("averaged_results_path")):
+        cached_runtime_budget = cached_summary.get("runtime_budget_seconds")
+        runtime_budget_matches = isinstance(cached_runtime_budget, (int, float)) and (
+            abs(float(cached_runtime_budget) - float(runtime_budget_seconds)) <= 1e-9
+        )
+        cached_dataset_path = cached_summary.get("dataset_path")
+        dataset_path_matches = _is_valid_path(cached_dataset_path) and (
+            os.path.abspath(cached_dataset_path) == os.path.abspath(dataset_run["dataset_path"])
+        )
+        if (
+            _is_valid_path(cached_summary.get("averaged_results_path"))
+            and runtime_budget_matches
+            and dataset_path_matches
+        ):
+            changed = False
+            if cached_summary.get("parameter_case_code") != case_run_code:
+                cached_summary["parameter_case_code"] = case_run_code
+                changed = True
+            if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
+                cached_summary["parameter_case_index"] = parameter_case["case_index"]
+                changed = True
+            if cached_summary.get("runtime_budget_seconds") != runtime_budget_seconds:
+                cached_summary["runtime_budget_seconds"] = runtime_budget_seconds
+                changed = True
+            if changed:
+                write_json(summary_path, cached_summary)
             return cached_summary
 
     analysis_dataset_path = ensure_python_simulation_input(
@@ -465,6 +774,8 @@ def run_python_analysis_task(
         "dataset_path": dataset_run["dataset_path"],
         "dataset_stem": dataset_run["dataset_stem"],
         "parameter_case_id": case_id,
+        "parameter_case_code": case_run_code,
+        "parameter_case_index": parameter_case["case_index"],
         "parameter_levels": normalize_stpn_parameter_bundle(parameter_bundle).get("levels", {}),
         "analysis_dir": analysis_dir,
         "analysis_dataset_path": analysis_dataset_path,
@@ -491,26 +802,22 @@ def run_comparison_task(
     python_summary,
     time_step_hours,
     iterations,
+    save_plots=True,
 ):
     case_id = parameter_case["case_id"]
+    case_run_code = parameter_case["case_run_code"]
     parameter_levels = parameter_case["levels"]
 
-    comparison_dir = os.path.join(
+    comparison_base_dir = os.path.join(
         save_path,
         "comparison",
         quartile_label,
         dataset_run["dataset_stem"],
-        case_id,
     )
+    comparison_dir = resolve_case_output_dir(comparison_base_dir, parameter_case)
     summary_path = os.path.join(comparison_dir, "comparison_summary.json")
-    if os.path.exists(summary_path):
-        cached_summary = read_json(summary_path)
-        if _is_valid_path(cached_summary.get("ground_truth_path")):
-            return cached_summary
+    run_id = f"{dataset_run['dataset_stem']}__{case_run_code}__{quartile_label}"
 
-    ensure_dir(comparison_dir)
-
-    run_id = f"{dataset_run['dataset_stem']}__{case_id}__{quartile_label}"
     analysis_path = java_summary.get("analysis_path")
     if not _is_valid_path(analysis_path):
         analysis_path = find_generated_file(
@@ -521,6 +828,46 @@ def run_comparison_task(
     baseline_path = python_summary["averaged_results_path"]
     ground_truth_path = dataset_run["ground_truth_path"]
 
+    if os.path.exists(summary_path):
+        cached_summary = read_json(summary_path)
+        cached_java_analysis = cached_summary.get("java_analysis", {})
+        cached_python_analysis = cached_summary.get("python_analysis", {})
+        cached_analysis_path = cached_java_analysis.get("analysis_path")
+        cached_baseline_path = cached_python_analysis.get("baseline_path")
+        cached_ground_truth_path = cached_summary.get("ground_truth_path")
+
+        cache_matches_inputs = (
+            _is_valid_path(cached_ground_truth_path)
+            and _is_valid_path(cached_analysis_path)
+            and _is_valid_path(cached_baseline_path)
+            and os.path.abspath(cached_ground_truth_path) == os.path.abspath(ground_truth_path)
+            and os.path.abspath(cached_analysis_path) == os.path.abspath(analysis_path)
+            and os.path.abspath(cached_baseline_path) == os.path.abspath(baseline_path)
+        )
+
+        if cache_matches_inputs:
+            changed = False
+            if cached_summary.get("run_id") != run_id:
+                cached_summary["run_id"] = run_id
+                changed = True
+            if cached_summary.get("parameter_case_code") != case_run_code:
+                cached_summary["parameter_case_code"] = case_run_code
+                changed = True
+            if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
+                cached_summary["parameter_case_index"] = parameter_case["case_index"]
+                changed = True
+            if cached_summary.get("runtime_budget_seconds") != runtime_budget_seconds:
+                cached_summary["runtime_budget_seconds"] = runtime_budget_seconds
+                changed = True
+            if cached_summary.get("ground_truth_iterations") != dataset_run.get("ground_truth_iterations"):
+                cached_summary["ground_truth_iterations"] = dataset_run.get("ground_truth_iterations")
+                changed = True
+            if changed:
+                write_json(summary_path, cached_summary)
+            return cached_summary
+
+    ensure_dir(comparison_dir)
+
     analysis_curve_plots = sp.create_analysis_subject_curve_plots(
         run_dir=comparison_dir,
         run_name=run_id,
@@ -528,7 +875,8 @@ def run_comparison_task(
         ground_truth_path=ground_truth_path,
         baseline_path=baseline_path,
         granularity=time_step_hours,
-        save_plots=True,
+        ground_truth_sample_size=dataset_run.get("ground_truth_iterations"),
+        save_plots=save_plots,
     )
 
     precision_dir = os.path.join(comparison_dir, "precision_metrics")
@@ -536,26 +884,47 @@ def run_comparison_task(
     prediction_metrics_path = os.path.join(precision_dir, "metrics_prediction.json")
     baseline_metrics_path = os.path.join(precision_dir, "metrics_baseline.json")
 
-    metrics_stdout = io.StringIO()
-    with contextlib.redirect_stdout(metrics_stdout):
-        process_and_save(
+    if LOG_PRECISION_METRICS:
+        metrics_stdout = io.StringIO()
+        with contextlib.redirect_stdout(metrics_stdout):
+            prediction_metrics_summary = process_and_save(
+                analysis_path,
+                ground_truth_path,
+                M=10,
+                metrics_output=prediction_metrics_path,
+                plots_dir=os.path.join(precision_dir, "numericalAnalysis", "plots"),
+                save_plots=SAVE_PRECISION_PLOTS and save_plots,
+                verbose=True,
+            )
+            baseline_metrics_summary = process_and_save(
+                baseline_path,
+                ground_truth_path,
+                M=10,
+                metrics_output=baseline_metrics_path,
+                plots_dir=os.path.join(precision_dir, "simulatedBaseline", "plots"),
+                save_plots=SAVE_PRECISION_PLOTS and save_plots,
+                verbose=True,
+            )
+        write_text(os.path.join(precision_dir, "metrics_stdout.log"), metrics_stdout.getvalue())
+    else:
+        prediction_metrics_summary = process_and_save(
             analysis_path,
             ground_truth_path,
             M=10,
             metrics_output=prediction_metrics_path,
             plots_dir=os.path.join(precision_dir, "numericalAnalysis", "plots"),
-            save_plots=True,
+            save_plots=SAVE_PRECISION_PLOTS and save_plots,
+            verbose=False,
         )
-        process_and_save(
+        baseline_metrics_summary = process_and_save(
             baseline_path,
             ground_truth_path,
             M=10,
             metrics_output=baseline_metrics_path,
             plots_dir=os.path.join(precision_dir, "simulatedBaseline", "plots"),
-            save_plots=True,
+            save_plots=SAVE_PRECISION_PLOTS and save_plots,
+            verbose=False,
         )
-
-    write_text(os.path.join(precision_dir, "metrics_stdout.log"), metrics_stdout.getvalue())
 
     comparison_metrics = sp.create_analysis_vs_simulation_plots(
         run_dir=comparison_dir,
@@ -564,7 +933,7 @@ def run_comparison_task(
         analysis_path=analysis_path,
         baseline_path=baseline_path,
         include_moving_avg_metrics=True,
-        save_plots=True,
+        save_plots=save_plots,
     )
 
     summary = {
@@ -573,8 +942,11 @@ def run_comparison_task(
         "runtime_budget_seconds": runtime_budget_seconds,
         "dataset_path": dataset_run["dataset_path"],
         "dataset_stem": dataset_run["dataset_stem"],
+        "ground_truth_iterations": dataset_run.get("ground_truth_iterations"),
         "ground_truth_path": ground_truth_path,
         "parameter_case_id": case_id,
+        "parameter_case_code": case_run_code,
+        "parameter_case_index": parameter_case["case_index"],
         "parameter_levels": parameter_levels,
         "java_analysis": {
             "analysis_dir": java_summary["analysis_dir"],
@@ -596,10 +968,10 @@ def run_comparison_task(
         "precision_metrics": {
             "prediction_metrics_path": prediction_metrics_path,
             "baseline_metrics_path": baseline_metrics_path,
-            "prediction_mean_brier": sp.mean_metric_value(prediction_metrics_path, "Brier Score"),
-            "prediction_mean_ece": sp.mean_metric_value(prediction_metrics_path, "ECE"),
-            "baseline_mean_brier": sp.mean_metric_value(baseline_metrics_path, "Brier Score"),
-            "baseline_mean_ece": sp.mean_metric_value(baseline_metrics_path, "ECE"),
+            "prediction_mean_brier": prediction_metrics_summary["mean_brier_score"],
+            "prediction_mean_ece": prediction_metrics_summary["mean_ece"],
+            "baseline_mean_brier": baseline_metrics_summary["mean_brier_score"],
+            "baseline_mean_ece": baseline_metrics_summary["mean_ece"],
         },
         "comparison_metrics": comparison_metrics,
         "comparison_dir": comparison_dir,
@@ -620,6 +992,8 @@ def build_reference_row(comparison_summary):
 
     return {
         "run_id": comparison_summary.get("run_id"),
+        "parameter_case_code": comparison_summary.get("parameter_case_code"),
+        "parameter_case_id": comparison_summary.get("parameter_case_id"),
         "infectiousness_level": to_italian_level(levels.get("infectiousness")),
         "healing_level": to_italian_level(levels.get("healing")),
         "symptoms_level": to_italian_level(levels.get("symptoms")),
@@ -673,6 +1047,8 @@ def main():
             "time_step_hours": TIME_STEP,
             "internal_steps": INTERNAL_STEPS,
             "quantile": QUANTILE,
+            "noise_fraction": NOISE_FRACTION,
+            "noise_time_shift_hours": NOISE_TIME_SHIFT_HOURS,
             "resumed_run": resumed_run,
             "started_at": datetime.now().isoformat(timespec="seconds"),
         },
@@ -690,6 +1066,7 @@ def main():
                 n_nodes=SUBJECTS,
                 total_internal_contacts=internal_contacts,
                 tmax_after_intro=2016,
+                effective_external_contacts=EFFECTIVE_EXTERNAL_CONTACTS,
                 seed=30,
             )
             dg.save_dataset_event_sequence(dataset, dataset_path)
@@ -698,6 +1075,35 @@ def main():
 
     mark_stage_complete(save_path, stage_name)
     write_stage_checkpoint(save_path, stage_name, len(INTERNAL_CONTACTS), len(INTERNAL_CONTACTS), status="completed")
+
+    # # 1b. Inject observation noise on raw datasets used by analysis/baseline.
+    # stage_name = "stage1b_dataset_noise"
+    # write_stage_checkpoint(save_path, stage_name, 0, len(dataset_paths), status="running")
+
+    # noisy_dataset_paths_by_stem = {}
+    # raw_noise_summaries = []
+    # for index, dataset_path in enumerate(dataset_paths, start=1):
+    #     dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
+    #     noisy_dataset_path = os.path.join(save_path, f"{dataset_stem}_noisy.json")
+    #     noise_summary_path = os.path.join(save_path, "dataset_noise", f"{dataset_stem}_raw_noise_summary.json")
+
+    #     if os.path.exists(noisy_dataset_path) and os.path.exists(noise_summary_path):
+    #         noise_summary = read_json(noise_summary_path)
+    #     else:
+    #         noise_summary = apply_noise_to_dataset(
+    #             source_dataset_path=dataset_path,
+    #             noisy_dataset_path=noisy_dataset_path,
+    #             seed_label=f"{dataset_stem}:raw",
+    #         )
+    #         write_json(noise_summary_path, noise_summary)
+
+    #     noisy_dataset_paths_by_stem[dataset_stem] = noisy_dataset_path
+    #     raw_noise_summaries.append(noise_summary)
+    #     write_stage_checkpoint(save_path, stage_name, index, len(dataset_paths), status="running")
+
+    # write_json(os.path.join(save_path, "dataset_noise_raw_summary.json"), raw_noise_summaries)
+    # mark_stage_complete(save_path, stage_name)
+    # write_stage_checkpoint(save_path, stage_name, len(dataset_paths), len(dataset_paths), status="completed")
 
     parameter_cases, ground_truth_case = build_parameter_combinations(os.path.join(".", "parameters.json"))
     print(normalize_stpn_parameter_bundle(parameter_cases[0]["parameter_bundle"])["case_id"])
@@ -708,7 +1114,9 @@ def main():
     write_stage_checkpoint(save_path, stage_name, 0, len(dataset_paths), status="running")
 
     dataset_runs = []
+    observed_noise_summaries = []
     for index, dataset_path in enumerate(tqdm(dataset_paths, desc="Running GT simulations"), start=1):
+        dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
         gt_results_path = dataset_path.replace("dataset", "gt_results")
         gt_results = None
 
@@ -720,11 +1128,15 @@ def main():
                 gt_results = cached
 
         if gt_results is None:
-            gt_results = run_dataset_simulations(
+            ground_truth_dataset_path = ensure_ground_truth_simulation_input(
+                save_path=save_path,
                 dataset_path=dataset_path,
+            )
+            gt_results = run_dataset_simulations(
+                dataset_path=ground_truth_dataset_path,
                 run_until_convergence=True,
                 iterations_cap=100_000,
-                convergence_threshold=1e-6,
+                convergence_threshold=1e-8,
                 fine_grained=False,
                 time_step_hours=TIME_STEP,
                 seed=30,
@@ -732,20 +1144,48 @@ def main():
                 export_observed_simulation=True,
                 pruning_seed=None,
                 parameter_bundle=ground_truth_case["parameter_bundle"],
+                dataset_label=os.path.splitext(os.path.basename(dataset_path))[0],
                 save_plots=True,
             )
             write_json(gt_results_path, gt_results)
 
+        noisy_observed_simulated_path = gt_results["observed_simulated_path"].replace(
+            ".json",
+            "_noisy.json",
+        )
+        observed_noise_summary_path = os.path.join(
+            save_path,
+            "dataset_noise",
+            f"{dataset_stem}_observed_noise_summary.json",
+        )
+        if os.path.exists(noisy_observed_simulated_path) and os.path.exists(observed_noise_summary_path):
+            observed_noise_summary = read_json(observed_noise_summary_path)
+        else:
+            observed_noise_summary = apply_noise_to_dataset(
+                source_dataset_path=gt_results["observed_simulated_path"],
+                noisy_dataset_path=noisy_observed_simulated_path,
+                seed_label=f"{dataset_stem}:observed",
+            )
+            write_json(observed_noise_summary_path, observed_noise_summary)
+        observed_noise_summaries.append(observed_noise_summary)
+
+        noisy_dataset_path = noisy_dataset_paths_by_stem.get(dataset_stem, dataset_path)
+
         dataset_runs.append(
             {
-                "dataset_path": dataset_path,
-                "dataset_stem": os.path.splitext(os.path.basename(dataset_path))[0],
+                "clean_dataset_path": dataset_path,
+                "dataset_path": noisy_dataset_path,
+                "dataset_stem": dataset_stem,
                 "gt_results_path": gt_results_path,
                 "ground_truth_path": gt_results["averaged_results_path"],
-                "observed_simulated_path": gt_results["observed_simulated_path"],
+                "clean_observed_simulated_path": gt_results["observed_simulated_path"],
+                "observed_simulated_path": noisy_observed_simulated_path,
+                "ground_truth_iterations": gt_results.get("rep_done"),
             }
         )
         write_stage_checkpoint(save_path, stage_name, index, len(dataset_paths), status="running")
+
+    write_json(os.path.join(save_path, "dataset_noise_observed_summary.json"), observed_noise_summaries)
 
     mark_stage_complete(save_path, stage_name)
     write_stage_checkpoint(save_path, stage_name, len(dataset_paths), len(dataset_paths), status="completed")
@@ -825,15 +1265,22 @@ def main():
     if quartile_key not in java_analysis_runtime_quartiles["quartiles"]:
         raise ValueError(f"Unsupported quantile: {QUANTILE}. Expected one of 2, 3, 4.")
 
-    runtime_budget_seconds = java_analysis_runtime_quartiles["quartiles"][quartile_key]
+    java_summary_by_key = {
+        (summary["dataset_stem"], summary["parameter_case_id"]): summary
+        for summary in java_analysis_summaries
+    }
 
     mark_stage_complete(save_path, stage_name)
     write_stage_checkpoint(save_path, stage_name, 1, 1, status="completed")
 
-    # 6. Parallel Python analysis with runtime budget (wait all)
+    # 6. Parallel Python analysis with per-combination runtime budget (wait all)
     stage_name = "stage6_python_analysis"
     stage6_tasks = [
-        (dataset_run, parameter_case)
+        (
+            dataset_run,
+            parameter_case,
+            java_summary_by_key[(dataset_run["dataset_stem"], parameter_case["case_id"])],
+        )
         for dataset_run in dataset_runs
         for parameter_case in parameter_cases
     ]
@@ -850,10 +1297,10 @@ def main():
                 dataset_run,
                 parameter_case,
                 quartile_label,
-                runtime_budget_seconds,
+                java_summary["analysis_wall_runtime_seconds"],
                 TIME_STEP,
             )
-            for dataset_run, parameter_case in stage6_tasks
+            for dataset_run, parameter_case, java_summary in stage6_tasks
         ]
 
         completed = 0
@@ -867,12 +1314,8 @@ def main():
     mark_stage_complete(save_path, stage_name)
     write_stage_checkpoint(save_path, stage_name, total_stage_tasks, total_stage_tasks, status="completed")
 
-    # 7. Parallel comparison + metrics + plots (wait all)
+    # 7. Parallel comparison + metrics (without plots)
     stage_name = "stage7_comparison"
-    java_summary_by_key = {
-        (summary["dataset_stem"], summary["parameter_case_id"]): summary
-        for summary in java_analysis_summaries
-    }
     python_summary_by_key = {
         (summary["dataset_stem"], summary["parameter_case_id"]): summary
         for summary in python_analysis_summaries
@@ -906,13 +1349,14 @@ def main():
                 run_comparison_task,
                 save_path,
                 quartile_label,
-                runtime_budget_seconds,
+                java_summary["analysis_wall_runtime_seconds"],
                 dataset_run,
                 parameter_case,
                 java_summary,
                 python_summary,
                 TIME_STEP,
                 INTERNAL_STEPS,
+                False,
             )
             for dataset_run, parameter_case, java_summary, python_summary in stage7_tasks
         ]
@@ -924,6 +1368,56 @@ def main():
             write_stage_checkpoint(save_path, stage_name, completed, total_stage_tasks, status="running")
 
     comparison_summaries.sort(key=lambda item: (item["dataset_stem"], item["parameter_case_id"]))
+    mark_stage_complete(save_path, "stage7_comparison")
+    write_stage_checkpoint(
+        save_path,
+        "stage7_comparison",
+        len(stage7_tasks),
+        len(stage7_tasks),
+        status="completed",
+    )
+
+    notes_by_run = build_notes_map_per_dataset(comparison_summaries)
+    apply_notes_to_comparison_summaries(comparison_summaries, notes_by_run)
+
+    # 8. Regenerate plots only for runs selected in dataset-wise top/worst/median buckets.
+    stage_name = "stage8_selected_plots"
+    selected_summaries = [summary for summary in comparison_summaries if summary.get("note")]
+    total_stage_tasks = len(selected_summaries)
+    write_stage_checkpoint(save_path, stage_name, 0, total_stage_tasks, status="running")
+
+    if total_stage_tasks > 0:
+        updated_by_run_id = {}
+        worker_count = resolve_worker_count(total_stage_tasks)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    regenerate_selected_run_plots,
+                    summary,
+                    TIME_STEP,
+                    INTERNAL_STEPS,
+                )
+                for summary in selected_summaries
+            ]
+
+            completed = 0
+            for future in tqdm(as_completed(futures), total=total_stage_tasks, desc="Generating selected plots"):
+                updated_summary = future.result()
+                updated_by_run_id[updated_summary["run_id"]] = updated_summary
+                completed += 1
+                write_stage_checkpoint(save_path, stage_name, completed, total_stage_tasks, status="running")
+
+        comparison_summaries = [
+            updated_by_run_id.get(summary["run_id"], summary)
+            for summary in comparison_summaries
+        ]
+
+    mark_stage_complete(save_path, stage_name)
+    write_stage_checkpoint(save_path, stage_name, total_stage_tasks, total_stage_tasks, status="completed")
+
+    for comparison_summary in comparison_summaries:
+        summary_path = os.path.join(comparison_summary["comparison_dir"], "comparison_summary.json")
+        write_json(summary_path, comparison_summary)
 
     comparison_summary_json_path = os.path.join(save_path, f"comparison_summary_{quartile_label}.json")
     write_json(comparison_summary_json_path, comparison_summaries)
@@ -937,9 +1431,6 @@ def main():
     comparison_summary_csv_path = os.path.join(save_path, f"comparison_summary_{quartile_label}.csv")
     write_reference_sweep_csv(comparison_summary_csv_path, sweep_summary_rows)
 
-    mark_stage_complete(save_path, stage_name)
-    write_stage_checkpoint(save_path, stage_name, total_stage_tasks, total_stage_tasks, status="completed")
-
     write_json(
         os.path.join(save_path, RUN_COMPLETION_SENTINEL),
         {
@@ -947,6 +1438,7 @@ def main():
             "save_path": save_path,
             "quartile_label": quartile_label,
             "rows_written": len(sweep_summary_rows),
+            "selected_runs_for_plots": len([summary for summary in comparison_summaries if summary.get("note")]),
             "sweep_summary_csv_path": sweep_summary_csv_path,
             "comparison_summary_json_path": comparison_summary_json_path,
             "comparison_summary_csv_path": comparison_summary_csv_path,
