@@ -44,7 +44,8 @@ METRIC_SELECTION_BUCKET_SIZE = 10
 NOISE_FRACTION = 0.05
 NOISE_TIME_SHIFT_HOURS = 6.0
 NOISE_SEED = 30
-NOISE_EVENT_TYPES = ("Internal", "External", "Test", "Symptoms")
+CONTACT_NOISE_EVENT_TYPES = ("Internal", "External")
+OBSERVATION_NOISE_EVENT_TYPES = ("Test", "Symptoms")
 
 LEVEL_LABELS_IT = {
     "lower": "basso",
@@ -319,6 +320,14 @@ def ensure_dataset_analysis_input(analysis_dir, observed_simulated_path):
     destination = os.path.join(analysis_dir, os.path.basename(observed_simulated_path))
     if os.path.abspath(destination) != os.path.abspath(observed_simulated_path):
         shutil.copy2(observed_simulated_path, destination)
+    intended_path = os.path.abspath(destination)
+    for root, _, filenames in os.walk(analysis_dir):
+        for filename in filenames:
+            if not filename.endswith("simulated.json"):
+                continue
+            candidate_path = os.path.abspath(os.path.join(root, filename))
+            if candidate_path != intended_path:
+                os.remove(candidate_path)
     return destination
 
 
@@ -360,7 +369,7 @@ def _is_valid_path(path_value):
     return isinstance(path_value, str) and os.path.exists(path_value)
 
 
-def _flip_test_result(value):
+def _flip_observation_result(value):
     if isinstance(value, bool):
         return not value
 
@@ -379,10 +388,28 @@ def _flip_test_result(value):
     return None
 
 
-def apply_noise_to_dataset(
+def _shift_event_time(event, rng, time_limit_hours, time_shift_hours):
+    original_time = float(event.get("time", 0.0))
+    shift_delta = time_shift_hours if rng.random() < 0.5 else -time_shift_hours
+    shifted_time = original_time + shift_delta
+    if time_limit_hours > 0.0:
+        shifted_time = min(max(0.0, shifted_time), time_limit_hours)
+    else:
+        shifted_time = max(0.0, shifted_time)
+    event["time"] = float(shifted_time)
+
+
+def _noise_operation_count(original_count, fraction):
+    return max(0, int(original_count * fraction))
+
+
+def _apply_event_noise_to_dataset(
     source_dataset_path,
     noisy_dataset_path,
     seed_label,
+    event_types,
+    flip_event_types=(),
+    noise_stage="event",
     removal_fraction=NOISE_FRACTION,
     time_shift_hours=NOISE_TIME_SHIFT_HOURS,
 ):
@@ -391,47 +418,57 @@ def apply_noise_to_dataset(
     rng = random.Random(f"{NOISE_SEED}:{seed_label}")
     time_limit_days = payload.get("time_limit", 0)
     time_limit_hours = max(0.0, float(time_limit_days) * 24.0)
+    original_counts_by_type = {
+        event_type: len([event for event in events if event.get("type") == event_type])
+        for event_type in event_types
+    }
 
     removed_indices = set()
     removed_by_type = {}
-    for event_type in NOISE_EVENT_TYPES:
+    for event_type in event_types:
         matching_indices = [index for index, event in enumerate(events) if event.get("type") == event_type]
-        remove_count = min(len(matching_indices), int(len(matching_indices) * removal_fraction))
+        remove_count = min(
+            len(matching_indices),
+            _noise_operation_count(original_counts_by_type[event_type], removal_fraction),
+        )
         if remove_count > 0:
-            removed_indices.update(rng.sample(matching_indices, remove_count))
-        removed_by_type[event_type] = remove_count
+            selected_indices = rng.sample(matching_indices, remove_count)
+            removed_indices.update(selected_indices)
+        else:
+            selected_indices = []
+        removed_by_type[event_type] = len(selected_indices)
 
     events = [event for index, event in enumerate(events) if index not in removed_indices]
 
     shifted_by_type = {}
-    for event_type in NOISE_EVENT_TYPES:
+    for event_type in event_types:
         matching_indices = [index for index, event in enumerate(events) if event.get("type") == event_type]
-        shift_count = min(len(matching_indices), int(len(matching_indices) * removal_fraction))
-        shifted_by_type[event_type] = shift_count
-        if shift_count == 0:
-            continue
-
+        shift_count = min(
+            len(matching_indices),
+            _noise_operation_count(original_counts_by_type[event_type], removal_fraction),
+        )
         selected_indices = rng.sample(matching_indices, shift_count)
         for event_index in selected_indices:
-            original_time = float(events[event_index].get("time", 0.0))
-            shift_delta = time_shift_hours if rng.random() < 0.5 else -time_shift_hours
-            shifted_time = original_time + shift_delta
-            if time_limit_hours > 0.0:
-                shifted_time = min(max(0.0, shifted_time), time_limit_hours)
-            else:
-                shifted_time = max(0.0, shifted_time)
-            events[event_index]["time"] = float(shifted_time)
+            _shift_event_time(events[event_index], rng, time_limit_hours, time_shift_hours)
+        shifted_by_type[event_type] = len(selected_indices)
 
-    test_indices = [index for index, event in enumerate(events) if event.get("type") == "Test"]
-    flip_count = min(len(test_indices), int(len(test_indices) * removal_fraction))
-    flippable_test_indices = [
-        index for index in test_indices if _flip_test_result(events[index].get("result")) is not None
-    ]
-    selected_test_indices = rng.sample(flippable_test_indices, min(flip_count, len(flippable_test_indices)))
-    for event_index in selected_test_indices:
-        flipped = _flip_test_result(events[event_index].get("result"))
-        if flipped is not None:
-            events[event_index]["result"] = flipped
+    flipped_by_type = {}
+    for event_type in flip_event_types:
+        original_count = original_counts_by_type.get(
+            event_type,
+            len([event for event in payload.get("events", []) if event.get("type") == event_type]),
+        )
+        matching_indices = [index for index, event in enumerate(events) if event.get("type") == event_type]
+        flip_count = min(len(matching_indices), _noise_operation_count(original_count, removal_fraction))
+        flippable_indices = [
+            index
+            for index in matching_indices
+            if _flip_observation_result(events[index].get("result")) is not None
+        ]
+        selected_indices = rng.sample(flippable_indices, min(flip_count, len(flippable_indices)))
+        for event_index in selected_indices:
+            events[event_index]["result"] = _flip_observation_result(events[event_index].get("result"))
+        flipped_by_type[event_type] = len(selected_indices)
 
     events.sort(key=lambda event: float(event.get("time", 0.0)))
     payload["events"] = events
@@ -443,13 +480,68 @@ def apply_noise_to_dataset(
     return {
         "source_dataset_path": source_dataset_path,
         "noisy_dataset_path": noisy_dataset_path,
+        "noise_stage": noise_stage,
+        "event_types": list(event_types),
+        "flip_event_types": list(flip_event_types),
         "removal_fraction": removal_fraction,
         "time_shift_hours": time_shift_hours,
+        "original_counts_by_type": original_counts_by_type,
         "removed_by_type": removed_by_type,
         "shifted_by_type": shifted_by_type,
-        "tests_flipped": len(selected_test_indices),
+        "flipped_by_type": flipped_by_type,
+        "tests_flipped": flipped_by_type.get("Test", 0),
+        "symptoms_flipped": flipped_by_type.get("Symptoms", 0),
         "seed_label": seed_label,
     }
+
+
+def apply_contact_noise_to_dataset(
+    source_dataset_path,
+    noisy_dataset_path,
+    seed_label,
+    removal_fraction=NOISE_FRACTION,
+    time_shift_hours=NOISE_TIME_SHIFT_HOURS,
+):
+    return _apply_event_noise_to_dataset(
+        source_dataset_path=source_dataset_path,
+        noisy_dataset_path=noisy_dataset_path,
+        seed_label=seed_label,
+        event_types=CONTACT_NOISE_EVENT_TYPES,
+        flip_event_types=(),
+        noise_stage="contact",
+        removal_fraction=removal_fraction,
+        time_shift_hours=time_shift_hours,
+    )
+
+
+def apply_observation_noise_to_dataset(
+    source_dataset_path,
+    noisy_dataset_path,
+    seed_label,
+    removal_fraction=NOISE_FRACTION,
+    time_shift_hours=NOISE_TIME_SHIFT_HOURS,
+):
+    return _apply_event_noise_to_dataset(
+        source_dataset_path=source_dataset_path,
+        noisy_dataset_path=noisy_dataset_path,
+        seed_label=seed_label,
+        event_types=OBSERVATION_NOISE_EVENT_TYPES,
+        flip_event_types=OBSERVATION_NOISE_EVENT_TYPES,
+        noise_stage="observation",
+        removal_fraction=removal_fraction,
+        time_shift_hours=time_shift_hours,
+    )
+
+
+def observation_noisy_simulated_path(observed_simulated_path):
+    directory = os.path.dirname(observed_simulated_path)
+    basename = os.path.basename(observed_simulated_path)
+    suffix = "_simulated.json"
+    if basename.endswith(suffix):
+        output_basename = basename[: -len(suffix)] + "_observation_noisy" + suffix
+    else:
+        output_basename = os.path.splitext(basename)[0] + "_observation_noisy" + suffix
+    return os.path.join(directory, output_basename)
 
 
 def finite_float(value):
@@ -1049,6 +1141,8 @@ def main():
             "quantile": QUANTILE,
             "noise_fraction": NOISE_FRACTION,
             "noise_time_shift_hours": NOISE_TIME_SHIFT_HOURS,
+            "contact_noise_event_types": list(CONTACT_NOISE_EVENT_TYPES),
+            "observation_noise_event_types": list(OBSERVATION_NOISE_EVENT_TYPES),
             "resumed_run": resumed_run,
             "started_at": datetime.now().isoformat(timespec="seconds"),
         },
@@ -1076,45 +1170,15 @@ def main():
     mark_stage_complete(save_path, stage_name)
     write_stage_checkpoint(save_path, stage_name, len(INTERNAL_CONTACTS), len(INTERNAL_CONTACTS), status="completed")
 
-    # # 1b. Inject observation noise on raw datasets used by analysis/baseline.
-    # stage_name = "stage1b_dataset_noise"
-    # write_stage_checkpoint(save_path, stage_name, 0, len(dataset_paths), status="running")
-
-    # noisy_dataset_paths_by_stem = {}
-    # raw_noise_summaries = []
-    # for index, dataset_path in enumerate(dataset_paths, start=1):
-    #     dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
-    #     noisy_dataset_path = os.path.join(save_path, f"{dataset_stem}_noisy.json")
-    #     noise_summary_path = os.path.join(save_path, "dataset_noise", f"{dataset_stem}_raw_noise_summary.json")
-
-    #     if os.path.exists(noisy_dataset_path) and os.path.exists(noise_summary_path):
-    #         noise_summary = read_json(noise_summary_path)
-    #     else:
-    #         noise_summary = apply_noise_to_dataset(
-    #             source_dataset_path=dataset_path,
-    #             noisy_dataset_path=noisy_dataset_path,
-    #             seed_label=f"{dataset_stem}:raw",
-    #         )
-    #         write_json(noise_summary_path, noise_summary)
-
-    #     noisy_dataset_paths_by_stem[dataset_stem] = noisy_dataset_path
-    #     raw_noise_summaries.append(noise_summary)
-    #     write_stage_checkpoint(save_path, stage_name, index, len(dataset_paths), status="running")
-
-    # write_json(os.path.join(save_path, "dataset_noise_raw_summary.json"), raw_noise_summaries)
-    # mark_stage_complete(save_path, stage_name)
-    # write_stage_checkpoint(save_path, stage_name, len(dataset_paths), len(dataset_paths), status="completed")
-
     parameter_cases, ground_truth_case = build_parameter_combinations(os.path.join(".", "parameters.json"))
     print(normalize_stpn_parameter_bundle(parameter_cases[0]["parameter_bundle"])["case_id"])
     print(f"\n\n\n{ground_truth_case['case_id']}\n\n\n")
 
-    # 2. Run GT simulation on datasets (recoverable)
+    # 2. Run clean GT simulation on clean datasets (recoverable)
     stage_name = "stage2_ground_truth"
     write_stage_checkpoint(save_path, stage_name, 0, len(dataset_paths), status="running")
 
-    dataset_runs = []
-    observed_noise_summaries = []
+    ground_truth_results_by_stem = {}
     for index, dataset_path in enumerate(tqdm(dataset_paths, desc="Running GT simulations"), start=1):
         dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
         gt_results_path = dataset_path.replace("dataset", "gt_results")
@@ -1149,47 +1213,165 @@ def main():
             )
             write_json(gt_results_path, gt_results)
 
-        noisy_observed_simulated_path = gt_results["observed_simulated_path"].replace(
-            ".json",
-            "_noisy.json",
-        )
-        observed_noise_summary_path = os.path.join(
+        ground_truth_results_by_stem[dataset_stem] = {
+            "clean_dataset_path": dataset_path,
+            "dataset_stem": dataset_stem,
+            "gt_results_path": gt_results_path,
+            "gt_results": gt_results,
+        }
+        write_stage_checkpoint(save_path, stage_name, index, len(dataset_paths), status="running")
+
+    mark_stage_complete(save_path, stage_name)
+    write_stage_checkpoint(save_path, stage_name, len(dataset_paths), len(dataset_paths), status="completed")
+    print("GT simulations completed")
+
+    # 2b. Inject contact noise on raw datasets used by the baseline simulation.
+    stage_name = "stage2b_contact_noise"
+    write_stage_checkpoint(save_path, stage_name, 0, len(dataset_paths), status="running")
+
+    contact_noisy_dataset_paths_by_stem = {}
+    contact_noise_summaries_by_stem = {}
+    contact_noise_summaries = []
+    for index, dataset_path in enumerate(tqdm(dataset_paths, desc="Applying contact noise"), start=1):
+        dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
+        contact_noisy_dataset_path = os.path.join(save_path, f"{dataset_stem}_contact_noisy.json")
+        contact_noise_summary_path = os.path.join(
             save_path,
             "dataset_noise",
-            f"{dataset_stem}_observed_noise_summary.json",
+            f"{dataset_stem}_contact_noise_summary.json",
         )
-        if os.path.exists(noisy_observed_simulated_path) and os.path.exists(observed_noise_summary_path):
-            observed_noise_summary = read_json(observed_noise_summary_path)
+
+        if os.path.exists(contact_noisy_dataset_path) and os.path.exists(contact_noise_summary_path):
+            contact_noise_summary = read_json(contact_noise_summary_path)
         else:
-            observed_noise_summary = apply_noise_to_dataset(
-                source_dataset_path=gt_results["observed_simulated_path"],
-                noisy_dataset_path=noisy_observed_simulated_path,
-                seed_label=f"{dataset_stem}:observed",
+            contact_noise_summary = apply_contact_noise_to_dataset(
+                source_dataset_path=dataset_path,
+                noisy_dataset_path=contact_noisy_dataset_path,
+                seed_label=f"{dataset_stem}:contact",
             )
-            write_json(observed_noise_summary_path, observed_noise_summary)
-        observed_noise_summaries.append(observed_noise_summary)
+            write_json(contact_noise_summary_path, contact_noise_summary)
 
-        noisy_dataset_path = noisy_dataset_paths_by_stem.get(dataset_stem, dataset_path)
+        contact_noisy_dataset_paths_by_stem[dataset_stem] = contact_noisy_dataset_path
+        contact_noise_summaries_by_stem[dataset_stem] = contact_noise_summary
+        contact_noise_summaries.append(contact_noise_summary)
+        write_stage_checkpoint(save_path, stage_name, index, len(dataset_paths), status="running")
 
+    write_json(os.path.join(save_path, "dataset_noise_contact_summary.json"), contact_noise_summaries)
+    mark_stage_complete(save_path, stage_name)
+    write_stage_checkpoint(save_path, stage_name, len(dataset_paths), len(dataset_paths), status="completed")
+
+    # 2c. Run one GT-parameter simulation on the contact-noisy dataset.
+    stage_name = "stage2c_observed_one_run"
+    write_stage_checkpoint(save_path, stage_name, 0, len(dataset_paths), status="running")
+
+    observed_one_run_results_by_stem = {}
+    observed_one_run_summaries = []
+    for index, dataset_path in enumerate(tqdm(dataset_paths, desc="Running one observed simulation"), start=1):
+        dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
+        contact_noisy_dataset_path = contact_noisy_dataset_paths_by_stem[dataset_stem]
+        one_run_summary_path = os.path.join(
+            save_path,
+            "observed_one_run",
+            f"{dataset_stem}_contact_noisy_one_run_summary.json",
+        )
+        one_run_result = None
+
+        if os.path.exists(one_run_summary_path):
+            cached = read_json(one_run_summary_path)
+            cached_dataset_path = cached.get("dataset_path")
+            dataset_path_matches = _is_valid_path(cached_dataset_path) and (
+                os.path.abspath(cached_dataset_path) == os.path.abspath(contact_noisy_dataset_path)
+            )
+            if (
+                cached.get("rep_done") == 1
+                and dataset_path_matches
+                and _is_valid_path(cached.get("observed_simulated_path"))
+            ):
+                one_run_result = cached
+
+        if one_run_result is None:
+            one_run_result = run_dataset_simulations(
+                dataset_path=contact_noisy_dataset_path,
+                rep=1,
+                run_until_convergence=False,
+                iterations_cap=1,
+                convergence_threshold=1e-6,
+                fine_grained=False,
+                dataset_label=f"{dataset_stem}_contact_noisy_observed",
+                seed=30,
+                prune_after_positive_test=False,
+                export_observed_simulation=True,
+                pruning_seed=None,
+                time_step_hours=TIME_STEP,
+                parameter_bundle=ground_truth_case["parameter_bundle"],
+                save_plots=False,
+            )
+            write_json(one_run_summary_path, one_run_result)
+
+        observed_one_run_results_by_stem[dataset_stem] = one_run_result
+        observed_one_run_summaries.append(one_run_result)
+        write_stage_checkpoint(save_path, stage_name, index, len(dataset_paths), status="running")
+
+    write_json(os.path.join(save_path, "observed_one_run_summary.json"), observed_one_run_summaries)
+    mark_stage_complete(save_path, stage_name)
+    write_stage_checkpoint(save_path, stage_name, len(dataset_paths), len(dataset_paths), status="completed")
+
+    # 2d. Inject observation noise on the one-run observed simulation used by Java analysis.
+    stage_name = "stage2d_observation_noise"
+    write_stage_checkpoint(save_path, stage_name, 0, len(dataset_paths), status="running")
+
+    dataset_runs = []
+    observation_noise_summaries = []
+    for index, dataset_path in enumerate(tqdm(dataset_paths, desc="Applying observation noise"), start=1):
+        dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
+        ground_truth_entry = ground_truth_results_by_stem[dataset_stem]
+        gt_results = ground_truth_entry["gt_results"]
+        one_run_result = observed_one_run_results_by_stem[dataset_stem]
+        clean_observed_one_run_path = one_run_result["observed_simulated_path"]
+        final_observed_simulated_path = observation_noisy_simulated_path(clean_observed_one_run_path)
+        observation_noise_summary_path = os.path.join(
+            save_path,
+            "dataset_noise",
+            f"{dataset_stem}_observation_noise_summary.json",
+        )
+
+        if os.path.exists(final_observed_simulated_path) and os.path.exists(observation_noise_summary_path):
+            observation_noise_summary = read_json(observation_noise_summary_path)
+        else:
+            observation_noise_summary = apply_observation_noise_to_dataset(
+                source_dataset_path=clean_observed_one_run_path,
+                noisy_dataset_path=final_observed_simulated_path,
+                seed_label=f"{dataset_stem}:observation",
+            )
+            write_json(observation_noise_summary_path, observation_noise_summary)
+
+        observation_noise_summaries.append(observation_noise_summary)
         dataset_runs.append(
             {
                 "clean_dataset_path": dataset_path,
-                "dataset_path": noisy_dataset_path,
+                "dataset_path": contact_noisy_dataset_paths_by_stem[dataset_stem],
                 "dataset_stem": dataset_stem,
-                "gt_results_path": gt_results_path,
+                "gt_results_path": ground_truth_entry["gt_results_path"],
                 "ground_truth_path": gt_results["averaged_results_path"],
-                "clean_observed_simulated_path": gt_results["observed_simulated_path"],
-                "observed_simulated_path": noisy_observed_simulated_path,
+                "clean_ground_truth_observed_simulated_path": gt_results.get("observed_simulated_path"),
+                "clean_observed_simulated_path": clean_observed_one_run_path,
+                "observed_simulated_path": final_observed_simulated_path,
+                "contact_noise_summary": contact_noise_summaries_by_stem[dataset_stem],
+                "observation_noise_summary": observation_noise_summary,
+                "observed_one_run_summary_path": os.path.join(
+                    save_path,
+                    "observed_one_run",
+                    f"{dataset_stem}_contact_noisy_one_run_summary.json",
+                ),
                 "ground_truth_iterations": gt_results.get("rep_done"),
             }
         )
         write_stage_checkpoint(save_path, stage_name, index, len(dataset_paths), status="running")
 
-    write_json(os.path.join(save_path, "dataset_noise_observed_summary.json"), observed_noise_summaries)
-
+    write_json(os.path.join(save_path, "dataset_noise_observation_summary.json"), observation_noise_summaries)
+    write_json(os.path.join(save_path, "dataset_runs_summary.json"), dataset_runs)
     mark_stage_complete(save_path, stage_name)
     write_stage_checkpoint(save_path, stage_name, len(dataset_paths), len(dataset_paths), status="completed")
-    print("GT simulations completed")
 
     # 3. Parallel precompute STPN curves (wait all)
     stage_name = "stage3_precompute"
