@@ -5,8 +5,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import seaborn as sns
 
 
 COMPACT_PLOT_DPI = 80
@@ -75,6 +73,8 @@ def hide_unused_axes(axes, used_count):
 
 
 def save_metrics_table(results_df, output_path):
+    import seaborn as sns
+
     metrics_table_df = results_df[["Subject", "Brier Score", "ECE"]].copy()
     metrics_table_df["Subject"] = metrics_table_df["Subject"].astype(str)
     metrics_table_df = metrics_table_df.set_index("Subject")
@@ -150,6 +150,7 @@ def process_and_save(
     plots_dir="plots",
     save_plots=True,
     verbose=True,
+    include_scatter_coordinates=True,
 ):
     """
     Reads the two JSON files, calculates metrics, optionally saves compact plots,
@@ -185,7 +186,9 @@ def process_and_save(
                 f"Error: Subject {subject_id} has a different T (p:{len(p)}, g:{len(g)}).\n"
             )
 
-        bs, ece = calculate_metrics(p, g, M=M)
+        p_array = np.asarray(p)
+        g_array = np.asarray(g)
+        bs, ece = calculate_metrics(p_array, g_array, M=M)
         total_brier_score += bs
         total_ece += ece
         results.append(
@@ -196,14 +199,16 @@ def process_and_save(
             }
         )
 
-        metrics_dict[subject_id] = {
+        subject_metrics = {
             "Brier Score": bs,
             "ECE": ece,
-            "scatter_coordinates": [
+        }
+        if include_scatter_coordinates:
+            subject_metrics["scatter_coordinates"] = [
                 [float(p_val), float(g_val)]
                 for p_val, g_val in zip(p, g)
-            ],
-        }
+            ]
+        metrics_dict[subject_id] = subject_metrics
 
     subject_count = len(results)
     mean_brier_score = float(total_brier_score / subject_count) if subject_count else float("nan")
@@ -211,6 +216,8 @@ def process_and_save(
 
     results_df = None
     if save_plots or verbose:
+        import pandas as pd
+
         results_df = pd.DataFrame(results)
         results_df["Subject_num"] = pd.to_numeric(results_df["Subject"])
         results_df = results_df.sort_values(by="Subject_num").reset_index(drop=True)
