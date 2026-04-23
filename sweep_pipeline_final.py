@@ -8,6 +8,7 @@ import math
 import os
 import random
 import shutil
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -122,6 +123,22 @@ def resolve_worker_count(task_count):
             requested = DEFAULT_MAX_WORKERS
         return max(1, min(task_count, requested))
     return max(1, min(task_count, DEFAULT_MAX_WORKERS))
+
+
+def _stream_is_writable(stream):
+    return stream is not None and not getattr(stream, "closed", True)
+
+
+def progress(iterable, **kwargs):
+    """Return a tqdm-wrapped iterable only when std streams are usable."""
+    if not _stream_is_writable(getattr(sys, "stdout", None)):
+        return iterable
+    if not _stream_is_writable(getattr(sys, "stderr", None)):
+        return iterable
+    try:
+        return tqdm(iterable, **kwargs)
+    except (ValueError, AttributeError):
+        return iterable
 
 
 def to_italian_level(level):
@@ -1179,7 +1196,7 @@ def main():
     write_stage_checkpoint(save_path, stage_name, 0, len(dataset_paths), status="running")
 
     ground_truth_results_by_stem = {}
-    for index, dataset_path in enumerate(tqdm(dataset_paths, desc="Running GT simulations"), start=1):
+    for index, dataset_path in enumerate(progress(dataset_paths, desc="Running GT simulations"), start=1):
         dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
         gt_results_path = dataset_path.replace("dataset", "gt_results")
         gt_results = None
@@ -1232,7 +1249,7 @@ def main():
     contact_noisy_dataset_paths_by_stem = {}
     contact_noise_summaries_by_stem = {}
     contact_noise_summaries = []
-    for index, dataset_path in enumerate(tqdm(dataset_paths, desc="Applying contact noise"), start=1):
+    for index, dataset_path in enumerate(progress(dataset_paths, desc="Applying contact noise"), start=1):
         dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
         contact_noisy_dataset_path = os.path.join(save_path, f"{dataset_stem}_contact_noisy.json")
         contact_noise_summary_path = os.path.join(
@@ -1266,7 +1283,7 @@ def main():
 
     observed_one_run_results_by_stem = {}
     observed_one_run_summaries = []
-    for index, dataset_path in enumerate(tqdm(dataset_paths, desc="Running one observed simulation"), start=1):
+    for index, dataset_path in enumerate(progress(dataset_paths, desc="Running one observed simulation"), start=1):
         dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
         contact_noisy_dataset_path = contact_noisy_dataset_paths_by_stem[dataset_stem]
         one_run_summary_path = os.path.join(
@@ -1322,7 +1339,7 @@ def main():
 
     dataset_runs = []
     observation_noise_summaries = []
-    for index, dataset_path in enumerate(tqdm(dataset_paths, desc="Applying observation noise"), start=1):
+    for index, dataset_path in enumerate(progress(dataset_paths, desc="Applying observation noise"), start=1):
         dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
         ground_truth_entry = ground_truth_results_by_stem[dataset_stem]
         gt_results = ground_truth_entry["gt_results"]
@@ -1386,7 +1403,7 @@ def main():
             for parameter_case in parameter_cases
         ]
         completed = 0
-        for future in tqdm(as_completed(futures), total=total_stage_tasks, desc="Precomputing STPN curves"):
+        for future in progress(as_completed(futures), total=total_stage_tasks, desc="Precomputing STPN curves"):
             precompute_summaries.append(future.result())
             completed += 1
             write_stage_checkpoint(save_path, stage_name, completed, total_stage_tasks, status="running")
@@ -1422,7 +1439,7 @@ def main():
         ]
 
         completed = 0
-        for future in tqdm(as_completed(futures), total=total_stage_tasks, desc="Running Java analysis"):
+        for future in progress(as_completed(futures), total=total_stage_tasks, desc="Running Java analysis"):
             java_analysis_summaries.append(future.result())
             completed += 1
             write_stage_checkpoint(save_path, stage_name, completed, total_stage_tasks, status="running")
@@ -1486,7 +1503,7 @@ def main():
         ]
 
         completed = 0
-        for future in tqdm(as_completed(futures), total=total_stage_tasks, desc="Running Python analysis"):
+        for future in progress(as_completed(futures), total=total_stage_tasks, desc="Running Python analysis"):
             python_analysis_summaries.append(future.result())
             completed += 1
             write_stage_checkpoint(save_path, stage_name, completed, total_stage_tasks, status="running")
@@ -1544,7 +1561,7 @@ def main():
         ]
 
         completed = 0
-        for future in tqdm(as_completed(futures), total=total_stage_tasks, desc="Running comparisons"):
+        for future in progress(as_completed(futures), total=total_stage_tasks, desc="Running comparisons"):
             comparison_summaries.append(future.result())
             completed += 1
             write_stage_checkpoint(save_path, stage_name, completed, total_stage_tasks, status="running")
@@ -1583,7 +1600,7 @@ def main():
             ]
 
             completed = 0
-            for future in tqdm(as_completed(futures), total=total_stage_tasks, desc="Generating selected plots"):
+            for future in progress(as_completed(futures), total=total_stage_tasks, desc="Generating selected plots"):
                 updated_summary = future.result()
                 updated_by_run_id[updated_summary["run_id"]] = updated_summary
                 completed += 1
