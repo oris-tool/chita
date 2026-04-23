@@ -1004,6 +1004,7 @@ def run_comparison_task(
                 plots_dir=os.path.join(precision_dir, "numericalAnalysis", "plots"),
                 save_plots=SAVE_PRECISION_PLOTS and save_plots,
                 verbose=True,
+                include_scatter_coordinates=SAVE_PRECISION_PLOTS and save_plots,
             )
             baseline_metrics_summary = process_and_save(
                 baseline_path,
@@ -1013,6 +1014,7 @@ def run_comparison_task(
                 plots_dir=os.path.join(precision_dir, "simulatedBaseline", "plots"),
                 save_plots=SAVE_PRECISION_PLOTS and save_plots,
                 verbose=True,
+                include_scatter_coordinates=SAVE_PRECISION_PLOTS and save_plots,
             )
         write_text(os.path.join(precision_dir, "metrics_stdout.log"), metrics_stdout.getvalue())
     else:
@@ -1024,6 +1026,7 @@ def run_comparison_task(
             plots_dir=os.path.join(precision_dir, "numericalAnalysis", "plots"),
             save_plots=SAVE_PRECISION_PLOTS and save_plots,
             verbose=False,
+            include_scatter_coordinates=SAVE_PRECISION_PLOTS and save_plots,
         )
         baseline_metrics_summary = process_and_save(
             baseline_path,
@@ -1033,6 +1036,7 @@ def run_comparison_task(
             plots_dir=os.path.join(precision_dir, "simulatedBaseline", "plots"),
             save_plots=SAVE_PRECISION_PLOTS and save_plots,
             verbose=False,
+            include_scatter_coordinates=SAVE_PRECISION_PLOTS and save_plots,
         )
 
     comparison_metrics = sp.create_analysis_vs_simulation_plots(
