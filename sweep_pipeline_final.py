@@ -40,6 +40,7 @@ PROGRESS_DIR_NAME = "_progress"
 DEFAULT_MAX_WORKERS = max(1, (os.cpu_count() or 1) // 2)
 SAVE_PRECISION_PLOTS = os.environ.get("CHITA_SAVE_PRECISION_PLOTS", "0") == "1"
 LOG_PRECISION_METRICS = os.environ.get("CHITA_LOG_PRECISION_METRICS", "0") == "1"
+SAVE_COMPARISON_CSVS = os.environ.get("CHITA_SAVE_COMPARISON_CSVS", "1") == "1"
 CASE_INDEX_BASE = 0
 METRIC_SELECTION_BUCKET_SIZE = 10
 NOISE_FRACTION = 0.05
@@ -901,6 +902,260 @@ def run_python_analysis_task(
     return summary
 
 
+def compute_analysis_vs_simulation_metrics_only(
+    ground_truth_path,
+    analysis_path,
+    baseline_path,
+    run_dir=None,
+    write_csvs=False,
+):
+    ground_truth = sort_subject_tracks(sp.read_json(ground_truth_path))
+    analysis = sort_subject_tracks(sp.read_json(analysis_path))
+    baseline = sort_subject_tracks(sp.read_json(baseline_path))
+    output_dir = None
+    csv_summaries = None
+    analysis_summary = compute_candidate_summary_fast(
+        ground_truth,
+        analysis,
+        include_moving_avg_metrics=True,
+    )
+    baseline_summary = compute_candidate_summary_fast(
+        ground_truth,
+        baseline,
+        include_moving_avg_metrics=True,
+    )
+    if write_csvs:
+        output_dir = ensure_dir(os.path.join(run_dir, "plots", "analysis_vs_simulation"))
+        csv_summaries = write_analysis_vs_simulation_csvs_fast(
+            output_dir=output_dir,
+            ground_truth=ground_truth,
+            analysis=analysis,
+            baseline=baseline,
+            analysis_summary=analysis_summary,
+            baseline_summary=baseline_summary,
+        )
+    return {
+        "analysis": analysis_summary,
+        "simulation": baseline_summary,
+        "output_dir": output_dir,
+        "plot_paths": [],
+        "csv_paths": [] if csv_summaries is None else csv_summaries["csv_paths"],
+    }
+
+
+def sort_subject_tracks(tracks):
+    return {subject_id: tracks[subject_id] for subject_id in sorted(tracks, key=int)}
+
+
+def subject_track_matrix(tracks):
+    subjects = list(tracks.keys())
+    if not subjects:
+        return subjects, sp.np.empty((0, 0), dtype=float)
+    matrix = sp.np.asarray([tracks[subject_id] for subject_id in subjects], dtype=float).T
+    return subjects, matrix
+
+
+def rank_rows_descending(matrix):
+    ranks = sp.np.empty(matrix.shape, dtype=float)
+    for row_index, row in enumerate(matrix):
+        order = sp.np.argsort(-row, kind="mergesort")
+        sorted_values = row[order]
+        position = 0
+        while position < len(order):
+            end = position + 1
+            while end < len(order) and sorted_values[end] == sorted_values[position]:
+                end += 1
+            average_rank = (position + 1 + end) / 2.0
+            ranks[row_index, order[position:end]] = average_rank
+            position = end
+    return ranks
+
+
+def spearman_per_timestep_fast(ground_truth_matrix, candidate_matrix):
+    ground_truth_ranks = rank_rows_descending(ground_truth_matrix)
+    candidate_ranks = rank_rows_descending(candidate_matrix)
+    centered_ground_truth = ground_truth_ranks - ground_truth_ranks.mean(axis=1, keepdims=True)
+    centered_candidate = candidate_ranks - candidate_ranks.mean(axis=1, keepdims=True)
+    numerator = sp.np.sum(centered_ground_truth * centered_candidate, axis=1)
+    denominator = sp.np.sqrt(
+        sp.np.sum(centered_ground_truth * centered_ground_truth, axis=1)
+        * sp.np.sum(centered_candidate * centered_candidate, axis=1)
+    )
+    return sp.np.divide(
+        numerator,
+        denominator,
+        out=sp.np.full_like(numerator, sp.np.nan, dtype=float),
+        where=denominator != 0,
+    )
+
+
+def kendall_per_timestep_fast(ground_truth_matrix, candidate_matrix):
+    subject_count = ground_truth_matrix.shape[1]
+    if subject_count < 2:
+        return sp.np.full(ground_truth_matrix.shape[0], sp.np.nan, dtype=float)
+
+    left_indices, right_indices = sp.np.triu_indices(subject_count, k=1)
+    ground_truth_signs = sp.np.sign(ground_truth_matrix[:, left_indices] - ground_truth_matrix[:, right_indices])
+    candidate_signs = sp.np.sign(candidate_matrix[:, left_indices] - candidate_matrix[:, right_indices])
+    products = ground_truth_signs * candidate_signs
+
+    concordant = sp.np.sum(products > 0, axis=1).astype(float)
+    discordant = sp.np.sum(products < 0, axis=1).astype(float)
+    ground_truth_ties = sp.np.sum((ground_truth_signs == 0) & (candidate_signs != 0), axis=1).astype(float)
+    candidate_ties = sp.np.sum((candidate_signs == 0) & (ground_truth_signs != 0), axis=1).astype(float)
+    numerator = concordant - discordant
+    denominator = sp.np.sqrt(
+        (concordant + discordant + ground_truth_ties)
+        * (concordant + discordant + candidate_ties)
+    )
+    return sp.np.divide(
+        numerator,
+        denominator,
+        out=sp.np.full_like(numerator, sp.np.nan, dtype=float),
+        where=denominator != 0,
+    )
+
+
+def ranking_order_rows_descending(matrix):
+    return sp.np.argsort(-matrix, axis=1, kind="mergesort")
+
+
+def top_precision_series_fast(ground_truth_order, candidate_order, top_k):
+    series = []
+    for timestep in range(ground_truth_order.shape[0]):
+        ground_truth_top = set(ground_truth_order[timestep, :top_k])
+        candidate_top = set(candidate_order[timestep, :top_k])
+        series.append(len(ground_truth_top & candidate_top) / top_k)
+    return series
+
+
+def write_analysis_vs_simulation_csvs_fast(
+    output_dir,
+    ground_truth,
+    analysis,
+    baseline,
+    analysis_summary,
+    baseline_summary,
+):
+    subjects, ground_truth_matrix = subject_track_matrix(ground_truth)
+    analysis_subjects, analysis_matrix = subject_track_matrix(analysis)
+    baseline_subjects, baseline_matrix = subject_track_matrix(baseline)
+    if subjects != analysis_subjects or subjects != baseline_subjects:
+        raise ValueError("Analysis, baseline, and ground-truth files do not contain the same subjects.")
+
+    tau_analysis = kendall_per_timestep_fast(ground_truth_matrix, analysis_matrix)
+    tau_baseline = kendall_per_timestep_fast(ground_truth_matrix, baseline_matrix)
+    kendall_csv_path = os.path.join(output_dir, "kendall_correlation_data.csv")
+    sp.save_series_csv(
+        kendall_csv_path,
+        ["timestep", "analysis_kendall", "simulation_kendall"],
+        [[index, tau_analysis[index], tau_baseline[index]] for index in range(len(tau_analysis))],
+    )
+
+    spearman_analysis = spearman_per_timestep_fast(ground_truth_matrix, analysis_matrix)
+    spearman_baseline = spearman_per_timestep_fast(ground_truth_matrix, baseline_matrix)
+    spearman_csv_path = os.path.join(output_dir, "spearman_correlation_data.csv")
+    sp.save_series_csv(
+        spearman_csv_path,
+        ["timestep", "analysis_spearman", "simulation_spearman"],
+        [[index, spearman_analysis[index], spearman_baseline[index]] for index in range(len(spearman_analysis))],
+    )
+
+    ground_truth_order = ranking_order_rows_descending(ground_truth_matrix)
+    analysis_order = ranking_order_rows_descending(analysis_matrix)
+    baseline_order = ranking_order_rows_descending(baseline_matrix)
+    csv_paths = [kendall_csv_path, spearman_csv_path]
+    scalar_rows = []
+    max_top_precision = min(sp.MAX_TOP_PRECISION, len(subjects))
+    for top_k in range(1, max_top_precision + 1):
+        analysis_precision = top_precision_series_fast(ground_truth_order, analysis_order, top_k)
+        baseline_precision = top_precision_series_fast(ground_truth_order, baseline_order, top_k)
+        top_precision_csv_path = os.path.join(output_dir, f"top_{top_k}_precision_data.csv")
+        sp.save_series_csv(
+            top_precision_csv_path,
+            ["timestep", f"analysis_top_{top_k}_precision", f"simulation_top_{top_k}_precision"],
+            [
+                [index, analysis_precision[index], baseline_precision[index]]
+                for index in range(len(analysis_precision))
+            ],
+        )
+        csv_paths.append(top_precision_csv_path)
+        scalar_rows.append(
+            [
+                f"top_{top_k}",
+                float(sp.np.mean(analysis_precision)),
+                float(sp.np.mean(baseline_precision)),
+            ]
+        )
+
+    metrics_csv_path = os.path.join(output_dir, "metrics_results.csv")
+    sp.save_series_csv(
+        metrics_csv_path,
+        ["metric", "analysis", "simulation"],
+        [
+            ["tau", analysis_summary["tau"], baseline_summary["tau"]],
+            ["spearman", analysis_summary["spearman"], baseline_summary["spearman"]],
+            ["mrr", analysis_summary["mrr"], baseline_summary["mrr"]],
+        ]
+        + scalar_rows,
+    )
+    csv_paths.append(metrics_csv_path)
+    return {"output_dir": output_dir, "csv_paths": csv_paths}
+
+
+def compute_candidate_summary_fast(ground_truth, candidate, include_moving_avg_metrics=True):
+    summary = {}
+    tau, p_value_tau = sp.ranking_metrics.compute_kendalls_tau_correlation(ground_truth, candidate)
+    spearman, p_value_sp = sp.ranking_metrics.compute_spearmans_correlation(ground_truth, candidate)
+    summary["tau"] = tau
+    summary["tau_p_value"] = p_value_tau
+    summary["spearman"] = spearman
+    summary["spearman_p_value"] = p_value_sp
+
+    subjects = list(ground_truth.keys())
+    if subjects != list(candidate.keys()):
+        raise ValueError("Ground-truth and candidate tracks do not contain the same subjects.")
+    if not subjects:
+        summary["mrr"] = 0.0
+        return summary
+
+    max_top_precision = min(sp.MAX_TOP_PRECISION, len(subjects))
+    top_precision_totals = {top_k: 0.0 for top_k in range(1, max_top_precision + 1)}
+    reciprocal_rank_total = 0.0
+    timesteps = len(ground_truth[subjects[0]])
+
+    for timestep in range(timesteps):
+        ground_truth_rank = sorted(
+            subjects,
+            key=lambda subject_id: ground_truth[subject_id][timestep],
+            reverse=True,
+        )
+        candidate_rank = sorted(
+            subjects,
+            key=lambda subject_id: candidate[subject_id][timestep],
+            reverse=True,
+        )
+
+        ground_truth_top_subject = ground_truth_rank[0]
+        reciprocal_rank_total += 1.0 / (candidate_rank.index(ground_truth_top_subject) + 1)
+
+        ground_truth_top_set = set()
+        candidate_top_set = set()
+        for top_k in range(1, max_top_precision + 1):
+            ground_truth_top_set.add(ground_truth_rank[top_k - 1])
+            candidate_top_set.add(candidate_rank[top_k - 1])
+            top_precision_totals[top_k] += len(ground_truth_top_set & candidate_top_set) / top_k
+
+    summary["mrr"] = reciprocal_rank_total / timesteps if timesteps else 0.0
+    for top_k in range(1, max_top_precision + 1):
+        precision_mean = top_precision_totals[top_k] / timesteps if timesteps else 0.0
+        summary[f"top_{top_k}_precision_mean"] = float(precision_mean)
+        if include_moving_avg_metrics:
+            summary[f"top_{top_k}_precision_moving_avg_mean"] = float(precision_mean)
+
+    return summary
+
+
 def run_comparison_task(
     save_path,
     quartile_label,
@@ -977,16 +1232,25 @@ def run_comparison_task(
 
     ensure_dir(comparison_dir)
 
-    analysis_curve_plots = sp.create_analysis_subject_curve_plots(
-        run_dir=comparison_dir,
-        run_name=run_id,
-        analysis_path=analysis_path,
-        ground_truth_path=ground_truth_path,
-        baseline_path=baseline_path,
-        granularity=time_step_hours,
-        ground_truth_sample_size=dataset_run.get("ground_truth_iterations"),
-        save_plots=save_plots,
-    )
+    if save_plots:
+        analysis_curve_plots = sp.create_analysis_subject_curve_plots(
+            run_dir=comparison_dir,
+            run_name=run_id,
+            analysis_path=analysis_path,
+            ground_truth_path=ground_truth_path,
+            baseline_path=baseline_path,
+            granularity=time_step_hours,
+            ground_truth_sample_size=dataset_run.get("ground_truth_iterations"),
+            save_plots=True,
+        )
+    else:
+        analysis_curve_plots = {
+            "output_dir": None,
+            "csv_path": None,
+            "epsilon": None,
+            "plot_paths": [],
+            "java_curve_plot_paths": [],
+        }
 
     precision_dir = os.path.join(comparison_dir, "precision_metrics")
     ensure_dir(precision_dir)
@@ -1039,15 +1303,24 @@ def run_comparison_task(
             include_scatter_coordinates=SAVE_PRECISION_PLOTS and save_plots,
         )
 
-    comparison_metrics = sp.create_analysis_vs_simulation_plots(
-        run_dir=comparison_dir,
-        run_name=run_id,
-        ground_truth_path=ground_truth_path,
-        analysis_path=analysis_path,
-        baseline_path=baseline_path,
-        include_moving_avg_metrics=True,
-        save_plots=save_plots,
-    )
+    if save_plots:
+        comparison_metrics = sp.create_analysis_vs_simulation_plots(
+            run_dir=comparison_dir,
+            run_name=run_id,
+            ground_truth_path=ground_truth_path,
+            analysis_path=analysis_path,
+            baseline_path=baseline_path,
+            include_moving_avg_metrics=True,
+            save_plots=True,
+        )
+    else:
+        comparison_metrics = compute_analysis_vs_simulation_metrics_only(
+            ground_truth_path=ground_truth_path,
+            analysis_path=analysis_path,
+            baseline_path=baseline_path,
+            run_dir=comparison_dir,
+            write_csvs=SAVE_COMPARISON_CSVS,
+        )
 
     summary = {
         "run_id": run_id,
@@ -1162,6 +1435,7 @@ def main():
             "quantile": QUANTILE,
             "noise_fraction": NOISE_FRACTION,
             "noise_time_shift_hours": NOISE_TIME_SHIFT_HOURS,
+            "save_comparison_csvs": SAVE_COMPARISON_CSVS,
             "contact_noise_event_types": list(CONTACT_NOISE_EVENT_TYPES),
             "observation_noise_event_types": list(OBSERVATION_NOISE_EVENT_TYPES),
             "resumed_run": resumed_run,

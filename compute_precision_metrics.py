@@ -23,8 +23,8 @@ def calculate_brier_score(p, g):
     """
     Calculate the Brier Score for a single subject.
     """
-    p = np.array(p)
-    g = np.array(g)
+    p = np.asarray(p)
+    g = np.asarray(g)
     brier_score = np.mean((p - g) ** 2)
     return float(brier_score)
 
@@ -33,8 +33,8 @@ def calculate_ece(p, g, M=10):
     """
     Calculate the Expected Calibration Error (ECE) for a single subject.
     """
-    p = np.array(p)
-    g = np.array(g)
+    p = np.asarray(p)
+    g = np.asarray(g)
     T = len(p)
 
     bins = np.linspace(0, 1, M + 1)
