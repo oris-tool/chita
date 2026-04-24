@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import copy
 import csv
@@ -10,11 +11,14 @@ import random
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
 from datetime import datetime
+from typing import Optional, Tuple
 
 from tqdm import tqdm
 
 import dataset_graph as dg
+import scale_free_dataset_graph as sfdg
 import sweep_pipeline as sp
 from compute_precision_metrics import process_and_save
 from run_n_simulations import run_dataset_simulations
@@ -26,12 +30,9 @@ TIME_STEP = 1  # hours
 INTERNAL_STEPS = 2  # 0 means just external contacts, 1 means external + internal, 2 means one more propagation layer
 QUANTILE = 4
 
-EXTERNAL_CONTACTS = 100
-TESTS = 100
-SYMPTOMS = 100
-INTERNAL_CONTACTS = [32, 200, 400, 800]
-SUBJECTS = 8
-EFFECTIVE_EXTERNAL_CONTACTS = 3
+TIME_LIMIT_HOURS = 2016.0
+DATASET_FAMILY_BUBBLE = "bubble"
+DATASET_FAMILY_SCALE_FREE = "scale_free"
 
 RUN_DIR_PREFIX = "sweep_"
 RUN_COMPLETION_SENTINEL = "_run_completed.json"
@@ -90,6 +91,44 @@ REFERENCE_SWEEP_COLUMNS = [
 ]
 
 
+@dataclass(frozen=True)
+class DatasetProfile:
+    family: str
+    generator_module_name: str
+    n_subjects: int
+    time_limit_hours: float
+    internal_contacts: Tuple[int, ...]
+    effective_external_contacts: int
+    total_external_contacts: Optional[int] = None
+    total_symptom_observations: Optional[int] = None
+    total_test_observations: Optional[int] = None
+    barabasi_m: Optional[int] = None
+
+
+DATASET_PROFILES = {
+    DATASET_FAMILY_BUBBLE: DatasetProfile(
+        family=DATASET_FAMILY_BUBBLE,
+        generator_module_name="dataset_graph",
+        n_subjects=8,
+        time_limit_hours=TIME_LIMIT_HOURS,
+        internal_contacts=(32, 200, 400, 800),
+        effective_external_contacts=3,
+    ),
+    DATASET_FAMILY_SCALE_FREE: DatasetProfile(
+        family=DATASET_FAMILY_SCALE_FREE,
+        generator_module_name="scale_free_dataset_graph",
+        n_subjects=100,
+        time_limit_hours=TIME_LIMIT_HOURS,
+        internal_contacts=(32, 2500, 5000, 10000),
+        effective_external_contacts=15,
+        total_external_contacts=1000,
+        total_symptom_observations=1000,
+        total_test_observations=1000,
+        barabasi_m=3,
+    ),
+}
+
+
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
     return path
@@ -110,6 +149,118 @@ def write_text(path, content):
     ensure_dir(os.path.dirname(path) or ".")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(content)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run the final CHITA sweep pipeline.")
+    parser.add_argument(
+        "--dataset",
+        choices=sorted(DATASET_PROFILES.keys()),
+        default=DATASET_FAMILY_BUBBLE,
+        help="Dataset family to generate and run through the sweep pipeline.",
+    )
+    parser.add_argument(
+        "--reuse-run",
+        default=None,
+        help="Existing results/sweep_* directory to reuse.",
+    )
+    parser.add_argument(
+        "--only-selected-plots",
+        action="store_true",
+        help=(
+            "Reuse an existing sweep directory, recompute the per-dataset top/worst/median "
+            "selection, and regenerate plots only for the selected runs."
+        ),
+    )
+    parser.add_argument(
+        "--quartile-label",
+        default=None,
+        help="Optional quartile label to use with --only-selected-plots, for example q4.",
+    )
+    return parser.parse_args(argv)
+
+
+def resolve_dataset_profile(dataset_family):
+    try:
+        return DATASET_PROFILES[dataset_family]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported dataset family: {dataset_family}") from exc
+
+
+def resolve_existing_run_path(run_path):
+    if not run_path:
+        raise ValueError("An existing run path is required.")
+    resolved_path = os.path.abspath(run_path)
+    if not os.path.isdir(resolved_path):
+        raise FileNotFoundError(f"Existing run directory not found: {resolved_path}")
+    return resolved_path
+
+
+def dataset_profile_metadata(dataset_profile):
+    payload = asdict(dataset_profile)
+    payload["internal_contacts"] = list(dataset_profile.internal_contacts)
+    return payload
+
+
+def dataset_filename(dataset_profile, internal_contacts):
+    return f"dataset_{dataset_profile.family}_{internal_contacts}.json"
+
+
+def count_events_by_type(events):
+    counts = {}
+    for event in events:
+        event_type = event.get("type")
+        counts[event_type] = counts.get(event_type, 0) + 1
+    return counts
+
+
+def summarize_generated_dataset(dataset_profile, dataset_path, payload, requested_internal_contacts):
+    event_counts = count_events_by_type(payload.get("events", []))
+    return {
+        "dataset_family": dataset_profile.family,
+        "dataset_path": dataset_path,
+        "dataset_stem": os.path.splitext(os.path.basename(dataset_path))[0],
+        "generator_module_name": dataset_profile.generator_module_name,
+        "requested_internal_contacts": requested_internal_contacts,
+        "n_subjects": payload.get("n_subjects"),
+        "time_limit_days": payload.get("time_limit"),
+        "n_contacts": payload.get("n_contacts"),
+        "event_counts": event_counts,
+    }
+
+
+def generate_dataset_for_profile(dataset_profile, dataset_path, internal_contacts, seed):
+    if dataset_profile.family == DATASET_FAMILY_BUBBLE:
+        dataset = dg.simulate_external_introduction(
+            n_nodes=dataset_profile.n_subjects,
+            total_internal_contacts=internal_contacts,
+            tmax_after_intro=dataset_profile.time_limit_hours,
+            effective_external_contacts=dataset_profile.effective_external_contacts,
+            seed=seed,
+        )
+        payload = dg.save_dataset_event_sequence(dataset, dataset_path)
+    elif dataset_profile.family == DATASET_FAMILY_SCALE_FREE:
+        dataset = sfdg.simulate_scale_free_introduction(
+            n_nodes=dataset_profile.n_subjects,
+            total_internal_contacts=internal_contacts,
+            total_external_contacts=dataset_profile.total_external_contacts,
+            total_symptom_observations=dataset_profile.total_symptom_observations,
+            total_test_observations=dataset_profile.total_test_observations,
+            tmax_after_intro=dataset_profile.time_limit_hours,
+            effective_external_contacts=dataset_profile.effective_external_contacts,
+            barabasi_m=dataset_profile.barabasi_m,
+            seed=seed,
+        )
+        payload = sfdg.save_dataset_event_sequence(dataset, dataset_path)
+    else:
+        raise ValueError(f"Unsupported dataset family: {dataset_profile.family}")
+
+    return summarize_generated_dataset(
+        dataset_profile=dataset_profile,
+        dataset_path=dataset_path,
+        payload=payload,
+        requested_internal_contacts=internal_contacts,
+    )
 
 
 def resolve_worker_count(task_count):
@@ -175,7 +326,21 @@ def mark_stage_complete(save_path, stage_name):
     )
 
 
-def resolve_run_directory(results_root="results"):
+def run_directory_matches_dataset_family(run_dir, dataset_family):
+    metadata_path = os.path.join(run_dir, "run_metadata.json")
+    if not os.path.exists(metadata_path):
+        return dataset_family == DATASET_FAMILY_BUBBLE
+    try:
+        metadata = read_json(metadata_path)
+    except (OSError, json.JSONDecodeError):
+        return False
+    recorded_family = metadata.get("dataset_family")
+    if recorded_family is None:
+        return dataset_family == DATASET_FAMILY_BUBBLE
+    return recorded_family == dataset_family
+
+
+def resolve_run_directory(results_root="results", dataset_family=DATASET_FAMILY_BUBBLE):
     ensure_dir(results_root)
 
     force_new = os.environ.get("CHITA_FORCE_NEW_RUN", "0") == "1"
@@ -190,7 +355,10 @@ def resolve_run_directory(results_root="results"):
 
         for run_dir in run_dirs:
             sentinel_path = os.path.join(run_dir, RUN_COMPLETION_SENTINEL)
-            if not os.path.exists(sentinel_path):
+            if not os.path.exists(sentinel_path) and run_directory_matches_dataset_family(
+                run_dir,
+                dataset_family,
+            ):
                 print(f"Resuming interrupted run at: {run_dir}")
                 return run_dir, True
 
@@ -561,6 +729,17 @@ def append_unique_note(notes_by_run, run_id, note_text):
         notes.append(note_text)
 
 
+def selection_entry(item, rank, note_text):
+    return {
+        "rank": rank,
+        "run_id": item["run_id"],
+        "parameter_case_id": item.get("parameter_case_id"),
+        "parameter_case_code": item.get("parameter_case_code"),
+        "metric_value": item["metric_value"],
+        "note": note_text,
+    }
+
+
 def add_metric_selection_notes(dataset_rows, metric_key, metric_label, notes_by_run):
     candidates = []
     for row in dataset_rows:
@@ -570,21 +749,44 @@ def add_metric_selection_notes(dataset_rows, metric_key, metric_label, notes_by_
         candidates.append(
             {
                 "run_id": row["run_id"],
+                "parameter_case_id": row.get("parameter_case_id"),
+                "parameter_case_code": row.get("parameter_case_code"),
                 "metric_value": metric_value,
             }
         )
 
     if not candidates:
-        return
+        return {
+            "metric_key": metric_key,
+            "metric_label": metric_label,
+            "total_candidates": 0,
+            "bucket_size": 0,
+            "top": [],
+            "worst": [],
+            "median": [],
+        }
 
     bucket_size = min(METRIC_SELECTION_BUCKET_SIZE, len(candidates))
     candidates.sort(key=lambda item: (item["metric_value"], item["run_id"]))
+    selection = {
+        "metric_key": metric_key,
+        "metric_label": metric_label,
+        "total_candidates": len(candidates),
+        "bucket_size": bucket_size,
+        "top": [],
+        "worst": [],
+        "median": [],
+    }
 
     for rank, item in enumerate(reversed(candidates[-bucket_size:]), start=1):
-        append_unique_note(notes_by_run, item["run_id"], f"Top {rank} {metric_label}")
+        note_text = f"Top {rank} {metric_label}"
+        append_unique_note(notes_by_run, item["run_id"], note_text)
+        selection["top"].append(selection_entry(item, rank, note_text))
 
     for rank, item in enumerate(candidates[:bucket_size], start=1):
-        append_unique_note(notes_by_run, item["run_id"], f"Worst {rank} {metric_label}")
+        note_text = f"Worst {rank} {metric_label}"
+        append_unique_note(notes_by_run, item["run_id"], note_text)
+        selection["worst"].append(selection_entry(item, rank, note_text))
 
     median_value = percentile([item["metric_value"] for item in candidates], 0.50)
     nearest_to_median = sorted(
@@ -592,10 +794,14 @@ def add_metric_selection_notes(dataset_rows, metric_key, metric_label, notes_by_
         key=lambda item: (abs(item["metric_value"] - median_value), item["run_id"]),
     )[:bucket_size]
     for rank, item in enumerate(nearest_to_median, start=1):
-        append_unique_note(notes_by_run, item["run_id"], f"Median {rank} {metric_label}")
+        note_text = f"Median {rank} {metric_label}"
+        append_unique_note(notes_by_run, item["run_id"], note_text)
+        selection["median"].append(selection_entry(item, rank, note_text))
+
+    return selection
 
 
-def build_notes_map_per_dataset(comparison_summaries):
+def build_notes_map_and_selection_manifest(comparison_summaries):
     rows = []
     for summary in comparison_summaries:
         analysis_metrics = summary.get("comparison_metrics", {}).get("analysis", {})
@@ -603,18 +809,41 @@ def build_notes_map_per_dataset(comparison_summaries):
             {
                 "run_id": summary.get("run_id"),
                 "dataset_stem": summary.get("dataset_stem"),
+                "parameter_case_id": summary.get("parameter_case_id"),
+                "parameter_case_code": summary.get("parameter_case_code"),
                 "kendall_analysis": analysis_metrics.get("tau"),
                 "spearman_analysis": analysis_metrics.get("spearman"),
             }
         )
 
     notes_by_run = {}
+    manifest = {
+        "selection_bucket_size": METRIC_SELECTION_BUCKET_SIZE,
+        "datasets": {},
+    }
     dataset_stems = sorted({row["dataset_stem"] for row in rows if row.get("dataset_stem") is not None})
     for dataset_stem in dataset_stems:
         dataset_rows = [row for row in rows if row.get("dataset_stem") == dataset_stem]
-        add_metric_selection_notes(dataset_rows, "kendall_analysis", "Kendall", notes_by_run)
-        add_metric_selection_notes(dataset_rows, "spearman_analysis", "Spearman", notes_by_run)
+        manifest["datasets"][dataset_stem] = {
+            "kendall": add_metric_selection_notes(
+                dataset_rows,
+                "kendall_analysis",
+                "Kendall",
+                notes_by_run,
+            ),
+            "spearman": add_metric_selection_notes(
+                dataset_rows,
+                "spearman_analysis",
+                "Spearman",
+                notes_by_run,
+            ),
+        }
 
+    return notes_by_run, manifest
+
+
+def build_notes_map_per_dataset(comparison_summaries):
+    notes_by_run, _ = build_notes_map_and_selection_manifest(comparison_summaries)
     return notes_by_run
 
 
@@ -1404,8 +1633,186 @@ def write_reference_sweep_csv(csv_path, rows):
             writer.writerow({column: row.get(column) for column in REFERENCE_SWEEP_COLUMNS})
 
 
-def main():
-    save_path, resumed_run = resolve_run_directory(results_root="results")
+def resolve_quartile_label_for_existing_run(save_path, explicit_quartile_label=None):
+    if explicit_quartile_label:
+        return explicit_quartile_label
+
+    sentinel_path = os.path.join(save_path, RUN_COMPLETION_SENTINEL)
+    if os.path.exists(sentinel_path):
+        completion_payload = read_json(sentinel_path)
+        quartile_label = completion_payload.get("quartile_label")
+        if isinstance(quartile_label, str) and quartile_label:
+            return quartile_label
+
+    comparison_summary_candidates = [
+        filename[len("comparison_summary_") : -len(".json")]
+        for filename in os.listdir(save_path)
+        if filename.startswith("comparison_summary_")
+        and filename.endswith(".json")
+    ]
+    comparison_summary_candidates = sorted(set(comparison_summary_candidates))
+    if len(comparison_summary_candidates) == 1:
+        return comparison_summary_candidates[0]
+    if not comparison_summary_candidates:
+        raise FileNotFoundError(
+            f"Could not infer quartile label for {save_path}: no comparison_summary_*.json file found."
+        )
+    raise ValueError(
+        "Could not infer quartile label automatically because multiple comparison summaries were found. "
+        f"Use --quartile-label with one of: {', '.join(comparison_summary_candidates)}"
+    )
+
+
+def persist_comparison_outputs(save_path, quartile_label, comparison_summaries):
+    for comparison_summary in comparison_summaries:
+        summary_path = os.path.join(comparison_summary["comparison_dir"], "comparison_summary.json")
+        write_json(summary_path, comparison_summary)
+
+    comparison_summary_json_path = os.path.join(save_path, f"comparison_summary_{quartile_label}.json")
+    write_json(comparison_summary_json_path, comparison_summaries)
+
+    sweep_summary_rows = [build_reference_row(summary) for summary in comparison_summaries]
+    sweep_summary_csv_path = os.path.join(save_path, "sweep_summary.csv")
+    write_reference_sweep_csv(sweep_summary_csv_path, sweep_summary_rows)
+
+    comparison_summary_csv_path = os.path.join(save_path, f"comparison_summary_{quartile_label}.csv")
+    write_reference_sweep_csv(comparison_summary_csv_path, sweep_summary_rows)
+
+    return {
+        "comparison_summary_json_path": comparison_summary_json_path,
+        "comparison_summary_csv_path": comparison_summary_csv_path,
+        "sweep_summary_csv_path": sweep_summary_csv_path,
+        "rows_written": len(sweep_summary_rows),
+    }
+
+
+def update_run_completion_metadata(save_path, quartile_label, comparison_summaries, output_paths, selection_manifest_path):
+    completion_payload = {}
+    sentinel_path = os.path.join(save_path, RUN_COMPLETION_SENTINEL)
+    if os.path.exists(sentinel_path):
+        completion_payload = read_json(sentinel_path)
+
+    completion_payload.update(
+        {
+            "completed_at": completion_payload.get(
+                "completed_at",
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+            "save_path": save_path,
+            "quartile_label": quartile_label,
+            "rows_written": output_paths["rows_written"],
+            "selected_runs_for_plots": len([summary for summary in comparison_summaries if summary.get("note")]),
+            "sweep_summary_csv_path": output_paths["sweep_summary_csv_path"],
+            "comparison_summary_json_path": output_paths["comparison_summary_json_path"],
+            "comparison_summary_csv_path": output_paths["comparison_summary_csv_path"],
+            "selected_run_manifest_path": selection_manifest_path,
+            "selection_refreshed_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    write_json(sentinel_path, completion_payload)
+
+
+def refresh_selected_run_outputs(save_path, quartile_label, time_step_hours, iterations):
+    comparison_summary_json_path = os.path.join(save_path, f"comparison_summary_{quartile_label}.json")
+    if not os.path.exists(comparison_summary_json_path):
+        raise FileNotFoundError(
+            f"Comparison summary not found for quartile {quartile_label}: {comparison_summary_json_path}"
+        )
+
+    comparison_summaries = read_json(comparison_summary_json_path)
+    comparison_summaries.sort(key=lambda item: (item["dataset_stem"], item["parameter_case_id"]))
+
+    notes_by_run, selection_manifest = build_notes_map_and_selection_manifest(comparison_summaries)
+    apply_notes_to_comparison_summaries(comparison_summaries, notes_by_run)
+    selection_manifest_path = os.path.join(save_path, "selected_run_manifest.json")
+    write_json(selection_manifest_path, selection_manifest)
+
+    stage_name = "stage8_selected_plots"
+    selected_summaries = [summary for summary in comparison_summaries if summary.get("note")]
+    total_stage_tasks = len(selected_summaries)
+    write_stage_checkpoint(
+        save_path,
+        stage_name,
+        0,
+        total_stage_tasks,
+        status="running",
+        extra={"mode": "refresh_selected_plots", "quartile_label": quartile_label},
+    )
+
+    if total_stage_tasks > 0:
+        updated_by_run_id = {}
+        worker_count = resolve_worker_count(total_stage_tasks)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    regenerate_selected_run_plots,
+                    summary,
+                    time_step_hours,
+                    iterations,
+                )
+                for summary in selected_summaries
+            ]
+
+            completed = 0
+            for future in tqdm(as_completed(futures), total=total_stage_tasks, desc="Generating selected plots"):
+                updated_summary = future.result()
+                updated_by_run_id[updated_summary["run_id"]] = updated_summary
+                completed += 1
+                write_stage_checkpoint(save_path, stage_name, completed, total_stage_tasks, status="running")
+
+        comparison_summaries = [
+            updated_by_run_id.get(summary["run_id"], summary)
+            for summary in comparison_summaries
+        ]
+
+    mark_stage_complete(save_path, stage_name)
+    write_stage_checkpoint(save_path, stage_name, total_stage_tasks, total_stage_tasks, status="completed")
+
+    output_paths = persist_comparison_outputs(save_path, quartile_label, comparison_summaries)
+    update_run_completion_metadata(
+        save_path=save_path,
+        quartile_label=quartile_label,
+        comparison_summaries=comparison_summaries,
+        output_paths=output_paths,
+        selection_manifest_path=selection_manifest_path,
+    )
+    return {
+        "save_path": save_path,
+        "quartile_label": quartile_label,
+        "selected_runs_for_plots": total_stage_tasks,
+        "selected_run_manifest_path": selection_manifest_path,
+        **output_paths,
+    }
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.reuse_run and not args.only_selected_plots:
+        raise ValueError("--reuse-run currently requires --only-selected-plots.")
+    if args.quartile_label and not args.only_selected_plots:
+        raise ValueError("--quartile-label can only be used together with --only-selected-plots.")
+    if args.only_selected_plots:
+        save_path = resolve_existing_run_path(args.reuse_run)
+        quartile_label = resolve_quartile_label_for_existing_run(save_path, args.quartile_label)
+        refresh_summary = refresh_selected_run_outputs(
+            save_path=save_path,
+            quartile_label=quartile_label,
+            time_step_hours=TIME_STEP,
+            iterations=INTERNAL_STEPS,
+        )
+        print(
+            "Selected-run refresh completed. "
+            f"Updated {refresh_summary['selected_runs_for_plots']} selected runs in {save_path}. "
+            f"Manifest: {refresh_summary['selected_run_manifest_path']}"
+        )
+        return
+
+    dataset_profile = resolve_dataset_profile(args.dataset)
+
+    save_path, resumed_run = resolve_run_directory(
+        results_root="results",
+        dataset_family=dataset_profile.family,
+    )
     cache_path = ensure_dir(os.path.join("results", "cache"))
 
     write_json(
@@ -1413,6 +1820,8 @@ def main():
         {
             "save_path": save_path,
             "cache_path": cache_path,
+            "dataset_family": dataset_profile.family,
+            "dataset_profile": dataset_profile_metadata(dataset_profile),
             "time_step_hours": TIME_STEP,
             "internal_steps": INTERNAL_STEPS,
             "quantile": QUANTILE,
@@ -1428,25 +1837,44 @@ def main():
 
     # 1. Create datasets
     stage_name = "stage1_dataset_generation"
-    write_stage_checkpoint(save_path, stage_name, 0, len(INTERNAL_CONTACTS), status="running")
+    dataset_contact_targets = list(dataset_profile.internal_contacts)
+    write_stage_checkpoint(save_path, stage_name, 0, len(dataset_contact_targets), status="running")
 
     dataset_paths = []
-    for index, internal_contacts in enumerate(INTERNAL_CONTACTS, start=1):
-        dataset_path = os.path.join(save_path, f"dataset_{internal_contacts}.json")
+    dataset_generation_summaries = []
+    for index, internal_contacts in enumerate(dataset_contact_targets, start=1):
+        dataset_path = os.path.join(save_path, dataset_filename(dataset_profile, internal_contacts))
         if not os.path.exists(dataset_path):
-            dataset = dg.simulate_external_introduction(
-                n_nodes=SUBJECTS,
-                total_internal_contacts=internal_contacts,
-                tmax_after_intro=2016,
-                effective_external_contacts=EFFECTIVE_EXTERNAL_CONTACTS,
+            dataset_generation_summary = generate_dataset_for_profile(
+                dataset_profile=dataset_profile,
+                dataset_path=dataset_path,
+                internal_contacts=internal_contacts,
                 seed=30,
             )
-            dg.save_dataset_event_sequence(dataset, dataset_path)
+        else:
+            dataset_generation_summary = summarize_generated_dataset(
+                dataset_profile=dataset_profile,
+                dataset_path=dataset_path,
+                payload=read_json(dataset_path),
+                requested_internal_contacts=internal_contacts,
+            )
         dataset_paths.append(dataset_path)
-        write_stage_checkpoint(save_path, stage_name, index, len(INTERNAL_CONTACTS), status="running")
+        dataset_generation_summaries.append(dataset_generation_summary)
+        write_stage_checkpoint(save_path, stage_name, index, len(dataset_contact_targets), status="running")
+
+    write_json(
+        os.path.join(save_path, "dataset_generation_summary.json"),
+        dataset_generation_summaries,
+    )
 
     mark_stage_complete(save_path, stage_name)
-    write_stage_checkpoint(save_path, stage_name, len(INTERNAL_CONTACTS), len(INTERNAL_CONTACTS), status="completed")
+    write_stage_checkpoint(
+        save_path,
+        stage_name,
+        len(dataset_contact_targets),
+        len(dataset_contact_targets),
+        status="completed",
+    )
 
     parameter_cases, ground_truth_case = build_parameter_combinations(os.path.join(".", "parameters.json"))
     print(normalize_stpn_parameter_bundle(parameter_cases[0]["parameter_bundle"])["case_id"])
@@ -1837,8 +2265,10 @@ def main():
         status="completed",
     )
 
-    notes_by_run = build_notes_map_per_dataset(comparison_summaries)
+    notes_by_run, selection_manifest = build_notes_map_and_selection_manifest(comparison_summaries)
     apply_notes_to_comparison_summaries(comparison_summaries, notes_by_run)
+    selection_manifest_path = os.path.join(save_path, "selected_run_manifest.json")
+    write_json(selection_manifest_path, selection_manifest)
 
     # 8. Regenerate plots only for runs selected in dataset-wise top/worst/median buckets.
     stage_name = "stage8_selected_plots"
@@ -1875,40 +2305,19 @@ def main():
     mark_stage_complete(save_path, stage_name)
     write_stage_checkpoint(save_path, stage_name, total_stage_tasks, total_stage_tasks, status="completed")
 
-    for comparison_summary in comparison_summaries:
-        summary_path = os.path.join(comparison_summary["comparison_dir"], "comparison_summary.json")
-        write_json(summary_path, comparison_summary)
-
-    comparison_summary_json_path = os.path.join(save_path, f"comparison_summary_{quartile_label}.json")
-    write_json(comparison_summary_json_path, comparison_summaries)
-
-    # Output CSV with the reference schema.
-    sweep_summary_rows = [build_reference_row(summary) for summary in comparison_summaries]
-    sweep_summary_csv_path = os.path.join(save_path, "sweep_summary.csv")
-    write_reference_sweep_csv(sweep_summary_csv_path, sweep_summary_rows)
-
-    # Keep the old filename as compatibility alias, but with the reference schema.
-    comparison_summary_csv_path = os.path.join(save_path, f"comparison_summary_{quartile_label}.csv")
-    write_reference_sweep_csv(comparison_summary_csv_path, sweep_summary_rows)
-
-    write_json(
-        os.path.join(save_path, RUN_COMPLETION_SENTINEL),
-        {
-            "completed_at": datetime.now().isoformat(timespec="seconds"),
-            "save_path": save_path,
-            "quartile_label": quartile_label,
-            "rows_written": len(sweep_summary_rows),
-            "selected_runs_for_plots": len([summary for summary in comparison_summaries if summary.get("note")]),
-            "sweep_summary_csv_path": sweep_summary_csv_path,
-            "comparison_summary_json_path": comparison_summary_json_path,
-            "comparison_summary_csv_path": comparison_summary_csv_path,
-        },
+    output_paths = persist_comparison_outputs(save_path, quartile_label, comparison_summaries)
+    update_run_completion_metadata(
+        save_path=save_path,
+        quartile_label=quartile_label,
+        comparison_summaries=comparison_summaries,
+        output_paths=output_paths,
+        selection_manifest_path=selection_manifest_path,
     )
 
     print(
         "Point 7 completed. "
-        f"Saved {len(comparison_summaries)} comparison summaries to {comparison_summary_json_path}, "
-        f"{comparison_summary_csv_path}, and {sweep_summary_csv_path}."
+        f"Saved {len(comparison_summaries)} comparison summaries to {output_paths['comparison_summary_json_path']}, "
+        f"{output_paths['comparison_summary_csv_path']}, and {output_paths['sweep_summary_csv_path']}."
     )
 
 

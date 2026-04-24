@@ -1,5 +1,5 @@
-import random
 import json
+import random
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -11,6 +11,7 @@ except ImportError as exc:
     _EON_IMPORT_ERROR = exc
 else:
     _EON_IMPORT_ERROR = None
+
 
 seed = 777
 rng = random.Random(seed)
@@ -87,6 +88,113 @@ def sample_internal_contact_from_graph(
     )
 
 
+def build_contact_graph(n_nodes):
+    graph = nx.complete_graph(n_nodes)
+    if graph.number_of_edges() == 0 and n_nodes > 1:
+        for node in range(n_nodes - 1):
+            graph.add_edge(node, node + 1)
+    return graph
+
+
+def generate_external_contacts(graph, total_time_limit, max_external_contacts_per_node):
+    external_contacts = []
+    for node in graph.nodes:
+        n_contacts = rng.randint(0, max_external_contacts_per_node)
+        sampled_times = sorted(
+            rng.uniform(0.0, total_time_limit) for _ in range(n_contacts)
+        )
+        for contact_time in sampled_times:
+            external_contacts.append(
+                {
+                    "type": "External",
+                    "involved_subjects": [node + 1],
+                    "time": float(contact_time),
+                    "risk_factor": rng.uniform(0.0, 1.0),
+                    "result": None,
+                }
+            )
+    return external_contacts
+
+
+def ensure_external_contacts(graph, external_contacts, total_time_limit):
+    if external_contacts:
+        return external_contacts
+
+    fallback_node = rng.choice(list(graph.nodes))
+    external_contacts.append(
+        {
+            "type": "External",
+            "involved_subjects": [fallback_node + 1],
+            "time": float(rng.uniform(0.0, total_time_limit)),
+            "risk_factor": rng.uniform(0.0, 1.0),
+            "result": None,
+        }
+    )
+    return external_contacts
+
+
+def index_external_contacts_by_node(external_contacts):
+    contact_indices_by_node = {}
+    for index, event in enumerate(external_contacts):
+        subject_id = int(event["involved_subjects"][0])
+        node = subject_id - 1
+        contact_indices_by_node.setdefault(node, []).append(index)
+    return contact_indices_by_node
+
+
+def select_effective_external_contacts(external_contacts, effective_external_contacts):
+    contact_indices_by_node = index_external_contacts_by_node(external_contacts)
+    candidate_nodes = sorted(contact_indices_by_node.keys())
+    n_effective_contacts = min(int(effective_external_contacts), len(candidate_nodes))
+    introduced_nodes = rng.sample(candidate_nodes, n_effective_contacts)
+    effective_contact_indices = [
+        rng.choice(contact_indices_by_node[node])
+        for node in introduced_nodes
+    ]
+    effective_contacts = [external_contacts[index] for index in effective_contact_indices]
+    return introduced_nodes, effective_contacts
+
+
+def align_effective_introduction_times(effective_contacts):
+    introduction_time = min(event["time"] for event in effective_contacts)
+    for effective_event in effective_contacts:
+        effective_event["time"] = float(introduction_time)
+        effective_event["result"] = True
+    return introduction_time
+
+
+def run_hidden_outbreak(graph, transmission_rate, recovery_rate, introduced_nodes, tmax_after_intro):
+    return EoN.fast_SIR(
+        graph,
+        tau=transmission_rate,
+        gamma=recovery_rate,
+        initial_infecteds=introduced_nodes,
+        tmax=tmax_after_intro,
+        return_full_data=True,
+    )
+
+
+def shift_epidemic_curves(simulation, introduction_time, n_nodes, n_effective_contacts):
+    times = simulation.t()
+    susceptible = simulation.S()
+    infected = simulation.I()
+    recovered = simulation.R()
+
+    shifted_times = [introduction_time + t for t in times]
+
+    if introduction_time > 0.0:
+        shifted_times = [0.0, introduction_time] + shifted_times
+        susceptible = [n_nodes, n_nodes - n_effective_contacts] + list(susceptible)
+        infected = [0, n_effective_contacts] + list(infected)
+        recovered = [0, 0] + list(recovered)
+    else:
+        susceptible = list(susceptible)
+        infected = list(infected)
+        recovered = list(recovered)
+
+    return shifted_times, susceptible, infected, recovered
+
+
 def simulate_external_introduction(
     n_nodes=8,
     edge_probability=0.8,
@@ -111,6 +219,9 @@ def simulate_external_introduction(
     Returns:
         dict: Graph, sampled introduction info, and S/I/R time series.
     """
+    del edge_probability
+    del max_intro_time
+
     if EoN is None:
         raise ImportError(
             "EoN is required for this sample. Install it with `pip install EoN`."
@@ -120,91 +231,42 @@ def simulate_external_introduction(
         global rng
         rng = random.Random(seed)
 
-    graph = nx.complete_graph(n_nodes)
-    if graph.number_of_edges() == 0 and n_nodes > 1:
-        for node in range(n_nodes - 1):
-            graph.add_edge(node, node + 1)
+    graph = build_contact_graph(n_nodes)
 
     if int(effective_external_contacts) <= 0:
         raise ValueError("effective_external_contacts must be greater than 0.")
 
-    requested_effective_contacts = int(effective_external_contacts)
     total_time_limit = tmax_after_intro
-
-    external_contacts = []
-    for node in graph.nodes:
-        n_contacts = rng.randint(0, max_external_contacts_per_node)
-        sampled_times = sorted(
-            rng.uniform(0.0, total_time_limit) for _ in range(n_contacts)
-        )
-        for contact_time in sampled_times:
-            external_contacts.append(
-                {
-                    "type": "External",
-                    "involved_subjects": [node + 1],
-                    "time": float(contact_time),
-                    "risk_factor": rng.uniform(0.0, 1.0),
-                    "result": None,
-                }
-            )
-
-    if not external_contacts:
-        fallback_node = rng.choice(list(graph.nodes))
-        external_contacts.append(
-            {
-                "type": "External",
-                "involved_subjects": [fallback_node + 1],
-                "time": float(rng.uniform(0.0, total_time_limit)),
-                "risk_factor": rng.uniform(0.0, 1.0),
-                "result": None,
-            }
-        )
-
-    contact_indices_by_node = {}
-    for index, event in enumerate(external_contacts):
-        subject_id = int(event["involved_subjects"][0])
-        node = subject_id - 1
-        contact_indices_by_node.setdefault(node, []).append(index)
-
-    candidate_nodes = sorted(contact_indices_by_node.keys())
-    n_effective_contacts = min(requested_effective_contacts, len(candidate_nodes))
-    introduced_nodes = rng.sample(candidate_nodes, n_effective_contacts)
-    effective_contact_indices = [
-        rng.choice(contact_indices_by_node[node])
-        for node in introduced_nodes
-    ]
-    effective_contacts = [external_contacts[index] for index in effective_contact_indices]
-    introduction_time = min(event["time"] for event in effective_contacts)
-
-    # Align effective introductions to the same external-arrival time.
-    for effective_event in effective_contacts:
-        effective_event["time"] = float(introduction_time)
-        effective_event["result"] = True
-
-    simulation = EoN.fast_SIR(
-        graph,
-        tau=transmission_rate,
-        gamma=recovery_rate,
-        initial_infecteds=introduced_nodes,
-        tmax=tmax_after_intro,
-        return_full_data=True,
+    external_contacts = generate_external_contacts(
+        graph=graph,
+        total_time_limit=total_time_limit,
+        max_external_contacts_per_node=max_external_contacts_per_node,
     )
-    times = simulation.t()
-    susceptible = simulation.S()
-    infected = simulation.I()
-    recovered = simulation.R()
+    external_contacts = ensure_external_contacts(
+        graph=graph,
+        external_contacts=external_contacts,
+        total_time_limit=total_time_limit,
+    )
 
-    shifted_times = [introduction_time + t for t in times]
+    introduced_nodes, effective_contacts = select_effective_external_contacts(
+        external_contacts=external_contacts,
+        effective_external_contacts=effective_external_contacts,
+    )
+    introduction_time = align_effective_introduction_times(effective_contacts)
 
-    if introduction_time > 0.0:
-        shifted_times = [0.0, introduction_time] + shifted_times
-        susceptible = [n_nodes, n_nodes - n_effective_contacts] + list(susceptible)
-        infected = [0, n_effective_contacts] + list(infected)
-        recovered = [0, 0] + list(recovered)
-    else:
-        susceptible = list(susceptible)
-        infected = list(infected)
-        recovered = list(recovered)
+    simulation = run_hidden_outbreak(
+        graph=graph,
+        transmission_rate=transmission_rate,
+        recovery_rate=recovery_rate,
+        introduced_nodes=introduced_nodes,
+        tmax_after_intro=tmax_after_intro,
+    )
+    shifted_times, susceptible, infected, recovered = shift_epidemic_curves(
+        simulation=simulation,
+        introduction_time=introduction_time,
+        n_nodes=n_nodes,
+        n_effective_contacts=len(effective_contacts),
+    )
 
     return {
         "graph": graph,
@@ -274,17 +336,10 @@ def plot_network_and_epidemic(result):
     return fig, axes
 
 
-def build_dataset_event_sequence(result):
-    """
-    Convert the simulated outbreak to the JSON event format used by dataset.py.
-    """
+def generate_transmission_internal_events(result):
     graph = result["graph"]
     simulation = result["simulation"]
     introduction_time = result["introduction_time"]
-    fine_grained_rng = random.Random(seed)
-    requested_internal_contacts = result.get("total_internal_contacts")
-
-    events = list(result["external_contacts"])
     internal_events = []
 
     for time, source, target in simulation.transmissions():
@@ -299,43 +354,85 @@ def build_dataset_event_sequence(result):
             )
         )
 
-    if requested_internal_contacts is None:
-        events.extend(internal_events)
-    else:
-        target_internal_contacts = max(int(requested_internal_contacts), len(internal_events))
-        additional_contacts_needed = target_internal_contacts - len(internal_events)
-        additional_timestamps = sample_continuous_timestamps(
-            additional_contacts_needed,
-            result["time_limit"],
-        )
-        graph_edges = list(graph.edges())
-        for timestamp in additional_timestamps:
-            internal_events.append(
-                create_event(
-                    "Internal",
-                    sample_internal_contact_from_graph(graph, edges=graph_edges),
-                    timestamp,
-                    rng.uniform(0.0, 0.99),
-                )
-            )
-        events.extend(internal_events)
+    return internal_events
 
+
+def top_up_internal_events(graph, internal_events, requested_internal_contacts, time_limit_hours):
+    target_internal_contacts = max(int(requested_internal_contacts), len(internal_events))
+    additional_contacts_needed = target_internal_contacts - len(internal_events)
+    additional_timestamps = sample_continuous_timestamps(
+        additional_contacts_needed,
+        time_limit_hours,
+    )
+    graph_edges = list(graph.edges())
+    for timestamp in additional_timestamps:
+        internal_events.append(
+            create_event(
+                "Internal",
+                sample_internal_contact_from_graph(graph, edges=graph_edges),
+                timestamp,
+                rng.uniform(0.0, 0.99),
+            )
+        )
+    return internal_events
+
+
+def generate_test_events(graph, time_limit_hours, fine_grained_rng):
+    test_events = []
     for subject in range(1, graph.number_of_nodes() + 1):
-        n_tests = sample_tests(result["time_limit"])
-        test_timestamps = sample_timestamps(n_tests, result["time_limit"], fine_grained_rng)
+        n_tests = sample_tests(time_limit_hours)
+        test_timestamps = sample_timestamps(n_tests, time_limit_hours, fine_grained_rng)
         for timestamp in test_timestamps:
-            events.append(
+            test_events.append(
                 create_event("Test", [subject], timestamp, None, "to be defined")
             )
+    return test_events
 
+
+def finalize_dataset_payload(graph, events, time_limit_hours):
     events.sort(key=lambda event: event["time"])
-
     return {
         "events": events,
         "n_subjects": graph.number_of_nodes(),
-        "time_limit": int(round(result["time_limit"] / 24.0)),
+        "time_limit": int(round(time_limit_hours / 24.0)),
         "n_contacts": len([event for event in events if event["type"] == "Internal"]),
     }
+
+
+def build_dataset_event_sequence(result):
+    """
+    Convert the simulated outbreak to the JSON event format used by dataset.py.
+    """
+    graph = result["graph"]
+    fine_grained_rng = random.Random(seed)
+    requested_internal_contacts = result.get("total_internal_contacts")
+
+    events = list(result["external_contacts"])
+    internal_events = generate_transmission_internal_events(result)
+
+    if requested_internal_contacts is None:
+        events.extend(internal_events)
+    else:
+        internal_events = top_up_internal_events(
+            graph=graph,
+            internal_events=internal_events,
+            requested_internal_contacts=requested_internal_contacts,
+            time_limit_hours=result["time_limit"],
+        )
+        events.extend(internal_events)
+
+    events.extend(
+        generate_test_events(
+            graph=graph,
+            time_limit_hours=result["time_limit"],
+            fine_grained_rng=fine_grained_rng,
+        )
+    )
+    return finalize_dataset_payload(
+        graph=graph,
+        events=events,
+        time_limit_hours=result["time_limit"],
+    )
 
 
 def save_dataset_event_sequence(result, output_path):
