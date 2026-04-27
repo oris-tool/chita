@@ -10,6 +10,7 @@ import os
 import random
 import shutil
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -120,7 +121,8 @@ DATASET_PROFILES = {
         generator_module_name="scale_free_dataset_graph",
         n_subjects=100,
         time_limit_hours=TIME_LIMIT_HOURS,
-        internal_contacts=(32, 2500, 5000, 10000),
+        # internal_contacts=(32, 2500, 5000, 10000),
+        internal_contacts=(2500,),
         effective_external_contacts=15,
         total_external_contacts=1000,
         total_symptom_observations=1000,
@@ -136,14 +138,43 @@ def ensure_dir(path):
 
 
 def write_json(path, payload):
-    ensure_dir(os.path.dirname(path) or ".")
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=4)
+    target_dir = ensure_dir(os.path.dirname(path) or ".")
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=target_dir, delete=False, encoding="utf-8") as handle:
+            temp_path = handle.name
+            json.dump(payload, handle, indent=4)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            with contextlib.suppress(OSError):
+                os.remove(temp_path)
 
 
 def read_json(path):
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def read_cached_json(path):
+    try:
+        payload = read_json(path)
+    except (json.JSONDecodeError, OSError) as exc:
+        corrupt_path = f"{path}.corrupt.{int(time.time())}"
+        moved = False
+        with contextlib.suppress(OSError):
+            shutil.move(path, corrupt_path)
+            moved = True
+        if moved:
+            print(f"[cache] Ignoring invalid JSON summary {path}: {exc}. Moved to {corrupt_path}.")
+        else:
+            print(f"[cache] Ignoring invalid JSON summary {path}: {exc}.")
+        return None
+
+    if not isinstance(payload, dict):
+        print(f"[cache] Ignoring non-object JSON summary {path}: expected object, got {type(payload).__name__}.")
+        return None
+    return payload
 
 
 def write_text(path, content):
@@ -922,20 +953,21 @@ def run_precompute_task(save_path, parameter_case, time_step_hours):
     precompute_dir = resolve_case_output_dir(precompute_base_dir, parameter_case)
     summary_path = os.path.join(precompute_dir, "precompute_summary.json")
     if os.path.exists(summary_path):
-        cached_summary = read_json(summary_path)
-        if _is_valid_path(cached_summary.get("stpn_solution_path")) and _is_valid_path(
-            cached_summary.get("observation_curve_path")
-        ):
-            changed = False
-            if cached_summary.get("parameter_case_code") != case_run_code:
-                cached_summary["parameter_case_code"] = case_run_code
-                changed = True
-            if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
-                cached_summary["parameter_case_index"] = parameter_case["case_index"]
-                changed = True
-            if changed:
-                write_json(summary_path, cached_summary)
-            return cached_summary
+        cached_summary = read_cached_json(summary_path)
+        if cached_summary:
+            if _is_valid_path(cached_summary.get("stpn_solution_path")) and _is_valid_path(
+                cached_summary.get("observation_curve_path")
+            ):
+                changed = False
+                if cached_summary.get("parameter_case_code") != case_run_code:
+                    cached_summary["parameter_case_code"] = case_run_code
+                    changed = True
+                if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
+                    cached_summary["parameter_case_index"] = parameter_case["case_index"]
+                    changed = True
+                if changed:
+                    write_json(summary_path, cached_summary)
+                return cached_summary
 
     precomputed = precompute_stpn_solution(
         parameter_bundle=parameter_bundle,
@@ -970,31 +1002,32 @@ def run_java_analysis_task(save_path, dataset_run, parameter_case, time_step_hou
     summary_path = os.path.join(analysis_dir, "java_analysis_summary.json")
 
     if os.path.exists(summary_path):
-        cached_summary = read_json(summary_path)
-        analysis_path = cached_summary.get("analysis_path")
-        cached_observed_path = cached_summary.get("observed_simulated_path")
-        observed_path_matches = _is_valid_path(cached_observed_path) and (
-            os.path.abspath(cached_observed_path) == os.path.abspath(dataset_run["observed_simulated_path"])
-        )
-        if not _is_valid_path(analysis_path):
-            try:
-                analysis_path = find_generated_file(analysis_dir, f"_tracks_it{iterations}.json")
-                cached_summary["analysis_path"] = analysis_path
-                write_json(summary_path, cached_summary)
-            except FileNotFoundError:
-                analysis_path = None
+        cached_summary = read_cached_json(summary_path)
+        if cached_summary:
+            analysis_path = cached_summary.get("analysis_path")
+            cached_observed_path = cached_summary.get("observed_simulated_path")
+            observed_path_matches = _is_valid_path(cached_observed_path) and (
+                os.path.abspath(cached_observed_path) == os.path.abspath(dataset_run["observed_simulated_path"])
+            )
+            if not _is_valid_path(analysis_path):
+                try:
+                    analysis_path = find_generated_file(analysis_dir, f"_tracks_it{iterations}.json")
+                    cached_summary["analysis_path"] = analysis_path
+                    write_json(summary_path, cached_summary)
+                except FileNotFoundError:
+                    analysis_path = None
 
-        if _is_valid_path(analysis_path) and observed_path_matches:
-            changed = False
-            if cached_summary.get("parameter_case_code") != case_run_code:
-                cached_summary["parameter_case_code"] = case_run_code
-                changed = True
-            if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
-                cached_summary["parameter_case_index"] = parameter_case["case_index"]
-                changed = True
-            if changed:
-                write_json(summary_path, cached_summary)
-            return cached_summary
+            if _is_valid_path(analysis_path) and observed_path_matches:
+                changed = False
+                if cached_summary.get("parameter_case_code") != case_run_code:
+                    cached_summary["parameter_case_code"] = case_run_code
+                    changed = True
+                if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
+                    cached_summary["parameter_case_index"] = parameter_case["case_index"]
+                    changed = True
+                if changed:
+                    write_json(summary_path, cached_summary)
+                return cached_summary
 
     ensure_dataset_analysis_input(
         analysis_dir=analysis_dir,
@@ -1056,33 +1089,34 @@ def run_python_analysis_task(
     summary_path = os.path.join(analysis_dir, "python_analysis_summary.json")
 
     if os.path.exists(summary_path):
-        cached_summary = read_json(summary_path)
-        cached_runtime_budget = cached_summary.get("runtime_budget_seconds")
-        runtime_budget_matches = isinstance(cached_runtime_budget, (int, float)) and (
-            abs(float(cached_runtime_budget) - float(runtime_budget_seconds)) <= 1e-9
-        )
-        cached_dataset_path = cached_summary.get("dataset_path")
-        dataset_path_matches = _is_valid_path(cached_dataset_path) and (
-            os.path.abspath(cached_dataset_path) == os.path.abspath(dataset_run["dataset_path"])
-        )
-        if (
-            _is_valid_path(cached_summary.get("averaged_results_path"))
-            and runtime_budget_matches
-            and dataset_path_matches
-        ):
-            changed = False
-            if cached_summary.get("parameter_case_code") != case_run_code:
-                cached_summary["parameter_case_code"] = case_run_code
-                changed = True
-            if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
-                cached_summary["parameter_case_index"] = parameter_case["case_index"]
-                changed = True
-            if cached_summary.get("runtime_budget_seconds") != runtime_budget_seconds:
-                cached_summary["runtime_budget_seconds"] = runtime_budget_seconds
-                changed = True
-            if changed:
-                write_json(summary_path, cached_summary)
-            return cached_summary
+        cached_summary = read_cached_json(summary_path)
+        if cached_summary:
+            cached_runtime_budget = cached_summary.get("runtime_budget_seconds")
+            runtime_budget_matches = isinstance(cached_runtime_budget, (int, float)) and (
+                abs(float(cached_runtime_budget) - float(runtime_budget_seconds)) <= 1e-9
+            )
+            cached_dataset_path = cached_summary.get("dataset_path")
+            dataset_path_matches = _is_valid_path(cached_dataset_path) and (
+                os.path.abspath(cached_dataset_path) == os.path.abspath(dataset_run["dataset_path"])
+            )
+            if (
+                _is_valid_path(cached_summary.get("averaged_results_path"))
+                and runtime_budget_matches
+                and dataset_path_matches
+            ):
+                changed = False
+                if cached_summary.get("parameter_case_code") != case_run_code:
+                    cached_summary["parameter_case_code"] = case_run_code
+                    changed = True
+                if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
+                    cached_summary["parameter_case_index"] = parameter_case["case_index"]
+                    changed = True
+                if cached_summary.get("runtime_budget_seconds") != runtime_budget_seconds:
+                    cached_summary["runtime_budget_seconds"] = runtime_budget_seconds
+                    changed = True
+                if changed:
+                    write_json(summary_path, cached_summary)
+                return cached_summary
 
     analysis_dataset_path = ensure_python_simulation_input(
         analysis_dir=analysis_dir,
@@ -1422,42 +1456,43 @@ def run_comparison_task(
     ground_truth_path = dataset_run["ground_truth_path"]
 
     if os.path.exists(summary_path):
-        cached_summary = read_json(summary_path)
-        cached_java_analysis = cached_summary.get("java_analysis", {})
-        cached_python_analysis = cached_summary.get("python_analysis", {})
-        cached_analysis_path = cached_java_analysis.get("analysis_path")
-        cached_baseline_path = cached_python_analysis.get("baseline_path")
-        cached_ground_truth_path = cached_summary.get("ground_truth_path")
+        cached_summary = read_cached_json(summary_path)
+        if cached_summary:
+            cached_java_analysis = cached_summary.get("java_analysis", {})
+            cached_python_analysis = cached_summary.get("python_analysis", {})
+            cached_analysis_path = cached_java_analysis.get("analysis_path")
+            cached_baseline_path = cached_python_analysis.get("baseline_path")
+            cached_ground_truth_path = cached_summary.get("ground_truth_path")
 
-        cache_matches_inputs = (
-            _is_valid_path(cached_ground_truth_path)
-            and _is_valid_path(cached_analysis_path)
-            and _is_valid_path(cached_baseline_path)
-            and os.path.abspath(cached_ground_truth_path) == os.path.abspath(ground_truth_path)
-            and os.path.abspath(cached_analysis_path) == os.path.abspath(analysis_path)
-            and os.path.abspath(cached_baseline_path) == os.path.abspath(baseline_path)
-        )
+            cache_matches_inputs = (
+                _is_valid_path(cached_ground_truth_path)
+                and _is_valid_path(cached_analysis_path)
+                and _is_valid_path(cached_baseline_path)
+                and os.path.abspath(cached_ground_truth_path) == os.path.abspath(ground_truth_path)
+                and os.path.abspath(cached_analysis_path) == os.path.abspath(analysis_path)
+                and os.path.abspath(cached_baseline_path) == os.path.abspath(baseline_path)
+            )
 
-        if cache_matches_inputs:
-            changed = False
-            if cached_summary.get("run_id") != run_id:
-                cached_summary["run_id"] = run_id
-                changed = True
-            if cached_summary.get("parameter_case_code") != case_run_code:
-                cached_summary["parameter_case_code"] = case_run_code
-                changed = True
-            if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
-                cached_summary["parameter_case_index"] = parameter_case["case_index"]
-                changed = True
-            if cached_summary.get("runtime_budget_seconds") != runtime_budget_seconds:
-                cached_summary["runtime_budget_seconds"] = runtime_budget_seconds
-                changed = True
-            if cached_summary.get("ground_truth_iterations") != dataset_run.get("ground_truth_iterations"):
-                cached_summary["ground_truth_iterations"] = dataset_run.get("ground_truth_iterations")
-                changed = True
-            if changed:
-                write_json(summary_path, cached_summary)
-            return cached_summary
+            if cache_matches_inputs:
+                changed = False
+                if cached_summary.get("run_id") != run_id:
+                    cached_summary["run_id"] = run_id
+                    changed = True
+                if cached_summary.get("parameter_case_code") != case_run_code:
+                    cached_summary["parameter_case_code"] = case_run_code
+                    changed = True
+                if cached_summary.get("parameter_case_index") != parameter_case["case_index"]:
+                    cached_summary["parameter_case_index"] = parameter_case["case_index"]
+                    changed = True
+                if cached_summary.get("runtime_budget_seconds") != runtime_budget_seconds:
+                    cached_summary["runtime_budget_seconds"] = runtime_budget_seconds
+                    changed = True
+                if cached_summary.get("ground_truth_iterations") != dataset_run.get("ground_truth_iterations"):
+                    cached_summary["ground_truth_iterations"] = dataset_run.get("ground_truth_iterations")
+                    changed = True
+                if changed:
+                    write_json(summary_path, cached_summary)
+                return cached_summary
 
     ensure_dir(comparison_dir)
 
@@ -1932,7 +1967,7 @@ def main(argv=None):
                 pruning_seed=None,
                 parameter_bundle=ground_truth_case["parameter_bundle"],
                 dataset_label=os.path.splitext(os.path.basename(dataset_path))[0],
-                save_plots=True,
+                save_plots=args.dataset == DATASET_FAMILY_BUBBLE,
             )
             write_json(gt_results_path, gt_results)
 
