@@ -39,7 +39,7 @@ DATASET_FAMILY_SCALE_FREE = "scale_free"
 RUN_DIR_PREFIX = "sweep_"
 RUN_COMPLETION_SENTINEL = "_run_completed.json"
 PROGRESS_DIR_NAME = "_progress"
-DEFAULT_MAX_WORKERS = max(1, (os.cpu_count() or 1) // 2)
+DEFAULT_MAX_WORKERS = max(1, (os.cpu_count() or 1))
 SAVE_PRECISION_PLOTS = os.environ.get("CHITA_SAVE_PRECISION_PLOTS", "0") == "1"
 LOG_PRECISION_METRICS = os.environ.get("CHITA_LOG_PRECISION_METRICS", "0") == "1"
 SAVE_COMPARISON_CSVS = os.environ.get("CHITA_SAVE_COMPARISON_CSVS", "1") == "1"

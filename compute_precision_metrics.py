@@ -1,5 +1,6 @@
 import json
 import os
+import time
 
 import matplotlib
 matplotlib.use("Agg")
@@ -60,6 +61,25 @@ def calculate_metrics(p, g, M=10):
     brier_score = calculate_brier_score(p, g)
     ece = calculate_ece(p, g, M)
     return float(brier_score), float(ece)
+
+
+def _load_json_object(path, retries=5, delay_seconds=0.1):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"Expected JSON object in {path}, got {type(payload).__name__}."
+                )
+            return payload
+        except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError) as exc:
+            last_exc = exc
+            if attempt + 1 < retries:
+                time.sleep(delay_seconds * (attempt + 1))
+
+    raise ValueError(f"Unable to load JSON object from {path} after {retries} attempts.") from last_exc
 
 
 def chunked(sequence, chunk_size):
@@ -160,11 +180,8 @@ def process_and_save(
     if save_plots:
         os.makedirs(plots_dir, exist_ok=True)
 
-    with open(json_path_p, "r", encoding="utf-8") as fp:
-        dict_p = json.load(fp)
-
-    with open(json_path_g, "r", encoding="utf-8") as fg:
-        dict_g = json.load(fg)
+    dict_p = _load_json_object(json_path_p)
+    dict_g = _load_json_object(json_path_g)
 
     results = []
     metrics_dict = {}

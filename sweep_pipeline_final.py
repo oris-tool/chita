@@ -39,7 +39,8 @@ DATASET_FAMILY_SCALE_FREE = "scale_free"
 RUN_DIR_PREFIX = "sweep_"
 RUN_COMPLETION_SENTINEL = "_run_completed.json"
 PROGRESS_DIR_NAME = "_progress"
-DEFAULT_MAX_WORKERS = max(1, (os.cpu_count() or 1) // 2)
+# DEFAULT_MAX_WORKERS = max(1, (os.cpu_count() or 1) // 2)
+DEFAULT_MAX_WORKERS = max(1, (os.cpu_count() or 1))
 SAVE_PRECISION_PLOTS = os.environ.get("CHITA_SAVE_PRECISION_PLOTS", "0") == "1"
 LOG_PRECISION_METRICS = os.environ.get("CHITA_LOG_PRECISION_METRICS", "0") == "1"
 SAVE_COMPARISON_CSVS = os.environ.get("CHITA_SAVE_COMPARISON_CSVS", "1") == "1"
@@ -122,7 +123,9 @@ DATASET_PROFILES = {
         n_subjects=100,
         time_limit_hours=TIME_LIMIT_HOURS,
         # internal_contacts=(32, 2500, 5000, 10000),
-        internal_contacts=(2500,),
+        # internal_contacts=(2500,),
+        # internal_contacts=(5000,),
+        internal_contacts=(10000,),
         effective_external_contacts=15,
         total_external_contacts=1000,
         total_symptom_observations=1000,
@@ -586,6 +589,45 @@ def _is_valid_path(path_value):
     return isinstance(path_value, str) and os.path.exists(path_value)
 
 
+def _is_populated_file(path_value):
+    return _is_valid_path(path_value) and os.path.isfile(path_value) and os.path.getsize(path_value) > 0
+
+
+def _is_valid_json_object_file(path_value):
+    if not _is_populated_file(path_value):
+        return False
+    try:
+        return isinstance(read_json(path_value), dict)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+
+
+def ensure_analysis_tracks_path(analysis_dir, analysis_path, parameter_bundle, iterations, time_step_hours, case_id=None):
+    if _is_valid_json_object_file(analysis_path):
+        return analysis_path
+
+    if _is_populated_file(analysis_path):
+        corrupt_path = f"{analysis_path}.corrupt.{int(time.time())}"
+        with contextlib.suppress(OSError):
+            shutil.move(analysis_path, corrupt_path)
+
+    run_stpn_analysis(
+        parameter_bundle=parameter_bundle,
+        analysis_dir=analysis_dir,
+        iterations=iterations,
+        cache_dir=None,
+        repo_root=".",
+        time_step_hours=time_step_hours,
+        case_id=case_id,
+    )
+    regenerated_path = find_generated_file(analysis_dir, f"_tracks_it{iterations}.json")
+    if not _is_populated_file(regenerated_path):
+        raise ValueError(
+            f"Regenerating analysis tracks did not produce a populated file: {regenerated_path}"
+        )
+    return regenerated_path
+
+
 def _flip_observation_result(value):
     if isinstance(value, bool):
         return not value
@@ -911,9 +953,25 @@ def regenerate_selected_run_plots(comparison_summary, time_step_hours, iteration
     python_analysis = comparison_summary.get("python_analysis", {})
     analysis_path = java_analysis.get("analysis_path")
     baseline_path = python_analysis.get("baseline_path")
+    parameter_bundle_path = java_analysis.get("parameter_bundle_path")
 
-    if not _is_valid_path(analysis_path):
-        analysis_path = find_generated_file(comparison_dir, f"_tracks_it{iterations}.json")
+    if not _is_populated_file(analysis_path):
+        if _is_valid_path(parameter_bundle_path):
+            parameter_bundle = read_json(parameter_bundle_path)
+            analysis_path = ensure_analysis_tracks_path(
+                java_analysis["analysis_dir"],
+                analysis_path,
+                parameter_bundle,
+                iterations,
+                time_step_hours,
+                case_id=comparison_summary.get("parameter_case_id"),
+            )
+        else:
+            analysis_path = find_generated_file(comparison_dir, f"_tracks_it{iterations}.json")
+            if not _is_populated_file(analysis_path):
+                raise FileNotFoundError(
+                    f"Unable to regenerate analysis tracks for run {run_id}: {analysis_path}"
+                )
     if not _is_valid_path(ground_truth_path):
         raise FileNotFoundError(f"Ground-truth path is invalid for run {run_id}: {ground_truth_path}")
     if not _is_valid_path(baseline_path):
@@ -939,8 +997,41 @@ def regenerate_selected_run_plots(comparison_summary, time_step_hours, iteration
         save_plots=True,
     )
 
+    precision_dir = os.path.join(comparison_dir, "precision_metrics")
+    ensure_dir(precision_dir)
+    prediction_metrics_summary = process_and_save(
+        analysis_path,
+        ground_truth_path,
+        M=10,
+        metrics_output=os.path.join(precision_dir, "metrics_prediction.json"),
+        plots_dir=os.path.join(precision_dir, "numericalAnalysis", "plots"),
+        save_plots=True,
+        verbose=False,
+        include_scatter_coordinates=True,
+    )
+    baseline_metrics_summary = process_and_save(
+        baseline_path,
+        ground_truth_path,
+        M=10,
+        metrics_output=os.path.join(precision_dir, "metrics_baseline.json"),
+        plots_dir=os.path.join(precision_dir, "simulatedBaseline", "plots"),
+        save_plots=True,
+        verbose=False,
+        include_scatter_coordinates=True,
+    )
+
     comparison_summary.setdefault("java_analysis", {})["analysis_path"] = analysis_path
     comparison_summary["java_analysis"]["subject_curve_plots"] = subject_curve_plots
+    comparison_summary["precision_metrics"] = {
+        "prediction_metrics_path": os.path.join(precision_dir, "metrics_prediction.json"),
+        "baseline_metrics_path": os.path.join(precision_dir, "metrics_baseline.json"),
+        "prediction_mean_brier": prediction_metrics_summary["mean_brier_score"],
+        "prediction_mean_ece": prediction_metrics_summary["mean_ece"],
+        "baseline_mean_brier": baseline_metrics_summary["mean_brier_score"],
+        "baseline_mean_ece": baseline_metrics_summary["mean_ece"],
+        "prediction_plots_dir": prediction_metrics_summary["plots_dir"],
+        "baseline_plots_dir": baseline_metrics_summary["plots_dir"],
+    }
     comparison_summary["comparison_metrics"] = comparison_metrics
     return comparison_summary
 
@@ -1446,11 +1537,14 @@ def run_comparison_task(
     run_id = f"{dataset_run['dataset_stem']}__{case_run_code}__{quartile_label}"
 
     analysis_path = java_summary.get("analysis_path")
-    if not _is_valid_path(analysis_path):
-        analysis_path = find_generated_file(
-            java_summary["analysis_dir"],
-            f"_tracks_it{iterations}.json",
-        )
+    analysis_path = ensure_analysis_tracks_path(
+        java_summary["analysis_dir"],
+        analysis_path,
+        parameter_case["parameter_bundle"],
+        iterations,
+        time_step_hours,
+        case_id=case_id,
+    )
 
     baseline_path = python_summary["averaged_results_path"]
     ground_truth_path = dataset_run["ground_truth_path"]
