@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 import dataset_graph as dg
 import scale_free_dataset_graph as sfdg
+import small_world_dataset_graph as swdg
 import sweep_pipeline as sp
 from compute_precision_metrics import process_and_save
 from run_n_simulations import run_dataset_simulations
@@ -35,6 +36,7 @@ QUANTILE = 4
 TIME_LIMIT_HOURS = 2016.0
 DATASET_FAMILY_BUBBLE = "bubble"
 DATASET_FAMILY_SCALE_FREE = "scale_free"
+DATASET_FAMILY_SMALL_WORLD = "small_world"
 
 RUN_DIR_PREFIX = "sweep_"
 RUN_COMPLETION_SENTINEL = "_run_completed.json"
@@ -106,6 +108,8 @@ class DatasetProfile:
     total_symptom_observations: Optional[int] = None
     total_test_observations: Optional[int] = None
     barabasi_m: Optional[int] = None
+    watts_k: Optional[int] = None
+    rewire_probability: Optional[float] = None
 
 
 DATASET_PROFILES = {
@@ -131,6 +135,19 @@ DATASET_PROFILES = {
         total_symptom_observations=1000,
         total_test_observations=1000,
         barabasi_m=3,
+    ),
+    DATASET_FAMILY_SMALL_WORLD: DatasetProfile(
+        family=DATASET_FAMILY_SMALL_WORLD,
+        generator_module_name="small_world_dataset_graph",
+        n_subjects=100,
+        time_limit_hours=TIME_LIMIT_HOURS,
+        internal_contacts=(1800, 3600, 7200),
+        effective_external_contacts=15,
+        total_external_contacts=1000,
+        total_symptom_observations=1000,
+        total_test_observations=1000,
+        watts_k=5,
+        rewire_probability=0.1,
     ),
 }
 
@@ -287,6 +304,20 @@ def generate_dataset_for_profile(dataset_profile, dataset_path, internal_contact
             seed=seed,
         )
         payload = sfdg.save_dataset_event_sequence(dataset, dataset_path)
+    elif dataset_profile.family == DATASET_FAMILY_SMALL_WORLD:
+        dataset = swdg.simulate_small_world_introduction(
+            n_nodes=dataset_profile.n_subjects,
+            total_internal_contacts=internal_contacts,
+            total_external_contacts=dataset_profile.total_external_contacts,
+            total_symptom_observations=dataset_profile.total_symptom_observations,
+            total_test_observations=dataset_profile.total_test_observations,
+            tmax_after_intro=dataset_profile.time_limit_hours,
+            effective_external_contacts=dataset_profile.effective_external_contacts,
+            watts_k=dataset_profile.watts_k,
+            rewire_probability=dataset_profile.rewire_probability,
+            seed=seed,
+        )
+        payload = swdg.save_dataset_event_sequence(dataset, dataset_path)
     else:
         raise ValueError(f"Unsupported dataset family: {dataset_profile.family}")
 

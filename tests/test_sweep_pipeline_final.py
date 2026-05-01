@@ -14,11 +14,13 @@ from sweep_pipeline_final import (
 
 
 class SweepPipelineFinalSelectionTest(unittest.TestCase):
-    def test_dataset_profiles_keep_warmup_case_for_both_families(self):
+    def test_dataset_profiles_include_expected_contact_targets(self):
         self.assertIn(32, DATASET_PROFILES["bubble"].internal_contacts)
-        self.assertIn(32, DATASET_PROFILES["scale_free"].internal_contacts)
+        self.assertEqual(DATASET_PROFILES["scale_free"].internal_contacts, (10000,))
+        self.assertEqual(DATASET_PROFILES["small_world"].internal_contacts, (1800, 3600, 7200))
         self.assertEqual(dataset_filename(DATASET_PROFILES["bubble"], 200), "dataset_bubble_200.json")
         self.assertEqual(dataset_filename(DATASET_PROFILES["scale_free"], 2500), "dataset_scale_free_2500.json")
+        self.assertEqual(dataset_filename(DATASET_PROFILES["small_world"], 1800), "dataset_small_world_1800.json")
 
     def test_selection_manifest_stays_grouped_by_dataset_stem(self):
         comparison_summaries = [
