@@ -18,6 +18,7 @@ import sweep_pipeline_n_iteration as iteration_sweep
 DATASET_NOISE_DIR = "dataset_noise"
 GROUND_TRUTH_DIR = "ground_truth"
 OBSERVED_ONE_RUN_DIR = "observed_one_run"
+LEGACY_PARAMETERS_JSON_PATH = "parameters.json"
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,91 @@ class GtsDatasetSpec:
 
 def read_json(path):
     return sp.read_json(path)
+
+
+def legacy_parameter_family_key(family):
+    return {
+        "infectiousness": "infectiousness",
+        "healing": "healing",
+        "symptoms": "symptoms",
+        "isolating": "isolating",
+        "symptomsOnset": "symptomsOnset",
+        "notificationToIsolation": "notification_to_isolation",
+        "symptomaticPeriod": "symptomatic_period",
+    }[family]
+
+
+def legacy_parameter_unit_measure(family):
+    if family in {"notificationToIsolation", "symptomaticPeriod"}:
+        return "days"
+    return "hours"
+
+
+def convert_legacy_parameter_transition(family, transition):
+    if family == "symptoms":
+        true_probability = float(transition["p"])
+        return {
+            "unit_measure": "probability",
+            "true": true_probability,
+            "false": 1.0 - true_probability,
+        }
+
+    if family == "notificationToIsolation":
+        p1 = float(transition["p"])
+        return {
+            "unit_measure": legacy_parameter_unit_measure(family),
+            "distribution": "hyperexponential",
+            "p1": p1,
+            "p2": 1.0 - p1,
+            "lambda1": float(transition["lambda1"]),
+            "lambda2": float(transition["lambda2"]),
+        }
+
+    return {
+        "unit_measure": legacy_parameter_unit_measure(family),
+        "erlang_stages": int(transition["n"]),
+        "erlang_lambda": float(transition["lambdaErl"]),
+        "exponential_lambda": float(transition["lambdaExp"]),
+    }
+
+
+def load_parameter_space_from_legacy_json(path):
+    payload = read_json(path)
+    transitions = {}
+    for family in sp.PARAMETER_FAMILY_ORDER:
+        legacy_key = legacy_parameter_family_key(family)
+        transitions[family] = {}
+        for level in sp.PARAMETER_LEVEL_ORDER:
+            transitions[family][level] = convert_legacy_parameter_transition(
+                family,
+                payload[legacy_key][level],
+            )
+
+    return {
+        "source_path": os.path.abspath(path),
+        "source_format": "legacy_json",
+        "unit_measure": "mixed",
+        "levels": list(sp.PARAMETER_LEVEL_ORDER),
+        "transitions": transitions,
+    }
+
+
+def load_mid_parameter_bundle(parameter_ods_path, repo_root):
+    ods_path = os.path.abspath(parameter_ods_path)
+    if os.path.exists(ods_path):
+        parameter_space = sp.load_parameter_space_from_ods(ods_path)
+    else:
+        legacy_path = os.path.join(repo_root, LEGACY_PARAMETERS_JSON_PATH)
+        if not os.path.exists(legacy_path):
+            raise FileNotFoundError(
+                f"Parameter spreadsheet not found: {ods_path}. "
+                f"Fallback legacy parameter JSON not found: {legacy_path}"
+            )
+        parameter_space = load_parameter_space_from_legacy_json(legacy_path)
+    return parameter_space, sp.resolve_uniform_parameter_bundle(
+        parameter_space,
+        sp.GROUND_TRUTH_PARAMETER_LEVEL,
+    )
 
 
 def _json_files(directory):
@@ -561,8 +647,7 @@ def main():
         return
 
     output_root = sp.ensure_dir(os.path.abspath(args.output_root))
-    parameter_space = sp.load_parameter_space_from_ods(os.path.abspath(args.parameter_ods_path))
-    mid_bundle = sp.resolve_uniform_parameter_bundle(parameter_space, sp.GROUND_TRUTH_PARAMETER_LEVEL)
+    parameter_space, mid_bundle = load_mid_parameter_bundle(args.parameter_ods_path, repo_root)
     parameter_manifest_paths = sp.write_parameter_case_manifest(output_root, [mid_bundle])
     write_gts_run_readme(output_root, gts_root, specs, args, parameter_manifest_paths)
 
