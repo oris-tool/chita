@@ -101,6 +101,13 @@ def resolve_referenced_path(raw_path, repo_root, gts_root, summary_dir):
     raise FileNotFoundError(f"Could not resolve referenced path '{raw_path}'. Searched: {searched}")
 
 
+def try_resolve_referenced_path(raw_path, repo_root, gts_root, summary_dir):
+    try:
+        return resolve_referenced_path(raw_path, repo_root, gts_root, summary_dir)
+    except FileNotFoundError:
+        return None
+
+
 def validate_dataset_payload(dataset_path):
     payload = read_json(dataset_path)
     required = ("events", "n_subjects", "time_limit", "n_contacts")
@@ -125,13 +132,22 @@ def select_ground_truth_path(dataset_name, dataset_dir):
         reps = _simulated_reps_count(path)
         if reps is not None:
             candidates.append((reps, path))
-    if not candidates:
-        raise FileNotFoundError(
-            f"Dataset '{dataset_name}' is missing a precomputed averaged ground-truth file "
-            f"matching '*_simulated_*_reps.json' under {dataset_dir}."
-        )
-    candidates.sort(key=lambda item: (item[0], item[1]))
-    return candidates[-1][1], candidates[-1][0]
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[-1][1], candidates[-1][0]
+
+    simulated_candidates = [
+        path
+        for path in _json_files(dataset_dir)
+        if path.endswith("_simulated.json")
+    ]
+    if simulated_candidates:
+        return sorted(simulated_candidates)[0], None
+
+    raise FileNotFoundError(
+        f"Dataset '{dataset_name}' is missing a precomputed ground-truth file matching "
+        f"'*_simulated_*_reps.json' or '*_simulated.json' under {dataset_dir}."
+    )
 
 
 def select_clean_observed_simulated_path(dataset_dir, ground_truth_path):
@@ -234,46 +250,54 @@ def discover_gts_datasets(gts_root, repo_root=None):
         dataset_path = clean_dataset_path
         observed_simulated_path = clean_observed_path
         if contact_noise_summary is not None:
-            dataset_path = resolve_referenced_path(
+            resolved_dataset_path = try_resolve_referenced_path(
                 contact_noise_summary["noisy_dataset_path"],
                 repo_root,
                 gts_root,
                 os.path.dirname(contact_noise_summary_path),
             )
+            if resolved_dataset_path is not None:
+                dataset_path = resolved_dataset_path
         if observed_one_run_summary is not None:
-            dataset_path = resolve_referenced_path(
+            resolved_dataset_path = try_resolve_referenced_path(
                 observed_one_run_summary["dataset_path"],
                 repo_root,
                 gts_root,
                 os.path.dirname(observed_one_run_summary_path),
             )
-            observed_simulated_path = resolve_referenced_path(
+            if resolved_dataset_path is not None:
+                dataset_path = resolved_dataset_path
+            resolved_observed_path = try_resolve_referenced_path(
                 observed_one_run_summary["observed_simulated_path"],
                 repo_root,
                 gts_root,
                 os.path.dirname(observed_one_run_summary_path),
             )
+            if resolved_observed_path is not None:
+                observed_simulated_path = resolved_observed_path
         if gt_summary is not None:
-            ground_truth_path = resolve_referenced_path(
-                gt_summary["averaged_results_path"],
+            resolved_ground_truth_path = try_resolve_referenced_path(
+                gt_summary.get("averaged_results_path"),
                 repo_root,
                 gts_root,
                 os.path.dirname(gt_summary_path),
             )
-            clean_observed_path = resolve_referenced_path(
-                gt_summary["observed_simulated_path"],
+            if resolved_ground_truth_path is not None:
+                ground_truth_path = resolved_ground_truth_path
+            resolved_clean_observed_path = try_resolve_referenced_path(
+                gt_summary.get("observed_simulated_path"),
                 repo_root,
                 gts_root,
                 os.path.dirname(gt_summary_path),
             )
+            if resolved_clean_observed_path is not None:
+                clean_observed_path = resolved_clean_observed_path
+                if observed_simulated_path is None:
+                    observed_simulated_path = resolved_clean_observed_path
             reps_count = gt_summary.get("rep_done", reps_count)
 
         if observed_simulated_path is None:
-            raise FileNotFoundError(
-                f"Dataset '{dataset_name}' is missing an observed simulation file. Expected either "
-                f"{observed_one_run_summary_path} with 'observed_simulated_path' or a '*_simulated.json' file "
-                f"under {dataset_dir}."
-            )
+            observed_simulated_path = ground_truth_path
 
         dataset_payload = validate_dataset_payload(dataset_path)
         tests_count = sum(1 for event in dataset_payload["events"] if event.get("type") == "Test")
