@@ -19,6 +19,7 @@ DATASET_NOISE_DIR = "dataset_noise"
 GROUND_TRUTH_DIR = "ground_truth"
 OBSERVED_ONE_RUN_DIR = "observed_one_run"
 LEGACY_PARAMETERS_JSON_PATH = "parameters.json"
+DEFAULT_GTS_JAVA_ITERATIONS = tuple(range(0, 9))
 
 
 @dataclass(frozen=True)
@@ -580,8 +581,8 @@ def main():
         "--java-iterations",
         nargs="+",
         type=int,
-        default=list(iteration_sweep.DEFAULT_JAVA_ITERATIONS),
-        help="Java iteration counts to test. Default: 1 2 3 4 5 6 7 8",
+        default=list(DEFAULT_GTS_JAVA_ITERATIONS),
+        help="Logical Java iteration counts to test. Default: 0 1 2 3 4 5 6 7 8",
     )
     parser.add_argument(
         "--parameter-ods-path",

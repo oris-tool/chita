@@ -91,8 +91,8 @@ def parse_java_iterations(values):
         raise ValueError("At least one Java iteration count is required.")
 
     parsed = sorted({int(value) for value in values})
-    if any(value <= 0 for value in parsed):
-        raise ValueError("Java iteration counts must all be greater than 0.")
+    if any(value < 0 for value in parsed):
+        raise ValueError("Java iteration counts must all be greater than or equal to 0.")
     return parsed
 
 
@@ -637,6 +637,7 @@ def run_parameter_bundle_iteration_sweep(
     sp.write_json(bundle_summary_path, bundle_summary)
 
     for java_iterations in java_iterations_values:
+        effective_java_iterations = max(1, java_iterations)
         iteration_dir = sp.ensure_dir(os.path.join(bundle_dir, iteration_run_dir_name(java_iterations)))
         iteration_run_name = f"{run_name}__jit_{java_iterations}"
         run_inputs = sp.prepare_run_inputs_from_shared_ground_truth(
@@ -651,6 +652,7 @@ def run_parameter_bundle_iteration_sweep(
             "run_dir": iteration_dir,
             "status": "running",
             "java_iterations": java_iterations,
+            "effective_java_iterations": effective_java_iterations,
             "time_limit": time_limit_days,
             "n_subjects": n_subjects,
             "total_internal_contacts": total_internal_contacts,
@@ -682,12 +684,12 @@ def run_parameter_bundle_iteration_sweep(
             java_result = run_java_analysis_with_iterations(
                 repo_root=repo_root,
                 run_dir=iteration_dir,
-                java_iterations=java_iterations,
+                java_iterations=effective_java_iterations,
                 time_step_hours=time_step_hours,
                 parameter_bundle_path=parameter_bundle_path,
                 parameter_bundle=parameter_bundle,
             )
-            analysis_path = sp.find_generated_file(iteration_dir, f"_tracks_it{java_iterations}.json")
+            analysis_path = sp.find_generated_file(iteration_dir, f"_tracks_it{effective_java_iterations}.json")
             baseline_runtime_budget_seconds = max(
                 baseline_runtime_multiplier * java_result["analysis_runtime_seconds"],
                 0.0,
@@ -757,6 +759,7 @@ def run_parameter_bundle_iteration_sweep(
             iteration_summary["analysis"] = {
                 "analysis_path": analysis_path,
                 "java_iterations": java_iterations,
+                "effective_java_iterations": effective_java_iterations,
                 "stpn_solution_path": java_result["stpn_solution_path"],
                 "analysis_runtime_seconds": java_result["analysis_runtime_seconds"],
                 "analysis_wall_runtime_seconds": java_result["analysis_wall_runtime_seconds"],
