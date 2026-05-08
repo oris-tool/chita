@@ -152,6 +152,165 @@ def load_mid_parameter_case(parameter_json_path):
     return mid_case
 
 
+def gt_results_summary_path(save_path, dataset_stem):
+    suffix = dataset_stem[len("dataset_") :] if dataset_stem.startswith("dataset_") else dataset_stem
+    return os.path.join(save_path, f"gt_results_{suffix}.json")
+
+
+def resolve_existing_path(path_value, candidate_roots):
+    if not isinstance(path_value, str) or not path_value:
+        return None
+
+    candidates = [path_value] if os.path.isabs(path_value) else [os.path.abspath(path_value)]
+    if not os.path.isabs(path_value):
+        candidates.extend(os.path.join(root, path_value) for root in candidate_roots)
+
+    for candidate in candidates:
+        normalized = os.path.abspath(candidate)
+        if os.path.exists(normalized):
+            return normalized
+    return None
+
+
+def parse_gt_reps_count(dataset_stem, filename):
+    prefix = f"{dataset_stem}_simulated_"
+    suffix = "_reps.json"
+    if not filename.startswith(prefix) or not filename.endswith(suffix):
+        return None
+    raw_count = filename[len(prefix) : -len(suffix)]
+    try:
+        return int(raw_count)
+    except ValueError:
+        return None
+
+
+def choose_existing_gt_average(ground_truth_dir, dataset_stem):
+    if not os.path.isdir(ground_truth_dir):
+        return None
+
+    candidates = []
+    for filename in os.listdir(ground_truth_dir):
+        reps_count = parse_gt_reps_count(dataset_stem, filename)
+        if reps_count is not None:
+            path = os.path.join(ground_truth_dir, filename)
+            if os.path.isfile(path):
+                candidates.append((reps_count, path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1]
+
+
+def choose_first_existing_file(directory, suffix):
+    if not os.path.isdir(directory):
+        return None
+    matches = [
+        os.path.join(directory, filename)
+        for filename in os.listdir(directory)
+        if filename.endswith(suffix) and os.path.isfile(os.path.join(directory, filename))
+    ]
+    if not matches:
+        return None
+    matches.sort(key=os.path.getmtime, reverse=True)
+    return os.path.abspath(matches[0])
+
+
+def normalize_cached_gt_summary(cached_summary, save_path, dataset_stem, summary_path):
+    candidate_roots = [
+        save_path,
+        os.path.dirname(summary_path),
+        os.path.join(save_path, "ground_truth", dataset_stem),
+    ]
+    averaged_results_path = resolve_existing_path(
+        cached_summary.get("averaged_results_path"),
+        candidate_roots,
+    )
+    if averaged_results_path is None:
+        return None
+
+    normalized = dict(cached_summary)
+    normalized["averaged_results_path"] = averaged_results_path
+    for key in (
+        "observed_simulated_path",
+        "dataset_path",
+        "effective_dataset_path",
+        "pruned_dataset_path",
+        "dkw_csv_path",
+        "suppressed_stdout_log_path",
+    ):
+        resolved = resolve_existing_path(cached_summary.get(key), candidate_roots)
+        if resolved is not None:
+            normalized[key] = resolved
+    return normalized
+
+
+def reconstruct_gt_summary_from_artifacts(save_path, dataset_path, dataset_stem, time_step_hours):
+    ground_truth_dir = os.path.join(save_path, "ground_truth", dataset_stem)
+    selected_average = choose_existing_gt_average(ground_truth_dir, dataset_stem)
+    if selected_average is None:
+        return None
+
+    rep_done, averaged_results_path = selected_average
+    ground_truth_dataset_path = os.path.join(ground_truth_dir, os.path.basename(dataset_path))
+    observed_simulated_path = os.path.join(ground_truth_dir, f"{dataset_stem}_simulated.json")
+    if not os.path.exists(observed_simulated_path):
+        observed_simulated_path = None
+
+    dkw_csv_path = choose_first_existing_file(os.path.join(ground_truth_dir, "plots"), "_dkw_band.csv")
+    suppressed_stdout_log_path = choose_first_existing_file(ground_truth_dir, "_stdout.log")
+    return {
+        "dataset_path": os.path.abspath(ground_truth_dataset_path if os.path.exists(ground_truth_dataset_path) else dataset_path),
+        "effective_dataset_path": os.path.abspath(ground_truth_dataset_path if os.path.exists(ground_truth_dataset_path) else dataset_path),
+        "pruned_dataset_path": None,
+        "dataset_dir": os.path.abspath(ground_truth_dir),
+        "dataset_stem": os.path.splitext(os.path.abspath(ground_truth_dataset_path))[0],
+        "rep_done": rep_done,
+        "actual_runtime_seconds": None,
+        "max_runtime_seconds": None,
+        "run_until_convergence": True,
+        "convergence_reached": None,
+        "convergence_scores": [],
+        "convergence_threshold": 1e-8,
+        "observed_simulated_path": None if observed_simulated_path is None else os.path.abspath(observed_simulated_path),
+        "averaged_results_path": os.path.abspath(averaged_results_path),
+        "plots_dir": os.path.join(ground_truth_dir, "plots"),
+        "dkw_csv_path": dkw_csv_path,
+        "granularity": time_step_hours,
+        "time_step_hours": time_step_hours,
+        "positive_test_pruning": None,
+        "suppressed_stdout_log_path": suppressed_stdout_log_path,
+        "reconstructed_from_existing_gt_artifacts": True,
+    }
+
+
+def load_existing_gt_results(save_path, dataset_path, time_step_hours):
+    dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
+    summary_path = gt_results_summary_path(save_path, dataset_stem)
+    if os.path.exists(summary_path):
+        cached_summary = final.read_cached_json(summary_path)
+        if cached_summary:
+            normalized = normalize_cached_gt_summary(
+                cached_summary,
+                save_path=save_path,
+                dataset_stem=dataset_stem,
+                summary_path=summary_path,
+            )
+            if normalized is not None:
+                final.write_json(summary_path, normalized)
+                return normalized, summary_path
+
+    reconstructed = reconstruct_gt_summary_from_artifacts(
+        save_path=save_path,
+        dataset_path=dataset_path,
+        dataset_stem=dataset_stem,
+        time_step_hours=time_step_hours,
+    )
+    if reconstructed is not None:
+        final.write_json(summary_path, reconstructed)
+        return reconstructed, summary_path
+    return None, summary_path
+
+
 def iteration_run_id(dataset_stem, parameter_case, java_iterations, quartile_label):
     return (
         f"{dataset_stem}__{parameter_case['case_run_code']}"
@@ -872,14 +1031,11 @@ def main(argv=None):
     ground_truth_results_by_stem = {}
     for index, dataset_path in enumerate(final.progress(dataset_paths, desc="Running GT simulations"), start=1):
         dataset_stem = os.path.splitext(os.path.basename(dataset_path))[0]
-        gt_results_path = dataset_path.replace("dataset", "gt_results")
-        gt_results = None
-        if os.path.exists(gt_results_path):
-            cached = final.read_json(gt_results_path)
-            if final._is_valid_path(cached.get("observed_simulated_path")) and final._is_valid_path(
-                cached.get("averaged_results_path")
-            ):
-                gt_results = cached
+        gt_results, gt_results_path = load_existing_gt_results(
+            save_path=save_path,
+            dataset_path=dataset_path,
+            time_step_hours=TIME_STEP,
+        )
 
         if gt_results is None:
             ground_truth_dataset_path = final.ensure_ground_truth_simulation_input(
