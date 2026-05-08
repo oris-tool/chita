@@ -71,12 +71,51 @@ ITERATION_SWEEP_COLUMNS.insert(
 )
 
 
-def fixed_dataset_targets():
-    return [
+def dataset_target_aliases(dataset_profile, internal_contacts):
+    filename = final.dataset_filename(dataset_profile, internal_contacts)
+    stem = os.path.splitext(filename)[0]
+    return {
+        dataset_profile.family,
+        f"{dataset_profile.family}_{internal_contacts}",
+        stem,
+        filename,
+    }
+
+
+def fixed_dataset_targets(skip_datasets=None):
+    targets = [
         (DATASET_PROFILES[family], internal_contacts)
         for family in DATASET_PROFILE_ORDER
         for internal_contacts in DATASET_PROFILES[family].internal_contacts
     ]
+    skip_values = {
+        str(value).strip()
+        for value in (skip_datasets or [])
+        if str(value).strip()
+    }
+    if not skip_values:
+        return targets
+
+    known_aliases = set()
+    for dataset_profile, internal_contacts in targets:
+        known_aliases.update(dataset_target_aliases(dataset_profile, internal_contacts))
+
+    unknown_values = sorted(skip_values - known_aliases)
+    if unknown_values:
+        raise ValueError(
+            "Unsupported --skip-datasets value(s): "
+            f"{', '.join(unknown_values)}. "
+            f"Expected one or more of: {', '.join(sorted(known_aliases))}"
+        )
+
+    filtered_targets = [
+        (dataset_profile, internal_contacts)
+        for dataset_profile, internal_contacts in targets
+        if dataset_target_aliases(dataset_profile, internal_contacts).isdisjoint(skip_values)
+    ]
+    if not filtered_targets:
+        raise ValueError("--skip-datasets removed every dataset target.")
+    return filtered_targets
 
 
 def iteration_label(java_iterations):
@@ -87,11 +126,11 @@ def effective_java_iterations(java_iterations):
     return max(1, int(java_iterations))
 
 
-def validate_java_iterations(java_iterations_values):
-    max_n_subjects_by_family = {
-        family: profile.n_subjects
-        for family, profile in DATASET_PROFILES.items()
-    }
+def validate_java_iterations(java_iterations_values, dataset_targets=None):
+    targets = dataset_targets if dataset_targets is not None else fixed_dataset_targets()
+    max_n_subjects_by_family = {}
+    for dataset_profile, _internal_contacts in targets:
+        max_n_subjects_by_family[dataset_profile.family] = dataset_profile.n_subjects
     for value in java_iterations_values:
         too_small_families = [
             family
@@ -693,9 +732,18 @@ def parse_args(argv=None):
         help="Optional filtering applied only to the observed_simulated.json copied into each run.",
     )
     parser.add_argument(
+        "--skip-datasets",
+        nargs="*",
+        default=[],
+        help=(
+            "Fixed dataset targets to skip. Accepts family names such as bubble, scale_free, "
+            "small_world, stems such as dataset_scale_free_2500, or filenames."
+        ),
+    )
+    parser.add_argument(
         "--reuse-run",
         default=None,
-        help="Existing results/final_mid_iteration_sweep_* directory to reuse.",
+        help="Existing results/final_mid_iteration_sweep_* directory to resume or refresh.",
     )
     parser.add_argument(
         "--only-selected-plots",
@@ -712,8 +760,6 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if args.reuse_run and not args.only_selected_plots:
-        raise ValueError("--reuse-run currently requires --only-selected-plots.")
     if args.quartile_label and not args.only_selected_plots:
         raise ValueError("--quartile-label can only be used together with --only-selected-plots.")
     if args.only_selected_plots:
@@ -732,15 +778,31 @@ def main(argv=None):
         return
 
     java_iterations_values = iteration_sweep.parse_java_iterations(args.java_iterations)
-    validate_java_iterations(java_iterations_values)
+    dataset_targets = fixed_dataset_targets(skip_datasets=args.skip_datasets)
+    validate_java_iterations(java_iterations_values, dataset_targets=dataset_targets)
     parameter_case = load_mid_parameter_case(args.parameter_json_path)
-    save_path = final.ensure_dir(os.path.abspath(args.output_root))
+    if args.reuse_run:
+        save_path = final.resolve_existing_run_path(args.reuse_run)
+    else:
+        save_path = final.ensure_dir(os.path.abspath(args.output_root))
     cache_path = final.ensure_dir(os.path.join("results", "cache"))
     repo_root = os.path.abspath(os.path.dirname(__file__))
     include_moving_avg_metrics = not args.disable_moving_avg_metrics
+    metadata_path = os.path.join(save_path, "run_metadata.json")
+    existing_metadata = {}
+    if os.path.exists(metadata_path):
+        existing_metadata = final.read_json(metadata_path)
+    selected_dataset_targets = [
+        {
+            "dataset_family": dataset_profile.family,
+            "internal_contacts": internal_contacts,
+            "dataset_stem": os.path.splitext(final.dataset_filename(dataset_profile, internal_contacts))[0],
+        }
+        for dataset_profile, internal_contacts in dataset_targets
+    ]
 
     final.write_json(
-        os.path.join(save_path, "run_metadata.json"),
+        metadata_path,
         {
             "save_path": save_path,
             "cache_path": cache_path,
@@ -749,6 +811,8 @@ def main(argv=None):
                 final.dataset_profile_metadata(DATASET_PROFILES[family])
                 for family in DATASET_PROFILE_ORDER
             ],
+            "selected_dataset_targets": selected_dataset_targets,
+            "skipped_datasets": list(args.skip_datasets),
             "time_step_hours": TIME_STEP,
             "java_iterations": java_iterations_values,
             "parameter_case_code": parameter_case["case_run_code"],
@@ -761,12 +825,16 @@ def main(argv=None):
             "observation_noise_event_types": list(final.OBSERVATION_NOISE_EVENT_TYPES),
             "observed_test_ablation": args.observed_test_ablation,
             "moving_avg_metrics_enabled": include_moving_avg_metrics,
-            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "started_at": existing_metadata.get(
+                "started_at",
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+            "resumed_run": bool(args.reuse_run),
+            "resumed_at": datetime.now().isoformat(timespec="seconds") if args.reuse_run else None,
         },
     )
 
     stage_name = "stage1_dataset_generation"
-    dataset_targets = fixed_dataset_targets()
     final.write_stage_checkpoint(save_path, stage_name, 0, len(dataset_targets), status="running")
 
     dataset_paths = []
