@@ -29,7 +29,7 @@ from utils import normalize_stpn_parameter_bundle, precompute_stpn_solution, run
 
 # 0. Define paths and dataset parameters
 TIME_STEP = 1  # hours
-INTERNAL_STEPS = 2  # 0 means just external contacts, 1 means external + internal, 2 means one more propagation layer
+INTERNAL_STEPS = 3
 QUANTILE = 4
 
 TIME_LIMIT_HOURS = 2016.0
