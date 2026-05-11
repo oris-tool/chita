@@ -488,7 +488,7 @@ def run_python_analysis_iteration_task(
         dataset_path=analysis_dataset_path,
         rep=None,
         run_until_convergence=False,
-        iterations_cap=10,
+        iterations_cap=4,
         convergence_threshold=1e-6,
         fine_grained=False,
         dataset_label=f"{dataset_run['dataset_stem']}_{iteration_label(logical_iterations)}",
