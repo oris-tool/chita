@@ -1415,7 +1415,7 @@ public class STPNAnalysis {
 
                                     double newValue = r_int * q * solutionValue * probabilityTrack[sampleTime] + previousValue;
 
-                                    probabilityTrack[sampleTime] *= (1.0 - (q * r_int)); // This is the old 
+                                    probabilityTrack[sampleTime] *= (1.0 - (q * r_int));
                                     currentTrack[sampleTime] = newValue;
                                 }
                                 offset_internal++;

@@ -118,7 +118,7 @@ DATASET_PROFILES = {
         generator_module_name="dataset_graph",
         n_subjects=8,
         time_limit_hours=TIME_LIMIT_HOURS,
-        internal_contacts=(32, 200, 400, 800),
+        internal_contacts=(200, 400, 800),
         effective_external_contacts=3,
     ),
     DATASET_FAMILY_SCALE_FREE: DatasetProfile(
@@ -126,10 +126,7 @@ DATASET_PROFILES = {
         generator_module_name="scale_free_dataset_graph",
         n_subjects=100,
         time_limit_hours=TIME_LIMIT_HOURS,
-        # internal_contacts=(32, 2500, 5000, 10000),
-        # internal_contacts=(2500,),
-        # internal_contacts=(5000,),
-        internal_contacts=(1250,),
+        internal_contacts=(1250, 2500, 5000),
         effective_external_contacts=15,
         total_external_contacts=1000,
         total_symptom_observations=1000,
@@ -141,10 +138,7 @@ DATASET_PROFILES = {
         generator_module_name="small_world_dataset_graph",
         n_subjects=100,
         time_limit_hours=TIME_LIMIT_HOURS,
-        # internal_contacts=(1800, 3600, 7200),
-        # internal_contacts=(1800,),
-        # internal_contacts=(3600,),
-        internal_contacts=(7200,),
+        internal_contacts=(1800, 3600, 7200),
         effective_external_contacts=15,
         total_external_contacts=1000,
         total_symptom_observations=1000,
@@ -249,6 +243,42 @@ def resolve_existing_run_path(run_path):
     if not os.path.isdir(resolved_path):
         raise FileNotFoundError(f"Existing run directory not found: {resolved_path}")
     return resolved_path
+
+
+def _normalize_reused_run_value(value, save_path):
+    if not isinstance(value, str):
+        return value
+
+    resolved_save_path = os.path.abspath(save_path)
+    run_name = os.path.basename(resolved_save_path)
+    legacy_prefix = os.path.normpath(os.path.join("results", run_name))
+    repo_legacy_prefix = os.path.abspath(legacy_prefix)
+    normalized_value = os.path.normpath(value)
+
+    for prefix in (legacy_prefix, repo_legacy_prefix):
+        if normalized_value == prefix:
+            return resolved_save_path
+        if normalized_value.startswith(prefix + os.sep):
+            relative_path = os.path.relpath(normalized_value, prefix)
+            return os.path.join(resolved_save_path, relative_path)
+
+    return value
+
+
+def normalize_reused_run_paths(payload, save_path):
+    if isinstance(payload, dict):
+        for key, value in list(payload.items()):
+            if isinstance(value, (dict, list)):
+                normalize_reused_run_paths(value, save_path)
+            else:
+                payload[key] = _normalize_reused_run_value(value, save_path)
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            if isinstance(value, (dict, list)):
+                normalize_reused_run_paths(value, save_path)
+            else:
+                payload[index] = _normalize_reused_run_value(value, save_path)
+    return payload
 
 
 def dataset_profile_metadata(dataset_profile):
@@ -1900,6 +1930,7 @@ def refresh_selected_run_outputs(save_path, quartile_label, time_step_hours, ite
         )
 
     comparison_summaries = read_json(comparison_summary_json_path)
+    normalize_reused_run_paths(comparison_summaries, save_path)
     comparison_summaries.sort(key=lambda item: (item["dataset_stem"], item["parameter_case_id"]))
 
     notes_by_run, selection_manifest = build_notes_map_and_selection_manifest(comparison_summaries)

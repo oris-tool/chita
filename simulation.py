@@ -913,7 +913,7 @@ def simulate_one_iteration(
                             distortion,
                             parameter_bundle=parameter_bundle,
                         )
-        elif event_type == "Symptoms": # XXX Sintomi
+        elif event_type == "Symptoms":
             is_symptomatic = False
             for subject in involved_subjects:
                 if subjects[subject - 1].symptoms == SYMPTOMATIC:
@@ -921,22 +921,7 @@ def simulate_one_iteration(
                 elif subjects[subject - 1].symptoms == DEVELOPING_SYMPTOMS:
                     is_symptomatic = random.random() < 0.5
             event["result"] = is_symptomatic
-        elif event_type == "Test": # XXX Test
-            ## TODO add specificity to the test.
-            
-            # is_positive = False
-            # for subject in involved_subjects:
-            #     if subjects[subject - 1].state == INFECTIOUS or subjects[subject - 1].state == ISOLATED:
-            #         is_positive = True
-            #         subjects = schedule_isolation_after_positive_test(
-            #             data,
-            #             subjects,
-            #             subject,
-            #             current_time,
-            #             fine_grained_rng=fine_grained_rng,
-            #             distortion=distortion,
-            #             parameter_bundle=parameter_bundle,
-            #         )
+        elif event_type == "Test":
             is_positive = False
             for subject in involved_subjects:
                 subject_state = subjects[subject - 1].state
@@ -1022,4 +1007,3 @@ if __name__=="__main__":
     simulate_one_iteration(data, n_subjects, False, data_filename.split(".")[0] + "_simulated", seed=seed)
     toc = time.time()
     print(f"Simulation took {toc - tic} seconds")
-

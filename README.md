@@ -1,97 +1,82 @@
-# CHITA Library
+# CHITA Experiments
 
-This repository provides CHITA, a Java library implementing a quantitative approach to predict the spread of infectious diseases within a cluster. CHITA is presented in a paper titled "An observation-based quantitative approach to predict the spread of infectious diseases within a cluster", authored by Laura Carnevali, Silvia Dani, Niccolò Niccoli, Benedetta Picano, and Enrico Vicario, currently submitted for a journal publication. 
+This repository contains the CHITA Java analysis code and Python experiment
+pipeline used to evaluate infection-risk predictions on synthetic contact
+datasets.
 
-The most distinctive features of CHITA are: 
-- definition of a custom-made extensible metamodel of an infection chain of a disease; 
-- automated translation of a metamodel instance into a Stochastic Time Petri Net (STPN) characterizing the disease evolution from contact to infectiousness;
-- implementation of an efficient quantitative approach to predict the spread of infectious diseases within a cluster, exploiting not only the STPN model of disease evolution in an individual but also observations of contacts, symptoms, and results of diagnostic tests;
-- randomly generated data sets of observations of contacts, symptoms, and results of diagnostic tests.
+CHITA builds a Stochastic Time Petri Net (STPN) model of disease progression and
+combines it with observations of contacts, symptoms, and diagnostic tests. The
+Python pipeline generates datasets, runs ground-truth simulations, runs the Java
+analysis, runs the simulation baseline, and writes comparison metrics and plots.
 
-## Experimental reproducibility
+## Repository Layout
 
-To support reproducibility of the experimental results reported in the paper, perform the steps reported below to repeat the experiments.
+- `src/main/java/com/chita/analysis/`: Java STPN analysis.
+- `sweep_pipeline_final.py`: supported end-to-end experiment pipeline.
+- `dataset_graph.py`, `scale_free_dataset_graph.py`, `small_world_dataset_graph.py`: dataset generators.
+- `run_n_simulations.py`: Python simulation baseline and ground-truth runner used by the sweep.
+- `compute_precision_metrics.py`: Brier score, ECE, and reliability outputs.
 
-1. Generate the data sets of observations used in the paper and compute a ground truth for each of them.
-   
-   ```powershell
-   python run_n_simulations.py
-   ```
+## Setup
 
-   This script generates data sets and intermediate output used by the analysis.
+Use Python 3.8+ and JDK 11+.
 
-   To run the simulation until convergence (with a maximum iteration cap), use:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-   ```powershell
-   python run_n_simulations.py --run_until_convergence --iterations_cap 100000
-   ```
+On Windows PowerShell:
 
-2. Execute our approach for each data set of observations.
-   
-   Import the project into Eclipse or IntelliJ and run the `main` method in `com.chita.analysis.STPNAnalysis`.
-  
-   Note: The analysis writes on the file named `stpn_solution.csv` if it does not exist.
+```powershell
+python -m venv .venv
+. .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-3. Execute the alternative simulative baseline for each data set of observations (10 runs for each data set).
+The Java classes are compiled manually because this repository does not include a
+Maven or Gradle build file:
 
-   ```powershell
-   python run_n_simulations.py --rep 10
-   ```
+```bash
+mkdir -p out/production/chita-main-test
+javac -cp "lib/*" -d out/production/chita-main-test src/main/java/com/chita/analysis/*.java
+```
 
-4. Compute precision metrics (Reliability Diagrams, Brier Score and ECE).
+If `javac` is missing, install a JDK rather than a JRE.
 
-   ```powershell
-   python compute_precision_metrics.py
-   ```
+## Running Experiments
 
-   The script scans experiment folders (`D*`) and writes outputs under each dataset in `precision_metrics/`.
+The supported reproducibility entrypoint is `sweep_pipeline_final.py`. It writes
+outputs under `results/sweep_*`.
 
-5. Plot results.
+These commands are long-running:
 
-   ```powershell
-   python plot_results.py
-   python plot_results_csv.py
-   ```
+```bash
+MPLCONFIGDIR=.cache/matplotlib python sweep_pipeline_final.py --dataset bubble
+MPLCONFIGDIR=.cache/matplotlib python sweep_pipeline_final.py --dataset scale_free
+MPLCONFIGDIR=.cache/matplotlib python sweep_pipeline_final.py --dataset small_world
+```
 
+Published dataset targets are:
 
-## Installation
+- `bubble`: 8 subjects, complete graph, `200`, `400`, and `800` internal contacts.
+- `scale_free`: 100 subjects, Barabasi-Albert graph, `1250`, `2500`, and `5000` internal contacts.
+- `small_world`: 100 subjects, Watts-Strogatz graph, `1800`, `3600`, and `7200` internal contacts.
 
-This repository provides a ready-to-use Maven project that you can easily import into an Eclipse workspace to start working with the [CHITA library](https://github.com/oris-tool/chita/) (the version `2.0.0-SNAPSHOT` of the [Sirio library](https://github.com/oris-tool/sirio) is included as a Maven dependency). Just follow these steps:
+To reuse an existing run directory:
 
-1. **Install Java >= 11.** For Windows, you can download a [package from Oracle](https://www.oracle.com/java/technologies/downloads/#java11); for Linux, you can run `apt-get install openjdk-11-jdk`; for macOS, you can run `brew install --cask java`. 
+```bash
+MPLCONFIGDIR=.cache/matplotlib python sweep_pipeline_final.py --reuse-run results/sweep_YYYYMMDD-HHMM --dataset scale_free
+```
 
-2. **Download Eclipse or IntelliJ.** Regarding Eclipse, the [Eclipse IDE for Java Developers](http://www.eclipse.org/downloads/eclipse-packages/) package is sufficient.
+To regenerate only the selected plots from an existing run:
 
-3. **Clone this project.** Inside Eclipse:
-   - Select `File > Import > Maven > Check out Maven Projects from SCM` and click `Next`.
-   - If the `SCM URL` dropbox is grayed out, click on `m2e Marketplace` and install `m2e-egit`. You will have to restart Eclipse.
-   - As `SCM URL`, type: `git@github.com:oris-tool/chita.git` and click `Next` and then `Finish`.
+```bash
+MPLCONFIGDIR=.cache/matplotlib python sweep_pipeline_final.py --reuse-run results/sweep_YYYYMMDD-HHMM --only-selected-plots --quartile-label q4
+```
 
-4. **Install Python >= 3.8.** We provide a minimal quick-start for the Python tools. First choose one for your platform:
-   - Windows:
+## License
 
-   ```powershell
-   python -m venv .venv
-   . .\.venv\Scripts\Activate.ps1 
-   pip install -r requirements.txt
-   ```
-
-   - macOS / Linux:
-
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-   - If a shell blocks script execution on Windows, run:
-
-   ```powershell
-   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-   ```
-
-   - Python dependencies are listed in `requirements.txt`.
-
-## Licence
-
-CHITA is released under the [GNU Affero General Public License v3.0](https://choosealicense.com/licenses/agpl-3.0).
+CHITA is released under the GNU Affero General Public License v3.0. See
+`LICENSE.txt`.

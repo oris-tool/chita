@@ -6,9 +6,9 @@ import re
 import shutil
 
 
-DEFAULT_SUMMARY_CSV = "/mnt/nniccoli/chita_results/sweep_20260423-0202/comparison_summary_q4.csv"
-DEFAULT_COMPARISON_ROOT = "/mnt/nniccoli/chita_results/sweep_20260423-0202/comparison/q4"
-DEFAULT_OUTPUT_ROOT = "/mnt/nniccoli/chita_results/roi"
+DEFAULT_SUMMARY_CSV = "results/sweep_latest/comparison_summary_q4.csv"
+DEFAULT_COMPARISON_ROOT = "results/sweep_latest/comparison/q4"
+DEFAULT_OUTPUT_ROOT = "results/roi"
 
 SELECTION_NOTE_PATTERN = re.compile(r"\b(?:Top|Median)\s+\d+\s+(?:Kendall|Spearman)\b")
 RUN_ID_PATTERN = re.compile(r"^(?P<dataset_stem>dataset_.+?)__(?P<run_number>\d+)__(?P<suffix>.+)$")

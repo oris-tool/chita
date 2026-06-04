@@ -1221,9 +1221,9 @@ def run_java_analysis(
     java_executable = resolve_java_executable()
     gson_jar = resolve_optional_jar(
         [
-            os.path.join(repo_root, "lib__", "gson.jar"),
-            os.path.join(repo_root, "lib__", "gson-2.13.1.jar"),
-            os.path.join(repo_root, "lib__", "gson-2.11.0.jar"),
+            os.path.join(repo_root, "lib", "gson.jar"),
+            os.path.join(repo_root, "lib", "gson-2.13.1.jar"),
+            os.path.join(repo_root, "lib", "gson-2.11.0.jar"),
             os.path.join(os.path.expanduser("~"), ".m2", "repository", "com", "google", "code", "gson", "gson", "2.13.1", "gson-2.13.1.jar"),
             os.path.join(os.path.expanduser("~"), ".m2", "repository", "com", "google", "code", "gson", "gson", "2.11.0", "gson-2.11.0.jar"),
             os.path.join(os.path.expanduser("~"), ".gradle", "caches", "modules-2", "files-2.1", "com.google.code.gson", "gson", "2.10.1", "b3add478d4382b78ea20b1671390a858002feb6c", "gson-2.10.1.jar"),
@@ -1255,7 +1255,7 @@ def run_java_analysis(
     classpath = os.pathsep.join(
         [
             class_root,
-            os.path.join(repo_root, "lib__", "*"),
+            os.path.join(repo_root, "lib", "*"),
             gson_jar,
         ]
     )

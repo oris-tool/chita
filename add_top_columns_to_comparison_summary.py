@@ -7,11 +7,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 
-DEFAULT_ROOT = "/mnt/nniccoli/chita_results"
-DEFAULT_DATASET_DIRS = ("dataset_2500", "dataset_5000", "dataset_10000")
+DEFAULT_ROOT = "results"
+DEFAULT_DATASET_DIRS = ("dataset_1250", "dataset_2500", "dataset_5000")
 SOURCE_FILENAME = "comparison_summary_q4.csv"
 DEFAULT_OUTPUT_SUFFIX = "_with_top_columns"
 TOP_THRESHOLDS = (10, 20, 30, 40, 50)
+SHARED_ANALYSIS_FALLBACK_SWEEP_DIRS = ("sweep_20260502-0119",)
 DEFAULT_MAX_WORKERS = max(1, min(8, (os.cpu_count() or 1) // 2))
 
 
@@ -25,7 +26,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--root",
         default=DEFAULT_ROOT,
-        help="Root directory containing dataset_2500, dataset_5000, and dataset_10000.",
+        help="Root directory containing dataset comparison output folders.",
     )
     parser.add_argument(
         "--dataset-dirs",
@@ -68,11 +69,57 @@ def output_csv_path(source_csv_path, output_suffix):
     return f"{base}{output_suffix}{extension}"
 
 
+def resolve_dataset_root(root, dataset_dir):
+    dataset_root = os.path.join(root, dataset_dir)
+    source_csv_path = os.path.join(dataset_root, SOURCE_FILENAME)
+    if os.path.exists(source_csv_path):
+        return dataset_root
+
+    if os.path.isdir(dataset_root):
+        nested_roots = [
+            os.path.join(dataset_root, name)
+            for name in os.listdir(dataset_root)
+            if os.path.isdir(os.path.join(dataset_root, name))
+            and os.path.exists(os.path.join(dataset_root, name, SOURCE_FILENAME))
+        ]
+        if len(nested_roots) == 1:
+            return nested_roots[0]
+
+    return dataset_root
+
+
 def comparison_root(dataset_root):
     return os.path.join(dataset_root, "comparison")
 
 
 def resolve_dataset_stem(dataset_root):
+    dataset_root_name = os.path.basename(os.path.normpath(dataset_root))
+    direct_dataset_path = os.path.join(comparison_root(dataset_root), dataset_root_name)
+    if os.path.isdir(direct_dataset_path):
+        return dataset_root_name
+
+    nested_matches = [
+        entry
+        for entry in os.listdir(comparison_root(dataset_root))
+        if os.path.isdir(os.path.join(comparison_root(dataset_root), entry, dataset_root_name))
+    ]
+    if nested_matches:
+        return dataset_root_name
+
+    nested_entries = []
+    for entry in os.listdir(comparison_root(dataset_root)):
+        entry_path = os.path.join(comparison_root(dataset_root), entry)
+        if not os.path.isdir(entry_path):
+            continue
+        nested_entries.extend(
+            name
+            for name in os.listdir(entry_path)
+            if os.path.isdir(os.path.join(entry_path, name))
+        )
+    nested_entries = sorted(set(nested_entries))
+    if len(nested_entries) == 1:
+        return nested_entries[0]
+
     entries = [
         name for name in os.listdir(comparison_root(dataset_root))
         if os.path.isdir(os.path.join(comparison_root(dataset_root), name))
@@ -85,12 +132,47 @@ def resolve_dataset_stem(dataset_root):
 
 
 def comparison_summary_path(dataset_root, dataset_stem, parameter_case_code):
-    return os.path.join(
-        comparison_root(dataset_root),
-        dataset_stem,
-        str(parameter_case_code),
-        "comparison_summary.json",
-    )
+    candidates = [
+        os.path.join(
+            comparison_root(dataset_root),
+            dataset_stem,
+            str(parameter_case_code),
+            "comparison_summary.json",
+        )
+    ]
+
+    for entry in os.listdir(comparison_root(dataset_root)):
+        nested_path = os.path.join(
+            comparison_root(dataset_root),
+            entry,
+            dataset_stem,
+            str(parameter_case_code),
+            "comparison_summary.json",
+        )
+        if nested_path not in candidates:
+            candidates.append(nested_path)
+
+    return first_existing_path(candidates)
+
+
+def first_existing_path(candidates):
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return candidates[0] if candidates else None
+
+
+def candidate_roots(dataset_root):
+    roots = []
+    current = os.path.abspath(dataset_root)
+    for _ in range(3):
+        if current not in roots:
+            roots.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return roots
 
 
 def resolve_saved_path(dataset_root, stored_path):
@@ -98,15 +180,14 @@ def resolve_saved_path(dataset_root, stored_path):
         return stored_path
 
     candidate_paths = []
-    shared_root = os.path.dirname(dataset_root)
+    roots = candidate_roots(dataset_root)
 
     for anchor in ("ground_truth", "java_analysis"):
         marker = f"{anchor}/"
         index = stored_path.find(marker)
         if index != -1:
             suffix = stored_path[index:]
-            candidate_paths.append(os.path.join(dataset_root, suffix))
-            candidate_paths.append(os.path.join(shared_root, suffix))
+            candidate_paths.extend(os.path.join(root, suffix) for root in roots)
             break
 
     if not candidate_paths:
@@ -114,8 +195,8 @@ def resolve_saved_path(dataset_root, stored_path):
         index = stored_path.find(marker)
         if index != -1:
             suffix = stored_path[index:]
+            candidate_paths.extend(os.path.join(root, suffix) for root in roots)
             candidate_paths.append(os.path.join(dataset_root, "python_analysis", suffix))
-            candidate_paths.append(os.path.join(shared_root, suffix))
 
     for candidate_path in candidate_paths:
         if os.path.exists(candidate_path):
@@ -126,35 +207,39 @@ def resolve_saved_path(dataset_root, stored_path):
     raise ValueError(f"Could not resolve saved path relative to dataset root: {stored_path}")
 
 
-def first_existing_path(candidates):
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    return candidates[0] if candidates else None
-
-
 def resolve_ground_truth_path(dataset_root, dataset_stem, stored_path):
     basename = os.path.basename(stored_path)
-    shared_root = os.path.dirname(dataset_root)
-    return first_existing_path(
-        [
-            resolve_saved_path(dataset_root, stored_path),
-            os.path.join(dataset_root, "ground_truth", dataset_stem, basename),
-            os.path.join(shared_root, "ground_truth", dataset_stem, basename),
-        ]
+    candidates = [
+        resolve_saved_path(dataset_root, stored_path),
+    ]
+    candidates.extend(
+        os.path.join(root, "ground_truth", dataset_stem, basename)
+        for root in candidate_roots(dataset_root)
     )
+    candidates.extend(
+        os.path.join(root, sweep_dir, "ground_truth", dataset_stem, basename)
+        for root in candidate_roots(dataset_root)
+        for sweep_dir in SHARED_ANALYSIS_FALLBACK_SWEEP_DIRS
+    )
+    return first_existing_path(candidates)
 
 
 def resolve_analysis_path(dataset_root, dataset_stem, parameter_case_code, stored_path):
     basename = os.path.basename(stored_path)
-    shared_root = os.path.dirname(dataset_root)
-    return first_existing_path(
-        [
-            resolve_saved_path(dataset_root, stored_path),
-            os.path.join(dataset_root, "java_analysis", dataset_stem, str(parameter_case_code), basename),
-            os.path.join(shared_root, "java_analysis", dataset_stem, str(parameter_case_code), basename),
-        ]
+    case_code = str(parameter_case_code)
+    candidates = [
+        resolve_saved_path(dataset_root, stored_path),
+    ]
+    candidates.extend(
+        os.path.join(root, "java_analysis", dataset_stem, case_code, basename)
+        for root in candidate_roots(dataset_root)
     )
+    candidates.extend(
+        os.path.join(root, sweep_dir, "java_analysis", dataset_stem, case_code, basename)
+        for root in candidate_roots(dataset_root)
+        for sweep_dir in SHARED_ANALYSIS_FALLBACK_SWEEP_DIRS
+    )
+    return first_existing_path(candidates)
 
 
 def resolve_baseline_path(dataset_root, dataset_stem, parameter_case_code, stored_path):
@@ -325,7 +410,7 @@ def main(argv=None):
     args = parse_args(argv)
     results = []
     for dataset_dir in args.dataset_dirs:
-        dataset_root = os.path.join(args.root, dataset_dir)
+        dataset_root = resolve_dataset_root(args.root, dataset_dir)
         source_csv_path = os.path.join(dataset_root, SOURCE_FILENAME)
         if not os.path.exists(source_csv_path):
             raise FileNotFoundError(f"Comparison summary CSV not found: {source_csv_path}")

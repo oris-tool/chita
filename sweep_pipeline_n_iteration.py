@@ -217,9 +217,9 @@ def run_java_analysis_with_iterations(
     java_executable = sp.resolve_java_executable()
     gson_jar = sp.resolve_optional_jar(
         [
-            os.path.join(repo_root, "lib__", "gson.jar"),
-            os.path.join(repo_root, "lib__", "gson-2.13.1.jar"),
-            os.path.join(repo_root, "lib__", "gson-2.11.0.jar"),
+            os.path.join(repo_root, "lib", "gson.jar"),
+            os.path.join(repo_root, "lib", "gson-2.13.1.jar"),
+            os.path.join(repo_root, "lib", "gson-2.11.0.jar"),
             os.path.join(
                 os.path.expanduser("~"),
                 ".m2",
@@ -285,7 +285,7 @@ def run_java_analysis_with_iterations(
     classpath = os.pathsep.join(
         [
             class_root,
-            os.path.join(repo_root, "lib__", "*"),
+            os.path.join(repo_root, "lib", "*"),
             gson_jar,
         ]
     )
