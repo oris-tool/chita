@@ -47,5 +47,5 @@ def sample_generalized_erlang(lambdas):
     float: A sample from the Generalized Erlang distribution.
     """
     samples = [np.random.exponential(1 / lam) for lam in lambdas]
-    
+
     return sum(samples)

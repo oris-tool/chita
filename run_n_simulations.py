@@ -23,13 +23,26 @@ from tqdm import tqdm
 import json
 import os
 import argparse
+import copy
+import time
 from compute_precision_metrics import calculate_brier_score
+import matplotlib
 import numpy as np
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy import stats
 
 
-def check_convergence(current_state, last_state, threshold=1e-6):
+def get_suppressed_stdout_log_path(dataset_dir, dataset_stem, run_until_convergence, max_runtime_seconds):
+    if run_until_convergence:
+        suffix = "convergence"
+    elif max_runtime_seconds is not None:
+        suffix = "runtime_limited"
+    else:
+        suffix = "fixed_reps"
+    return os.path.join(dataset_dir, f"{os.path.basename(dataset_stem)}_{suffix}_stdout.log")
+
+
+def check_convergence(current_state, last_state, threshold=1e-4):
     p_subjects = sorted(list(current_state.keys()), key=int)
     g_subjects = sorted(list(last_state.keys()), key=int)
     if p_subjects != g_subjects:
@@ -44,10 +57,9 @@ def check_convergence(current_state, last_state, threshold=1e-6):
         scores.append(brier_score)
         if brier_score > threshold:
             converged = False
-    print(f"Convergence check: Brier scores for all subjects: {scores}")
     return {"converged" : converged, "scores" : scores}
 
-def compute_confidence_intervals(current_state, confidence=0.95):
+def compute_confidence_intervals(current_state, confidence=0.95, sample_size=None):
     if not current_state:
         raise ValueError("Error: current_state cannot be empty.")
 
@@ -60,12 +72,19 @@ def compute_confidence_intervals(current_state, confidence=0.95):
         if len(current_state[subject_id]) != horizon:
             raise ValueError("Error: all subjects must have trajectories with the same length.")
 
+    if sample_size is None:
+        # Backward-compatible default for callers that do not provide the number
+        # of repetitions used to estimate each trajectory point.
+        sample_size = horizon
+    if sample_size <= 0:
+        raise ValueError("Error: sample_size must be greater than 0.")
+
     alpha = 1 - confidence
     if alpha <= 0 or alpha >= 1:
         raise ValueError("Error: confidence must be between 0 and 1.")
 
     # Dvoretzky-Kiefer-Wolfowitz epsilon for empirical CDF bands.
-    epsilon = np.sqrt(-np.log(alpha / 2) / (2 * horizon))
+    epsilon = np.sqrt(-np.log(alpha / 2) / (2 * float(sample_size)))
     dkw_band = {
         subject_id: {
             "lower": [max(0.0, value - epsilon) for value in current_state[subject_id]],
@@ -77,11 +96,20 @@ def compute_confidence_intervals(current_state, confidence=0.95):
     return {"epsilon": float(epsilon), "band": dkw_band}
 
 
-def plot_dkw_bands(current_state, dkw_result, output_dir, granularity=1.0, dataset_label=""):
+def plot_dkw_bands(
+    current_state,
+    dkw_result,
+    output_dir,
+    granularity=1.0,
+    dataset_label="",
+    save_plots=True,
+):
     if not current_state:
         raise ValueError("Error: current_state cannot be empty.")
     if "band" not in dkw_result:
         raise ValueError("Error: dkw_result must contain a 'band' entry.")
+    if not save_plots:
+        return
 
     os.makedirs(output_dir, exist_ok=True)
     subjects = sorted(list(current_state.keys()), key=int)
@@ -169,6 +197,227 @@ def get_infectious_simulated_data(numerical_results, avg_state):
         bin_data[subject] = [1 if value == 1 else 0 for value in results]
     return bin_data
 
+
+def get_granularity(fine_grained=False, time_step_hours=None):
+    if time_step_hours is not None:
+        if time_step_hours <= 0:
+            raise ValueError("Error: time_step_hours must be greater than 0.")
+        return float(time_step_hours)
+    return 0.1 if fine_grained else 1.0
+
+
+def run_dataset_simulations(
+    dataset_path,
+    rep=10_000,
+    run_until_convergence=False,
+    iterations_cap=100_000,
+    convergence_threshold=1e-4,
+    convergence_check_every=1000,
+    fine_grained=False,
+    dataset_label=None,
+    seed=None,
+    distortion=1.0,
+    progress_bar=None,
+    prune_after_positive_test=False,
+    export_observed_simulation=True,
+    pruning_seed=None,
+    time_step_hours=None,
+    max_runtime_seconds=None,
+    parameter_bundle=None,
+    save_plots=True,
+):
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    effective_fine_grained = fine_grained or (
+        time_step_hours is not None and float(time_step_hours) < 1.0
+    )
+
+    raw_dataset_path = dataset_path
+    effective_dataset_path = dataset_path
+    pruned_dataset_path = None
+    positive_test_pruning = None
+
+    if prune_after_positive_test:
+        raise NotImplementedError(
+            "prune_after_positive_test is not implemented in this pipeline."
+        )
+
+    source_data = simulation.read_data(effective_dataset_path)
+    n_subjects = source_data["n_subjects"]
+    timelimit = source_data["time_limit"]
+    granularity = get_granularity(
+        fine_grained=effective_fine_grained,
+        time_step_hours=time_step_hours,
+    )
+    horizon = int(timelimit * 24 / granularity)
+    dataset_stem = os.path.splitext(effective_dataset_path)[0]
+    dataset_dir = os.path.dirname(effective_dataset_path) or "."
+    suppressed_stdout_log_path = get_suppressed_stdout_log_path(
+        dataset_dir=dataset_dir,
+        dataset_stem=dataset_stem,
+        run_until_convergence=run_until_convergence,
+        max_runtime_seconds=max_runtime_seconds,
+    )
+
+    avg_state = {subject_id: [0] * horizon for subject_id in range(1, n_subjects + 1)}
+    if run_until_convergence:
+        max_iterations = iterations_cap
+    elif rep is None:
+        max_iterations = iterations_cap
+    else:
+        max_iterations = rep
+    rep_done = 0
+    save_first_iteration = export_observed_simulation
+    convergence_reached = False
+    conv_check = None
+    last_state = None
+    started_at = time.perf_counter()
+    with open(suppressed_stdout_log_path, "w", encoding="utf-8", buffering=1) as suppressed_stdout_handle:
+        suppressed_stdout_handle.write(
+            f"# Suppressed stdout log for {os.path.basename(dataset_stem)}\n"
+            f"# run_until_convergence={run_until_convergence}\n"
+            f"# max_runtime_seconds={max_runtime_seconds}\n"
+        )
+
+        for iteration_index in range(max_iterations):
+            if (
+                max_runtime_seconds is not None
+                and rep_done > 0
+                and (time.perf_counter() - started_at) >= max_runtime_seconds
+            ):
+                break
+            # Per-iteration log markers are disabled to reduce I/O overhead.
+            # suppressed_stdout_handle.write(f"\n## iteration={iteration_index}\n")
+            # suppressed_stdout_handle.flush()
+            with contextlib.redirect_stdout(suppressed_stdout_handle):
+                data = copy.deepcopy(source_data)
+                data["events"].sort(key=lambda x: x["time"])
+                simulated_data = simulation.simulate_one_iteration(
+                    data,
+                    n_subjects,
+                    export_data=save_first_iteration,
+                    exported_data_filename=f"{dataset_stem}_simulated",
+                    seed=seed if iteration_index == 0 else None,
+                    fine_grained=effective_fine_grained,
+                    distortion=distortion if iteration_index == 0 else 1.0,
+                    parameter_bundle=parameter_bundle,
+                )
+                save_first_iteration = False
+                numerical_results = simulation.get_numerical_results(simulated_data, granularity)
+                infectious_results = get_infectious_simulated_data(numerical_results, avg_state)
+
+            for subject, infectious_track in infectious_results.items():
+                subject_state = avg_state[subject]
+                for time_index, value in enumerate(infectious_track):
+                    subject_state[time_index] += value
+
+            rep_done += 1
+
+            if run_until_convergence:
+                current_state = {
+                    subject_id: [avg_state[subject_id][time_index] / rep_done for time_index in range(horizon)]
+                    for subject_id in range(1, n_subjects + 1)
+                }
+                if iteration_index == 0:
+                    last_state = current_state
+                elif rep_done % convergence_check_every == 0:
+                    conv_check = check_convergence(
+                        current_state=current_state,
+                        last_state=last_state,
+                        threshold=convergence_threshold,
+                    )
+                    convergence_reached = conv_check["converged"]
+                    if convergence_reached:
+                        break
+                    last_state = current_state
+                    
+            if rep_done % 1000 == 0:
+                current_state = {
+                    subject_id: [avg_state[subject_id][time_index] / rep_done for time_index in range(horizon)]
+                    for subject_id in range(1, n_subjects + 1)
+                }
+                intermediate_confidence_intervals = compute_confidence_intervals(
+                    current_state,
+                    sample_size=rep_done,
+                )
+                intermediate_label = dataset_label or os.path.basename(dataset_dir)
+                intermediate_plots_dir = os.path.join(dataset_dir, "plots", "intermediate")
+                plot_dkw_bands(
+                    current_state=current_state,
+                    dkw_result=intermediate_confidence_intervals,
+                    output_dir=intermediate_plots_dir,
+                    granularity=granularity,
+                    dataset_label=f"{intermediate_label}_t{timelimit}_{rep_done}reps",
+                    save_plots=save_plots,
+                )
+
+            if progress_bar is not None:
+                progress_bar.update(1)
+
+    actual_runtime_seconds = time.perf_counter() - started_at
+    if rep_done == 0:
+        raise RuntimeError("No simulation repetitions were completed.")
+
+    avg_results = {
+        subject_id: [avg_state[subject_id][time_index] / rep_done for time_index in range(horizon)]
+        for subject_id in range(1, n_subjects + 1)
+    }
+
+    confidence_intervals = compute_confidence_intervals(
+        avg_results,
+        sample_size=rep_done,
+    )
+    effective_label = dataset_label or os.path.basename(dataset_dir)
+    plots_dir = os.path.join(dataset_dir, "plots")
+    plot_dkw_bands(
+        current_state=avg_results,
+        dkw_result=confidence_intervals,
+        output_dir=plots_dir,
+        granularity=granularity,
+        dataset_label=f"{effective_label}_t{timelimit}_{rep_done}reps",
+        save_plots=save_plots,
+    )
+    dkw_csv_path = os.path.join(
+        plots_dir,
+        f"{effective_label}_t{timelimit}_{rep_done}reps_dkw_band.csv",
+    )
+    export_dkw_bands_to_csv(
+        current_state=avg_results,
+        dkw_result=confidence_intervals,
+        output_csv_path=dkw_csv_path,
+        granularity=granularity,
+    )
+
+    averaged_results_path = f"{dataset_stem}_simulated_{rep_done}_reps.json"
+    with open(averaged_results_path, "w", encoding="utf-8") as handle:
+        json.dump(avg_results, handle, indent=4)
+
+    return {
+        "dataset_path": raw_dataset_path,
+        "effective_dataset_path": effective_dataset_path,
+        "pruned_dataset_path": pruned_dataset_path,
+        "dataset_dir": dataset_dir,
+        "dataset_stem": dataset_stem,
+        "n_subjects": n_subjects,
+        "time_limit": timelimit,
+        "rep_done": rep_done,
+        "actual_runtime_seconds": actual_runtime_seconds,
+        "max_runtime_seconds": max_runtime_seconds,
+        "run_until_convergence": run_until_convergence,
+        "convergence_reached": convergence_reached,
+        "convergence_scores": [] if conv_check is None else conv_check["scores"],
+        "convergence_threshold": convergence_threshold,
+        "observed_simulated_path": f"{dataset_stem}_simulated.json" if export_observed_simulation else None,
+        "averaged_results_path": averaged_results_path,
+        "plots_dir": plots_dir,
+        "dkw_csv_path": dkw_csv_path,
+        "granularity": granularity,
+        "time_step_hours": granularity,
+        "positive_test_pruning": positive_test_pruning,
+        "suppressed_stdout_log_path": suppressed_stdout_log_path,
+    }
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run simulations")
     parser.add_argument("--rep", type=int, default=10_000, help="Number of repetitions per configuration")
@@ -177,10 +426,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     FINE_GRAINED = True
-    if FINE_GRAINED:
-        GRANULARITY = 0.1
-    else:
-        GRANULARITY = 1.0
+    GRANULARITY = get_granularity(fine_grained=FINE_GRAINED)
 
     rep = args.rep
     timelimits = {84}
@@ -213,73 +459,39 @@ if __name__ == "__main__":
                         n_subjects = 16
                         internal_contacts = {84}
                     os.makedirs(f"{dataset_path}", exist_ok=True)
-                    filenames = dataset.create_datasets(f"{dataset_path}/dataset_s{n_subjects}_t{timelimit}", [n_subjects], [timelimit], seeds[seed_index], FINE_GRAINED, internal_contacts = internal_contacts, max_contacts = 6)
+                    filenames = dataset.create_datasets(
+                        f"{dataset_path}/dataset_s{n_subjects}_t{timelimit}",
+                        [n_subjects],
+                        [timelimit],
+                        seeds[seed_index],
+                        FINE_GRAINED,
+                        internal_contacts=internal_contacts,
+                        max_contacts=6,
+                    )
                     for filename in filenames:
                         print("\033[91m" + filename + "\033[0m")
-                        avg_state ={i : [0] * int(timelimit * 24 / GRANULARITY) for i in range(1, n_subjects + 1)}
-                        save = True
-                        convergence_reached = False
-                        rep_done = 0
-                        for i in range(rep):
-                            with contextlib.redirect_stdout(None):
-                                data = simulation.read_data(f"{filename}")
-                                data["events"].sort(key=lambda x: x["time"])
-                                if i == 0:
-                                    distortion = 1.0
-                                    if dataset_path == "D2+15":
-                                        distortion = 1.15
-                                    elif dataset_path == "D2-15":
-                                        distortion = 0.85
-                                    elif dataset_path == "D2+25":
-                                        distortion = 1.25
-                                    elif dataset_path == "D2-25":
-                                        distortion = 0.75
-                                    simulated_data = simulation.simulate_one_iteration(data, n_subjects, save, f"{filename.split('.')[0]}_simulated", seeds[seed_index], distortion=distortion)
-                                else:
-                                    simulated_data  = simulation.simulate_one_iteration(data, n_subjects, save, f"{filename.split('.')[0]}_simulated", distortion=1.0)
-                                save = False
-                                numerical_results = simulation.get_numerical_results(simulated_data, GRANULARITY)
-                                infectious_results = get_infectious_simulated_data(numerical_results, avg_state)
-                                for subject in infectious_results:
-                                    for j in range(int(timelimit * 24 / GRANULARITY)):
-                                        avg_state[subject][j] += infectious_results[subject][j]
-                                rep_done += 1
-                                if args.run_until_convergence:
-                                    if i == 0:
-                                        last_state = {i : [avg_state[i][j] / rep_done for j in range(int(timelimit * 24 / GRANULARITY))] for i in range(1, n_subjects + 1)}
-                                    if i > 0 and i % 1000 == 0:
-                                        # Check for convergence every 1000 iterations
-                                        current_state = {i : [avg_state[i][j] / rep_done for j in range(int(timelimit * 24 / GRANULARITY))] for i in range(1, n_subjects + 1)}
-                                        conv_check = check_convergence(current_state=current_state, last_state=last_state)
-                                        convergence_reached = conv_check["converged"]
-                                        if convergence_reached:
-                                            print(f"Convergence reached at iteration {i} for dataset {dataset_path} with timelimit {timelimit} and n_subjects {n_subjects}.")
-                                            break
-                                        else:
-                                            last_state = current_state
-                                pbar.update(1)
-                        if args.run_until_convergence:
-                            print(f"Convergence scores: {conv_check['scores']}")     
-                        avg_results = {i : [avg_state[i][j] / rep_done for j in range(int(timelimit * 24 / GRANULARITY))] for i in range(1, n_subjects + 1)}
-                        confidence_intervals = compute_confidence_intervals(avg_results)
-                        plot_dkw_bands(
-                            current_state=avg_results,
-                            dkw_result=confidence_intervals,
-                            output_dir=os.path.join(os.path.dirname(filename), "plots"),
-                            granularity=GRANULARITY,
-                            dataset_label=f"{dataset_path}_t{timelimit}_{rep_done}reps",
+                        distortion = 1.0
+                        if dataset_path == "D2+15":
+                            distortion = 1.15
+                        elif dataset_path == "D2-15":
+                            distortion = 0.85
+                        elif dataset_path == "D2+25":
+                            distortion = 1.25
+                        elif dataset_path == "D2-25":
+                            distortion = 0.75
+                        result = run_dataset_simulations(
+                            dataset_path=filename,
+                            rep=rep,
+                            run_until_convergence=args.run_until_convergence,
+                            iterations_cap=args.iterations_cap,
+                            convergence_threshold=1e-4,
+                            convergence_check_every=1000,
+                            fine_grained=FINE_GRAINED,
+                            dataset_label=dataset_path,
+                            seed=seeds[seed_index],
+                            distortion=distortion,
+                            progress_bar=pbar,
                         )
-                        export_dkw_bands_to_csv(
-                            current_state=avg_results,
-                            dkw_result=confidence_intervals,
-                            output_csv_path=os.path.join(
-                                os.path.dirname(filename),
-                                "plots",
-                                f"{dataset_path}_t{timelimit}_{rep_done}reps_dkw_band.csv",
-                            ),
-                            granularity=GRANULARITY,
-                        )
-                        filename_surgery = filename.split('_t')[0] + f"_t{timelimit}_{internal_contacts.pop()}_simulated_{rep_done}_reps.json" 
-                        with open(filename_surgery, "w") as f:
-                            json.dump(avg_results, f, indent=4)
+                        if args.run_until_convergence and result["convergence_scores"]:
+                            print(f"Convergence scores: {result['convergence_scores']}")
                     seed_index += 1

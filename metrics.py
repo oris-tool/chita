@@ -41,16 +41,16 @@ def compute_kendalls_tau_correlation_per_timestep(simulated_tracks, numerical_tr
     Returns:
     - (list of tau values, list of p values)
     """
-    # Get number of timesteps
+    simulated_subjects = list(simulated_tracks.keys())
+    numerical_subjects = list(numerical_tracks.keys())
     timesteps = len(next(iter(simulated_tracks.values())))
     
     taus = []
     p_values = []
     
     for t in range(timesteps):
-        # Get values for all subjects at timestep t
-        simulated_at_t = [simulated_tracks[subj][t] for subj in simulated_tracks.keys()]
-        numerical_at_t = [numerical_tracks[subj][t] for subj in numerical_tracks.keys()]
+        simulated_at_t = [simulated_tracks[subj][t] for subj in simulated_subjects]
+        numerical_at_t = [numerical_tracks[subj][t] for subj in numerical_subjects]
         
         kendall_tau = scipy.stats.kendalltau(simulated_at_t, numerical_at_t)
         taus.append(kendall_tau.correlation)
@@ -74,7 +74,8 @@ def compute_kendalls_tau_correlation_moving_window(simulated_tracks, numerical_t
     # Verify inputs
     assert len(simulated_tracks) == len(numerical_tracks), "Dictionaries must have same length"
     
-    # Get number of timesteps
+    simulated_subjects = list(simulated_tracks.keys())
+    numerical_subjects = list(numerical_tracks.keys())
     n_timesteps = len(next(iter(simulated_tracks.values())))
     
     # Verify window size is valid
@@ -87,10 +88,10 @@ def compute_kendalls_tau_correlation_moving_window(simulated_tracks, numerical_t
     # Slide the window across timesteps
     for t in range(window_size - 1, n_timesteps):
         # For each subject, compute the average value over the window
-        sim_window_avg = {subj: np.mean([simulated_tracks[subj][i] for i in range(t-window_size+1, t+1)]) 
-                         for subj in simulated_tracks.keys()}
-        num_window_avg = {subj: np.mean([numerical_tracks[subj][i] for i in range(t-window_size+1, t+1)]) 
-                         for subj in numerical_tracks.keys()}
+        sim_window_avg = {subj: np.mean([simulated_tracks[subj][i] for i in range(t-window_size+1, t+1)])
+                         for subj in simulated_subjects}
+        num_window_avg = {subj: np.mean([numerical_tracks[subj][i] for i in range(t-window_size+1, t+1)])
+                         for subj in numerical_subjects}
         
         # Get averaged values for correlation
         sim_values = list(sim_window_avg.values())
@@ -127,16 +128,16 @@ def compute_spearmans_correlation_per_timestep(simulated_tracks, numerical_track
     Returns:
     - (list of correlation values, list of p values)
     """
-    # Get number of timesteps
+    simulated_subjects = list(simulated_tracks.keys())
+    numerical_subjects = list(numerical_tracks.keys())
     timesteps = len(next(iter(simulated_tracks.values())))
     
     correlations = []
     p_values = []
     
     for t in range(timesteps):
-        # Get values for all subjects at timestep t
-        simulated_at_t = [simulated_tracks[subj][t] for subj in simulated_tracks.keys()]
-        numerical_at_t = [numerical_tracks[subj][t] for subj in numerical_tracks.keys()]
+        simulated_at_t = [simulated_tracks[subj][t] for subj in simulated_subjects]
+        numerical_at_t = [numerical_tracks[subj][t] for subj in numerical_subjects]
         
         spearman = scipy.stats.spearmanr(simulated_at_t, numerical_at_t)
         correlations.append(spearman.correlation)
@@ -160,7 +161,8 @@ def compute_spearman_correlation_moving_window(simulated_tracks, numerical_track
     # Verify inputs
     assert len(simulated_tracks) == len(numerical_tracks), "Dictionaries must have same length"
     
-    # Get number of timesteps
+    simulated_subjects = list(simulated_tracks.keys())
+    numerical_subjects = list(numerical_tracks.keys())
     n_timesteps = len(next(iter(simulated_tracks.values())))
     
     # Verify window size is valid
@@ -173,10 +175,10 @@ def compute_spearman_correlation_moving_window(simulated_tracks, numerical_track
     # Slide the window across timesteps
     for t in range(window_size - 1, n_timesteps):
         # For each subject, compute the average value over the window
-        sim_window_avg = {subj: np.mean([simulated_tracks[subj][i] for i in range(t-window_size+1, t+1)]) 
-                         for subj in simulated_tracks.keys()}
-        num_window_avg = {subj: np.mean([numerical_tracks[subj][i] for i in range(t-window_size+1, t+1)]) 
-                         for subj in numerical_tracks.keys()}
+        sim_window_avg = {subj: np.mean([simulated_tracks[subj][i] for i in range(t-window_size+1, t+1)])
+                         for subj in simulated_subjects}
+        num_window_avg = {subj: np.mean([numerical_tracks[subj][i] for i in range(t-window_size+1, t+1)])
+                         for subj in numerical_subjects}
         
         # Get averaged values for correlation
         sim_values = list(sim_window_avg.values())
@@ -203,7 +205,7 @@ def top_n_precision(rank1, rank2, n):
         
     Returns:
         precision (float): The fraction of subjects in the top-n of rank1 that also appear in the top-n of rank2.
-                        This is computed as |top_n(rank1) ∩ top_n(rank2)| / n.
+                        This is computed as the size of the intersection divided by n.
     """
     # Handle edge case where n exceeds available subjects
     n = min(n, len(rank1), len(rank2))
@@ -233,16 +235,17 @@ def compute_top_n_precision(simulated_tracks, numerical_tracks, top_n=1):
     Returns:
         A list of top-n precision values for each timestep.
     """
-    # Assume all subjects have the same number of timesteps
+    simulated_subjects = list(simulated_tracks.keys())
+    numerical_subjects = list(numerical_tracks.keys())
     example_key = next(iter(simulated_tracks))
     timesteps = len(simulated_tracks[example_key])
     precisions = []
 
     for t in range(timesteps):
         # Build the ranking for simulated data at timestep t (higher probability first).
-        rank_sim = sorted(simulated_tracks.keys(), key=lambda subj: simulated_tracks[subj][t], reverse=True)
+        rank_sim = sorted(simulated_subjects, key=lambda subj: simulated_tracks[subj][t], reverse=True)
         # Build the ranking for analyzed data at timestep t.
-        rank_ana = sorted(numerical_tracks.keys(), key=lambda subj: numerical_tracks[subj][t], reverse=True)
+        rank_ana = sorted(numerical_subjects, key=lambda subj: numerical_tracks[subj][t], reverse=True)
         
         precision = top_n_precision(rank_sim, rank_ana, top_n)
         precisions.append(precision)
@@ -262,15 +265,17 @@ def compute_mrr(simulated_tracks, numerical_tracks, top_n=None):
     Returns:
         mrr (float): The mean reciprocal rank.
     """
+    simulated_subjects = list(simulated_tracks.keys())
+    numerical_subjects = list(numerical_tracks.keys())
     example_key = next(iter(simulated_tracks))
     timesteps = len(simulated_tracks[example_key])
     rrs = []
     
     for t in range(timesteps):
         # Build the ranking for simulated data at timestep t (higher probability first).
-        rank_sim = sorted(simulated_tracks.keys(), key=lambda subj: simulated_tracks[subj][t], reverse=True)
+        rank_sim = sorted(simulated_subjects, key=lambda subj: simulated_tracks[subj][t], reverse=True)
         # Build the ranking for analyzed data at timestep t.
-        rank_ana = sorted(numerical_tracks.keys(), key=lambda subj: numerical_tracks[subj][t], reverse=True)
+        rank_ana = sorted(numerical_subjects, key=lambda subj: numerical_tracks[subj][t], reverse=True)
         
         # Find the rank of the top simulated subject in the numerical rankings
         query = rank_sim[0]  # Top subject from simulated
@@ -300,7 +305,8 @@ def compute_top_n_precision_on_a_moving_window(simulated_tracks, numerical_track
     Returns:
         A list of top-n precision values for each timestep after the initial window.
     """
-    # Assume all subjects have the same number of timesteps
+    simulated_subjects = list(simulated_tracks.keys())
+    numerical_subjects = list(numerical_tracks.keys())
     example_key = next(iter(simulated_tracks))
     timesteps = len(simulated_tracks[example_key])
     precisions = []
@@ -308,10 +314,10 @@ def compute_top_n_precision_on_a_moving_window(simulated_tracks, numerical_track
     # Start from window_size-1 to have enough previous data points for the window
     for t in range(window_size-1, timesteps):
         # For each subject, compute the average value over the window
-        sim_window_avg = {subj: np.mean([simulated_tracks[subj][i] for i in range(t-window_size+1, t+1)]) 
-                         for subj in simulated_tracks.keys()}
-        num_window_avg = {subj: np.mean([numerical_tracks[subj][i] for i in range(t-window_size+1, t+1)]) 
-                         for subj in numerical_tracks.keys()}
+        sim_window_avg = {subj: np.mean([simulated_tracks[subj][i] for i in range(t-window_size+1, t+1)])
+                         for subj in simulated_subjects}
+        num_window_avg = {subj: np.mean([numerical_tracks[subj][i] for i in range(t-window_size+1, t+1)])
+                         for subj in numerical_subjects}
         
         # Build the ranking based on window averages (higher probability first)
         rank_sim = sorted(sim_window_avg.keys(), key=lambda subj: sim_window_avg[subj], reverse=True)
