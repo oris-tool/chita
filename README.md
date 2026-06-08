@@ -46,7 +46,30 @@ To support reproducibility of the experimental results, use `sweep_pipeline_fina
 
 Use Python 3.8+ and JDK 11+.
 
-1. **Install Python dependencies.**
+1. **Install Java >= 11.**
+
+   Windows:
+   - Download and install a JDK package from [Oracle](https://www.oracle.com/java/technologies/downloads/#java11).
+
+   macOS:
+
+   ```bash
+   brew install --cask java
+   ```
+
+   Linux:
+
+   ```bash
+   sudo apt-get install openjdk-11-jdk
+   ```
+
+   After installation, check that `javac` is available:
+
+   ```bash
+   javac -version
+   ```
+
+2. **Install Python dependencies.**
 
    macOS / Linux:
 
@@ -64,16 +87,12 @@ Use Python 3.8+ and JDK 11+.
    pip install -r requirements.txt
    ```
 
-2. **Compile the Java analysis classes.**
-
-   The Java classes are compiled manually because this repository does not include a Maven or Gradle build file.
+3. **Compile the Java analysis classes.**
 
    ```bash
    mkdir -p out/production/chita-main-test
    javac -cp "lib/*" -d out/production/chita-main-test src/main/java/com/chita/analysis/*.java
    ```
-
-   If `javac` is missing, install a JDK rather than a JRE.
 
 ## Licence
 
