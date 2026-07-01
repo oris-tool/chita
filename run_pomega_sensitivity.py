@@ -272,6 +272,8 @@ def copy_artifact(
 ) -> str:
     relative_path = run_relative_path(path_value, source_run_name)
     local_path = local_artifact_path(local_input_root, relative_path)
+    if os.path.exists(local_path):
+        return local_path
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     run_rsync(
         endpoint_spec(source_root, relative_path),
@@ -299,9 +301,52 @@ def try_copy_top_level_file(
     filename: str,
     ssh_opts: Optional[str],
 ) -> Optional[str]:
+    local_path = os.path.join(local_input_root, filename)
+    if os.path.exists(local_path):
+        return local_path
     if not endpoint_exists(source_root, filename, ssh_opts=ssh_opts):
         return None
     return copy_top_level_file(source_root, local_input_root, filename, ssh_opts)
+
+
+def stage_source_artifacts(
+    source_root: Endpoint,
+    local_input_root: str,
+    target: DatasetTarget,
+    ssh_opts: Optional[str],
+) -> None:
+    stem = target.dataset_stem
+    os.makedirs(local_input_root, exist_ok=True)
+    include_patterns = [
+        "/dataset_runs_summary.json",
+        "/python_analysis_summary.json",
+        f"/{stem}.json",
+        f"/{stem}_contact_noisy.json",
+        f"/{stem}_contact_noisy_simulated.json",
+        f"/{stem}_contact_noisy_observation_noisy_simulated.json",
+        f"/gt_results_{stem}.json",
+        f"/gt_results_{stem[len('dataset_'):]}.json" if stem.startswith("dataset_") else f"/gt_results_{stem}.json",
+        "/ground_truth/",
+        f"/ground_truth/{stem}/***",
+        "/dataset_noise/",
+        f"/dataset_noise/{stem}_contact_noise_summary.json",
+        f"/dataset_noise/{stem}_observation_noise_summary.json",
+        "/observed_one_run/",
+        f"/observed_one_run/{stem}_contact_noisy_one_run_summary.json",
+        "/python_analysis/",
+        f"/python_analysis/{QUARTILE_LABEL}/",
+        f"/python_analysis/{QUARTILE_LABEL}/{stem}/***",
+    ]
+    extra_args = ["--prune-empty-dirs"]
+    for pattern in include_patterns:
+        extra_args.extend(["--include", pattern])
+    extra_args.extend(["--exclude", "*"])
+    run_rsync(
+        endpoint_spec(source_root, trailing_slash=True),
+        local_input_root.rstrip(os.sep) + os.sep,
+        ssh_opts=ssh_opts,
+        extra_args=extra_args,
+    )
 
 
 def resolve_targets(dataset_args: Sequence[str]) -> List[DatasetTarget]:
@@ -396,7 +441,14 @@ def build_parameter_case_maps() -> Tuple[List[dict], Dict[str, dict]]:
     return parameter_cases, cases_by_id
 
 
-def _require_source_file(source_root: Endpoint, relative_path: str, ssh_opts: Optional[str]) -> str:
+def _require_source_file(
+    source_root: Endpoint,
+    relative_path: str,
+    ssh_opts: Optional[str],
+    local_input_root: Optional[str] = None,
+) -> str:
+    if local_input_root is not None and os.path.exists(local_artifact_path(local_input_root, relative_path)):
+        return relative_path
     if not endpoint_exists(source_root, *relative_path.split("/"), ssh_opts=ssh_opts):
         raise FileNotFoundError(f"Required source artifact not found: {endpoint_spec(source_root, relative_path)}")
     return relative_path
@@ -418,21 +470,34 @@ def reconstruct_dataset_run_from_artifacts(
     source_root: Endpoint,
     target: DatasetTarget,
     ssh_opts: Optional[str],
+    local_input_root: Optional[str] = None,
 ) -> dict:
     stem = target.dataset_stem
-    clean_dataset_path = _require_source_file(source_root, f"{stem}.json", ssh_opts)
-    dataset_path = _require_source_file(source_root, f"{stem}_contact_noisy.json", ssh_opts)
+    clean_dataset_path = _require_source_file(source_root, f"{stem}.json", ssh_opts, local_input_root)
+    dataset_path = _require_source_file(source_root, f"{stem}_contact_noisy.json", ssh_opts, local_input_root)
     observed_simulated_path = _require_source_file(
         source_root,
         f"{stem}_contact_noisy_observation_noisy_simulated.json",
         ssh_opts,
+        local_input_root,
     )
-    ground_truth_candidates = endpoint_find_files(
-        source_root,
-        f"ground_truth/{stem}",
-        f"{stem}_simulated_*_reps.json",
-        ssh_opts=ssh_opts,
-    )
+    if local_input_root is not None:
+        local_gt_dir = local_artifact_path(local_input_root, f"ground_truth/{stem}")
+        import glob
+        ground_truth_candidates = sorted(
+            os.path.relpath(match, local_input_root).replace(os.sep, "/")
+            for match in glob.glob(os.path.join(local_gt_dir, f"{stem}_simulated_*_reps.json"))
+            if os.path.isfile(match)
+        )
+    else:
+        ground_truth_candidates = []
+    if not ground_truth_candidates:
+        ground_truth_candidates = endpoint_find_files(
+            source_root,
+            f"ground_truth/{stem}",
+            f"{stem}_simulated_*_reps.json",
+            ssh_opts=ssh_opts,
+        )
     if not ground_truth_candidates:
         raise FileNotFoundError(
             f"Could not reconstruct {stem}: no ground_truth/{stem}/{stem}_simulated_*_reps.json found."
@@ -467,6 +532,7 @@ def select_dataset_run(
     target: DatasetTarget,
     source_root: Endpoint,
     ssh_opts: Optional[str],
+    local_input_root: Optional[str] = None,
 ) -> dict:
     matches = [run for run in dataset_runs if run.get("dataset_stem") == target.dataset_stem]
     if len(matches) == 1:
@@ -479,7 +545,7 @@ def select_dataset_run(
         f"dataset_runs_summary.json has no entry for {target.dataset_stem}; "
         f"attempting artifact reconstruction. Available stems: {available or '<none>'}"
     )
-    return reconstruct_dataset_run_from_artifacts(source_root, target, ssh_opts)
+    return reconstruct_dataset_run_from_artifacts(source_root, target, ssh_opts, local_input_root)
 
 
 def reconstruct_python_summaries_from_case_files(
@@ -491,6 +557,27 @@ def reconstruct_python_summaries_from_case_files(
     ssh_opts: Optional[str],
 ) -> List[dict]:
     summaries = []
+    case_codes = {parameter_case["case_run_code"] for parameter_case in parameter_cases}
+    local_dataset_dir = local_artifact_path(
+        local_input_root,
+        f"python_analysis/{QUARTILE_LABEL}/{target.dataset_stem}",
+    )
+    if os.path.isdir(local_dataset_dir):
+        for case_code in sorted(case_codes, key=lambda value: int(value) if str(value).isdigit() else str(value)):
+            local_summary_path = os.path.join(local_dataset_dir, case_code, "python_analysis_summary.json")
+            if not os.path.exists(local_summary_path):
+                continue
+            summary = read_json(local_summary_path)
+            summary["averaged_results_path"] = copy_artifact(
+                source_root,
+                local_input_root,
+                source_run_name,
+                summary["averaged_results_path"],
+                ssh_opts,
+            )
+            summaries.append(summary)
+        return summaries
+
     for parameter_case in parameter_cases:
         summary_relative_path = (
             f"python_analysis/{QUARTILE_LABEL}/{target.dataset_stem}/"
@@ -827,8 +914,10 @@ def run_one_experiment(
     os.makedirs(save_path, exist_ok=True)
 
     source_run_name = endpoint_basename(source_root)
+    print(f"Staging source artifacts for {target.dataset_stem}...")
+    stage_source_artifacts(source_root, local_input_root, target, ssh_opts)
     dataset_runs, python_summaries = load_source_indexes(source_root, local_input_root, ssh_opts)
-    source_dataset_run = select_dataset_run(dataset_runs, target, source_root, ssh_opts)
+    source_dataset_run = select_dataset_run(dataset_runs, target, source_root, ssh_opts, local_input_root)
     dataset_run = localize_dataset_run(
         source_dataset_run,
         source_root,
@@ -975,56 +1064,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     summary_csv_path = os.path.join(local_run_root, "pomega_sensitivity_summary.csv")
 
     total = len(targets) * len(priors)
-    completed = 0
-    for target in targets:
-        for prior in priors:
-            completed += 1
-            remote_sentinel_parts = (
-                run_label,
-                target.dataset_stem,
-                f"pomega_{prior_label(prior)}",
-                COMPLETION_SENTINEL,
-            )
-            if args.resume and endpoint_exists(dest_root, *remote_sentinel_parts, ssh_opts=ssh_opts):
-                row = {
-                    "dataset_key": target.key,
-                    "dataset_stem": target.dataset_stem,
-                    "observation_prior": prior,
-                    "status": "skipped_existing_destination",
-                    "dest_result_path": posixpath.join(run_label, target.dataset_stem, f"pomega_{prior_label(prior)}"),
-                    "completed_at": datetime.now().isoformat(timespec="seconds"),
-                }
-                summary_rows.append(row)
-                write_json(summary_json_path, summary_rows)
-                write_csv(
-                    summary_csv_path,
-                    summary_rows,
-                    ("dataset_key", "dataset_stem", "observation_prior", "status", "dest_result_path", "rows_written", "selected_runs_for_plots", "completed_at"),
-                )
-                copy_top_level_summaries_back(local_run_root, dest_root, run_label, ssh_opts)
-                print(f"[{completed}/{total}] skipped existing {target.dataset_stem} p={prior}")
-                continue
-
-            experiment_dir = os.path.join(local_run_root, target.dataset_stem, f"pomega_{prior_label(prior)}")
-            print(f"[{completed}/{total}] running {target.dataset_stem} with P(omega)={prior}")
-            try:
-                row = run_one_experiment(
-                    source_root=source_root,
-                    dest_root=dest_root,
-                    run_label=run_label,
-                    local_run_root=local_run_root,
-                    target=target,
-                    prior=prior,
-                    parameter_cases=parameter_cases,
-                    cases_by_id=cases_by_id,
-                    max_workers=args.max_workers,
-                    ssh_opts=ssh_opts,
-                )
-                row["status"] = "completed"
-            finally:
-                if not args.keep_local and os.path.isdir(experiment_dir):
-                    shutil.rmtree(experiment_dir)
-
+    progress = tqdm(
+        [(target, prior) for target in targets for prior in priors],
+        total=total,
+        desc="P(omega) experiments",
+        unit="experiment",
+    )
+    for completed, (target, prior) in enumerate(progress, start=1):
+        progress.set_postfix_str(f"{target.dataset_stem}, p={prior}")
+        remote_sentinel_parts = (
+            run_label,
+            target.dataset_stem,
+            f"pomega_{prior_label(prior)}",
+            COMPLETION_SENTINEL,
+        )
+        if args.resume and endpoint_exists(dest_root, *remote_sentinel_parts, ssh_opts=ssh_opts):
+            row = {
+                "dataset_key": target.key,
+                "dataset_stem": target.dataset_stem,
+                "observation_prior": prior,
+                "status": "skipped_existing_destination",
+                "dest_result_path": posixpath.join(run_label, target.dataset_stem, f"pomega_{prior_label(prior)}"),
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+            }
             summary_rows.append(row)
             write_json(summary_json_path, summary_rows)
             write_csv(
@@ -1033,6 +1095,37 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 ("dataset_key", "dataset_stem", "observation_prior", "status", "dest_result_path", "rows_written", "selected_runs_for_plots", "completed_at"),
             )
             copy_top_level_summaries_back(local_run_root, dest_root, run_label, ssh_opts)
+            tqdm.write(f"[{completed}/{total}] skipped existing {target.dataset_stem} p={prior}")
+            continue
+
+        experiment_dir = os.path.join(local_run_root, target.dataset_stem, f"pomega_{prior_label(prior)}")
+        tqdm.write(f"[{completed}/{total}] running {target.dataset_stem} with P(omega)={prior}")
+        try:
+            row = run_one_experiment(
+                source_root=source_root,
+                dest_root=dest_root,
+                run_label=run_label,
+                local_run_root=local_run_root,
+                target=target,
+                prior=prior,
+                parameter_cases=parameter_cases,
+                cases_by_id=cases_by_id,
+                max_workers=args.max_workers,
+                ssh_opts=ssh_opts,
+            )
+            row["status"] = "completed"
+        finally:
+            if not args.keep_local and os.path.isdir(experiment_dir):
+                shutil.rmtree(experiment_dir)
+
+        summary_rows.append(row)
+        write_json(summary_json_path, summary_rows)
+        write_csv(
+            summary_csv_path,
+            summary_rows,
+            ("dataset_key", "dataset_stem", "observation_prior", "status", "dest_result_path", "rows_written", "selected_runs_for_plots", "completed_at"),
+        )
+        copy_top_level_summaries_back(local_run_root, dest_root, run_label, ssh_opts)
 
     if not args.keep_local:
         with open(os.path.join(local_run_root, ".completed"), "w", encoding="utf-8") as handle:
