@@ -148,6 +148,45 @@ def endpoint_exists(endpoint: Endpoint, *parts: str, ssh_opts: Optional[str] = N
     return os.path.exists(path)
 
 
+def endpoint_find_files(
+    endpoint: Endpoint,
+    relative_dir: str,
+    name_pattern: str,
+    ssh_opts: Optional[str] = None,
+) -> List[str]:
+    if endpoint.is_remote:
+        search_dir = endpoint_path(endpoint, relative_dir)
+        command = (
+            "if test -d " + shlex.quote(search_dir) + "; then "
+            "find " + shlex.quote(search_dir) + " -maxdepth 1 -type f -name " + shlex.quote(name_pattern) + " -print; "
+            "fi"
+        )
+        result = subprocess.run(
+            ssh_command(endpoint, command, ssh_opts),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        prefix = endpoint.path.rstrip("/") + "/"
+        relatives = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(prefix):
+                relatives.append(line[len(prefix):])
+        return sorted(relatives)
+
+    import glob
+
+    search_dir = endpoint_path(endpoint, relative_dir)
+    return sorted(
+        os.path.relpath(match, endpoint.path).replace(os.sep, "/")
+        for match in glob.glob(os.path.join(search_dir, name_pattern))
+        if os.path.isfile(match)
+    )
+
+
 def run_rsync(
     source: str,
     destination: str,
@@ -254,6 +293,17 @@ def copy_top_level_file(
     return local_path
 
 
+def try_copy_top_level_file(
+    source_root: Endpoint,
+    local_input_root: str,
+    filename: str,
+    ssh_opts: Optional[str],
+) -> Optional[str]:
+    if not endpoint_exists(source_root, filename, ssh_opts=ssh_opts):
+        return None
+    return copy_top_level_file(source_root, local_input_root, filename, ssh_opts)
+
+
 def resolve_targets(dataset_args: Sequence[str]) -> List[DatasetTarget]:
     targets: List[DatasetTarget] = []
     unknown = []
@@ -289,10 +339,10 @@ def load_source_indexes(
     local_input_root: str,
     ssh_opts: Optional[str],
 ) -> Tuple[List[dict], List[dict]]:
-    copy_top_level_file(source_root, local_input_root, "dataset_runs_summary.json", ssh_opts)
-    copy_top_level_file(source_root, local_input_root, "python_analysis_summary.json", ssh_opts)
-    dataset_runs = read_json(os.path.join(local_input_root, "dataset_runs_summary.json"))
-    python_summaries = read_json(os.path.join(local_input_root, "python_analysis_summary.json"))
+    dataset_runs_path = try_copy_top_level_file(source_root, local_input_root, "dataset_runs_summary.json", ssh_opts)
+    python_summaries_path = try_copy_top_level_file(source_root, local_input_root, "python_analysis_summary.json", ssh_opts)
+    dataset_runs = [] if dataset_runs_path is None else read_json(dataset_runs_path)
+    python_summaries = [] if python_summaries_path is None else read_json(python_summaries_path)
     return dataset_runs, python_summaries
 
 
@@ -346,15 +396,125 @@ def build_parameter_case_maps() -> Tuple[List[dict], Dict[str, dict]]:
     return parameter_cases, cases_by_id
 
 
-def select_dataset_run(dataset_runs: Sequence[dict], target: DatasetTarget) -> dict:
-    matches = [run for run in dataset_runs if run.get("dataset_stem") == target.dataset_stem]
-    if len(matches) != 1:
-        available = ", ".join(sorted(str(run.get("dataset_stem")) for run in dataset_runs))
-        raise ValueError(
-            f"Expected exactly one dataset_run for {target.dataset_stem}, found {len(matches)}. "
-            f"Available dataset stems: {available}"
+def _require_source_file(source_root: Endpoint, relative_path: str, ssh_opts: Optional[str]) -> str:
+    if not endpoint_exists(source_root, *relative_path.split("/"), ssh_opts=ssh_opts):
+        raise FileNotFoundError(f"Required source artifact not found: {endpoint_spec(source_root, relative_path)}")
+    return relative_path
+
+
+def _parse_reps_from_ground_truth_path(dataset_stem: str, relative_path: str) -> Optional[int]:
+    filename = posixpath.basename(relative_path)
+    prefix = f"{dataset_stem}_simulated_"
+    suffix = "_reps.json"
+    if not filename.startswith(prefix) or not filename.endswith(suffix):
+        return None
+    try:
+        return int(filename[len(prefix):-len(suffix)])
+    except ValueError:
+        return None
+
+
+def reconstruct_dataset_run_from_artifacts(
+    source_root: Endpoint,
+    target: DatasetTarget,
+    ssh_opts: Optional[str],
+) -> dict:
+    stem = target.dataset_stem
+    clean_dataset_path = _require_source_file(source_root, f"{stem}.json", ssh_opts)
+    dataset_path = _require_source_file(source_root, f"{stem}_contact_noisy.json", ssh_opts)
+    observed_simulated_path = _require_source_file(
+        source_root,
+        f"{stem}_contact_noisy_observation_noisy_simulated.json",
+        ssh_opts,
+    )
+    ground_truth_candidates = endpoint_find_files(
+        source_root,
+        f"ground_truth/{stem}",
+        f"{stem}_simulated_*_reps.json",
+        ssh_opts=ssh_opts,
+    )
+    if not ground_truth_candidates:
+        raise FileNotFoundError(
+            f"Could not reconstruct {stem}: no ground_truth/{stem}/{stem}_simulated_*_reps.json found."
         )
-    return matches[0]
+    ground_truth_candidates.sort(
+        key=lambda item: (_parse_reps_from_ground_truth_path(stem, item) or -1, item)
+    )
+    ground_truth_path = ground_truth_candidates[-1]
+    ground_truth_iterations = _parse_reps_from_ground_truth_path(stem, ground_truth_path)
+    gt_suffix = stem[len("dataset_"):] if stem.startswith("dataset_") else stem
+    gt_results_path = f"gt_results_{gt_suffix}.json"
+
+    return {
+        "clean_dataset_path": clean_dataset_path,
+        "dataset_path": dataset_path,
+        "dataset_stem": stem,
+        "gt_results_path": gt_results_path,
+        "ground_truth_path": ground_truth_path,
+        "clean_ground_truth_observed_simulated_path": f"ground_truth/{stem}/{stem}_simulated.json",
+        "clean_observed_simulated_path": f"{stem}_contact_noisy_simulated.json",
+        "observed_simulated_path": observed_simulated_path,
+        "contact_noise_summary": {},
+        "observation_noise_summary": {},
+        "observed_one_run_summary_path": f"observed_one_run/{stem}_contact_noisy_one_run_summary.json",
+        "ground_truth_iterations": ground_truth_iterations,
+        "reconstructed_from_artifacts": True,
+    }
+
+
+def select_dataset_run(
+    dataset_runs: Sequence[dict],
+    target: DatasetTarget,
+    source_root: Endpoint,
+    ssh_opts: Optional[str],
+) -> dict:
+    matches = [run for run in dataset_runs if run.get("dataset_stem") == target.dataset_stem]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"Expected one dataset_run for {target.dataset_stem}, found {len(matches)}.")
+
+    available = ", ".join(sorted(str(run.get("dataset_stem")) for run in dataset_runs))
+    print(
+        f"dataset_runs_summary.json has no entry for {target.dataset_stem}; "
+        f"attempting artifact reconstruction. Available stems: {available or '<none>'}"
+    )
+    return reconstruct_dataset_run_from_artifacts(source_root, target, ssh_opts)
+
+
+def reconstruct_python_summaries_from_case_files(
+    source_root: Endpoint,
+    local_input_root: str,
+    source_run_name: str,
+    target: DatasetTarget,
+    parameter_cases: Sequence[dict],
+    ssh_opts: Optional[str],
+) -> List[dict]:
+    summaries = []
+    for parameter_case in parameter_cases:
+        summary_relative_path = (
+            f"python_analysis/{QUARTILE_LABEL}/{target.dataset_stem}/"
+            f"{parameter_case['case_run_code']}/python_analysis_summary.json"
+        )
+        if not endpoint_exists(source_root, *summary_relative_path.split("/"), ssh_opts=ssh_opts):
+            continue
+        local_summary_path = copy_artifact(
+            source_root,
+            local_input_root,
+            source_run_name,
+            summary_relative_path,
+            ssh_opts,
+        )
+        summary = read_json(local_summary_path)
+        summary["averaged_results_path"] = copy_artifact(
+            source_root,
+            local_input_root,
+            source_run_name,
+            summary["averaged_results_path"],
+            ssh_opts,
+        )
+        summaries.append(summary)
+    return summaries
 
 
 def validate_python_summaries(
@@ -668,7 +828,7 @@ def run_one_experiment(
 
     source_run_name = endpoint_basename(source_root)
     dataset_runs, python_summaries = load_source_indexes(source_root, local_input_root, ssh_opts)
-    source_dataset_run = select_dataset_run(dataset_runs, target)
+    source_dataset_run = select_dataset_run(dataset_runs, target, source_root, ssh_opts)
     dataset_run = localize_dataset_run(
         source_dataset_run,
         source_root,
@@ -684,6 +844,19 @@ def run_one_experiment(
         source_run_name,
         ssh_opts,
     )
+    if not localized_python_summaries:
+        print(
+            f"python_analysis_summary.json has no entries for {target.dataset_stem}; "
+            "attempting per-case summary reconstruction."
+        )
+        localized_python_summaries = reconstruct_python_summaries_from_case_files(
+            source_root,
+            local_input_root,
+            source_run_name,
+            target,
+            parameter_cases,
+            ssh_opts,
+        )
     python_summary_by_key = validate_python_summaries(localized_python_summaries, target, cases_by_id)
 
     final.write_json(os.path.join(save_path, "dataset_runs_summary.json"), [dataset_run])
