@@ -297,6 +297,7 @@ def run_stpn_analysis(
     time_step_hours=1,
     case_id=None,
     require_simulated_json=True,
+    observation_prior=None,
 ):
     repo_root = _repo_root(repo_root)
     analysis_dir = os.path.abspath(analysis_dir)
@@ -327,18 +328,25 @@ def run_stpn_analysis(
     ):
         shutil.copy2(precomputed["observation_curve_path"], local_observation_curve_path)
 
+    command_args = [
+        "--time-step",
+        str(time_step_hours),
+        "--iterations",
+        str(iterations),
+        "--stpn-solution-path",
+        os.path.abspath(precomputed["stpn_solution_path"]),
+        "--parameter-bundle",
+        os.path.abspath(precomputed["parameter_bundle_path"]),
+    ]
+    if observation_prior is not None:
+        observation_prior = float(observation_prior)
+        if observation_prior <= 0.0 or observation_prior >= 1.0:
+            raise ValueError("observation_prior must be greater than 0 and lower than 1")
+        command_args.extend(["--observation-prior", str(observation_prior)])
+
     result = _run_java_stpn_command(
         repo_root=repo_root,
-        command_args=[
-            "--time-step",
-            str(time_step_hours),
-            "--iterations",
-            str(iterations),
-            "--stpn-solution-path",
-            os.path.abspath(precomputed["stpn_solution_path"]),
-            "--parameter-bundle",
-            os.path.abspath(precomputed["parameter_bundle_path"]),
-        ],
+        command_args=command_args,
         working_dir=analysis_dir,
     )
 
@@ -348,6 +356,7 @@ def run_stpn_analysis(
         "analysis_dir": analysis_dir,
         "iterations": iterations,
         "time_step_hours": time_step_hours,
+        "observation_prior": observation_prior,
         "stpn_solution_path": precomputed["stpn_solution_path"],
         "observation_curve_path": precomputed["observation_curve_path"],
         "stdout": result.stdout,

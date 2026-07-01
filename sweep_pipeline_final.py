@@ -1143,7 +1143,14 @@ def run_precompute_task(save_path, parameter_case, time_step_hours):
     return summary
 
 
-def run_java_analysis_task(save_path, dataset_run, parameter_case, time_step_hours, iterations):
+def run_java_analysis_task(
+    save_path,
+    dataset_run,
+    parameter_case,
+    time_step_hours,
+    iterations,
+    observation_prior=None,
+):
     case_id = parameter_case["case_id"]
     case_run_code = parameter_case["case_run_code"]
     parameter_bundle = parameter_case["parameter_bundle"]
@@ -1172,7 +1179,17 @@ def run_java_analysis_task(save_path, dataset_run, parameter_case, time_step_hou
                 except FileNotFoundError:
                     analysis_path = None
 
-            if _is_valid_path(analysis_path) and observed_path_matches:
+            cached_observation_prior = cached_summary.get("observation_prior")
+            observation_prior_matches = (
+                observation_prior is None
+                and cached_observation_prior is None
+            ) or (
+                observation_prior is not None
+                and isinstance(cached_observation_prior, (int, float))
+                and abs(float(cached_observation_prior) - float(observation_prior)) <= 1e-12
+            )
+
+            if _is_valid_path(analysis_path) and observed_path_matches and observation_prior_matches:
                 changed = False
                 if cached_summary.get("parameter_case_code") != case_run_code:
                     cached_summary["parameter_case_code"] = case_run_code
@@ -1197,6 +1214,7 @@ def run_java_analysis_task(save_path, dataset_run, parameter_case, time_step_hou
         cache_dir=None,
         repo_root=".",
         time_step_hours=time_step_hours,
+        observation_prior=observation_prior,
     )
     analysis_wall_runtime_seconds = time.perf_counter() - started_at
     analysis_path = find_generated_file(analysis_dir, f"_tracks_it{iterations}.json")
@@ -1216,6 +1234,7 @@ def run_java_analysis_task(save_path, dataset_run, parameter_case, time_step_hou
         "analysis_path": analysis_path,
         "time_step_hours": time_step_hours,
         "iterations": iterations,
+        "observation_prior": observation_prior,
         "analysis_wall_runtime_seconds": analysis_wall_runtime_seconds,
     }
     write_json(summary_path, summary)
@@ -1760,6 +1779,7 @@ def run_comparison_task(
             "analysis_dir": java_summary["analysis_dir"],
             "analysis_path": analysis_path,
             "analysis_wall_runtime_seconds": java_summary["analysis_wall_runtime_seconds"],
+            "observation_prior": java_summary.get("observation_prior"),
             "parameter_bundle_path": java_summary["parameter_bundle_path"],
             "stpn_solution_path": java_summary["stpn_solution_path"],
             "observation_curve_path": java_summary["observation_curve_path"],

@@ -1,0 +1,870 @@
+#!/usr/bin/env python3
+"""Run P(omega) sensitivity analyses while reusing GT and baseline artifacts.
+
+This script is intended to run on a space-constrained compute machine.  It
+stages one dataset/prior experiment at a time from an existing full sweep,
+runs only the Java analysis with a different observation prior, recomputes
+comparison metrics against the reused ground truth and baseline, generates the
+selected best/worst/median plots, copies results back with rsync, and removes
+local staged data.
+"""
+
+import argparse
+import csv
+import json
+import os
+import posixpath
+import shlex
+import shutil
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from tqdm import tqdm
+
+import sweep_pipeline_final as final
+
+
+DEFAULT_PRIORS = (0.1, 0.3, 0.7, 0.9)
+DEFAULT_DATASETS = ("bubble_400", "scale_free_2500", "small_world_3600")
+QUARTILE_LABEL = f"q{final.QUANTILE}"
+RUN_PREFIX = "pomega_sensitivity_"
+COMPLETION_SENTINEL = "_run_completed.json"
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    raw: str
+    is_remote: bool
+    host: Optional[str]
+    path: str
+
+
+@dataclass(frozen=True)
+class DatasetTarget:
+    key: str
+    dataset_stem: str
+    aliases: Tuple[str, ...]
+
+
+DATASET_TARGETS = (
+    DatasetTarget(
+        key="bubble_400",
+        dataset_stem="dataset_bubble_400",
+        aliases=("bubble_400", "household_bubble_400", "hb400", "dataset_bubble_400"),
+    ),
+    DatasetTarget(
+        key="scale_free_2500",
+        dataset_stem="dataset_scale_free_2500",
+        aliases=("scale_free_2500", "sf2500", "dataset_scale_free_2500"),
+    ),
+    DatasetTarget(
+        key="small_world_3600",
+        dataset_stem="dataset_small_world_3600",
+        aliases=("small_world_3600", "sw3600", "dataset_small_world_3600"),
+    ),
+)
+TARGET_BY_ALIAS = {
+    alias: target
+    for target in DATASET_TARGETS
+    for alias in target.aliases
+}
+
+
+def parse_endpoint(value: str) -> Endpoint:
+    value = value.strip()
+    if not value:
+        raise ValueError("Endpoint cannot be empty.")
+    if ":" in value and not value.startswith("/"):
+        host, path = value.split(":", 1)
+        if host and path.startswith("/"):
+            return Endpoint(raw=value, is_remote=True, host=host, path=path.rstrip("/") or "/")
+    return Endpoint(raw=value, is_remote=False, host=None, path=os.path.abspath(value))
+
+
+def endpoint_path(endpoint: Endpoint, *parts: str) -> str:
+    clean_parts = [str(part).strip("/") for part in parts if str(part).strip("/")]
+    if endpoint.is_remote:
+        path = endpoint.path
+        for part in clean_parts:
+            path = posixpath.join(path, part)
+        return path
+    return os.path.join(endpoint.path, *clean_parts)
+
+
+def endpoint_spec(endpoint: Endpoint, *parts: str, trailing_slash: bool = False) -> str:
+    path = endpoint_path(endpoint, *parts)
+    if trailing_slash and not path.endswith("/"):
+        path += "/"
+    if endpoint.is_remote:
+        return f"{endpoint.host}:{path}"
+    return path
+
+
+def endpoint_child(endpoint: Endpoint, *parts: str) -> Endpoint:
+    path = endpoint_path(endpoint, *parts)
+    if endpoint.is_remote:
+        return Endpoint(raw=f"{endpoint.host}:{path}", is_remote=True, host=endpoint.host, path=path)
+    return Endpoint(raw=path, is_remote=False, host=None, path=path)
+
+
+def endpoint_basename(endpoint: Endpoint) -> str:
+    if endpoint.is_remote:
+        return posixpath.basename(endpoint.path.rstrip("/"))
+    return os.path.basename(endpoint.path.rstrip(os.sep))
+
+
+def ssh_command(endpoint: Endpoint, command: str, ssh_opts: Optional[str] = None) -> List[str]:
+    if not endpoint.is_remote or not endpoint.host:
+        raise ValueError("SSH command requested for a local endpoint.")
+    args = ["ssh"]
+    if ssh_opts:
+        args.extend(shlex.split(ssh_opts))
+    args.extend([endpoint.host, command])
+    return args
+
+
+def ensure_endpoint_dir(endpoint: Endpoint, *parts: str, ssh_opts: Optional[str] = None) -> None:
+    path = endpoint_path(endpoint, *parts)
+    if endpoint.is_remote:
+        subprocess.run(
+            ssh_command(endpoint, "mkdir -p " + shlex.quote(path), ssh_opts),
+            check=True,
+        )
+    else:
+        os.makedirs(path, exist_ok=True)
+
+
+def endpoint_exists(endpoint: Endpoint, *parts: str, ssh_opts: Optional[str] = None) -> bool:
+    path = endpoint_path(endpoint, *parts)
+    if endpoint.is_remote:
+        result = subprocess.run(
+            ssh_command(endpoint, "test -e " + shlex.quote(path), ssh_opts),
+            check=False,
+        )
+        return result.returncode == 0
+    return os.path.exists(path)
+
+
+def run_rsync(
+    source: str,
+    destination: str,
+    ssh_opts: Optional[str] = None,
+    extra_args: Optional[Sequence[str]] = None,
+) -> None:
+    command = ["rsync", "-a"]
+    if ssh_opts:
+        command.extend(["-e", "ssh " + ssh_opts])
+    if extra_args:
+        command.extend(extra_args)
+    command.extend([source, destination])
+    subprocess.run(command, check=True)
+
+
+def read_paths_file(path: str) -> Dict[str, str]:
+    config: Dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise ValueError(f"Invalid paths-file line {line_number}: expected KEY=VALUE.")
+            key, value = line.split("=", 1)
+            config[key.strip().upper()] = value.strip()
+
+    required = ("SOURCE_ROOT", "DEST_ROOT", "LOCAL_WORK")
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise ValueError(f"Missing required paths-file key(s): {', '.join(missing)}")
+    return config
+
+
+def read_json(path: str):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json(path: str, payload) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=4)
+
+
+def write_csv(path: str, rows: Sequence[Dict[str, object]], fieldnames: Sequence[str]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field) for field in fieldnames})
+
+
+def run_relative_path(path_value: str, run_name: str) -> str:
+    if not isinstance(path_value, str) or not path_value:
+        raise ValueError(f"Invalid artifact path: {path_value!r}")
+    normalized = path_value.replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if run_name in parts:
+        index = parts.index(run_name)
+        tail = parts[index + 1 :]
+        if not tail:
+            raise ValueError(f"Artifact path points at run root, not a file: {path_value}")
+        return posixpath.join(*tail)
+    if normalized.startswith("/"):
+        raise ValueError(
+            f"Absolute artifact path does not contain source run name '{run_name}': {path_value}"
+        )
+    return posixpath.normpath(normalized)
+
+
+def local_artifact_path(local_input_root: str, relative_path: str) -> str:
+    return os.path.join(local_input_root, *relative_path.split("/"))
+
+
+def copy_artifact(
+    source_root: Endpoint,
+    local_input_root: str,
+    source_run_name: str,
+    path_value: str,
+    ssh_opts: Optional[str],
+) -> str:
+    relative_path = run_relative_path(path_value, source_run_name)
+    local_path = local_artifact_path(local_input_root, relative_path)
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    run_rsync(
+        endpoint_spec(source_root, relative_path),
+        local_path,
+        ssh_opts=ssh_opts,
+    )
+    return local_path
+
+
+def copy_top_level_file(
+    source_root: Endpoint,
+    local_input_root: str,
+    filename: str,
+    ssh_opts: Optional[str],
+) -> str:
+    local_path = os.path.join(local_input_root, filename)
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    run_rsync(endpoint_spec(source_root, filename), local_path, ssh_opts=ssh_opts)
+    return local_path
+
+
+def resolve_targets(dataset_args: Sequence[str]) -> List[DatasetTarget]:
+    targets: List[DatasetTarget] = []
+    unknown = []
+    for raw_value in dataset_args:
+        value = raw_value.strip()
+        target = TARGET_BY_ALIAS.get(value)
+        if target is None:
+            unknown.append(value)
+        elif target not in targets:
+            targets.append(target)
+    if unknown:
+        supported = ", ".join(sorted(TARGET_BY_ALIAS))
+        raise ValueError(f"Unsupported dataset target(s): {', '.join(unknown)}. Supported: {supported}")
+    return targets
+
+
+def parse_priors(values: Sequence[str]) -> List[float]:
+    priors = []
+    for value in values:
+        prior = float(value)
+        if prior <= 0.0 or prior >= 1.0:
+            raise ValueError(f"Invalid prior {value}: values must be greater than 0 and lower than 1.")
+        priors.append(prior)
+    return priors
+
+
+def prior_label(prior: float) -> str:
+    return (f"{prior:.12g}").replace(".", "p")
+
+
+def load_source_indexes(
+    source_root: Endpoint,
+    local_input_root: str,
+    ssh_opts: Optional[str],
+) -> Tuple[List[dict], List[dict]]:
+    copy_top_level_file(source_root, local_input_root, "dataset_runs_summary.json", ssh_opts)
+    copy_top_level_file(source_root, local_input_root, "python_analysis_summary.json", ssh_opts)
+    dataset_runs = read_json(os.path.join(local_input_root, "dataset_runs_summary.json"))
+    python_summaries = read_json(os.path.join(local_input_root, "python_analysis_summary.json"))
+    return dataset_runs, python_summaries
+
+
+def localize_dataset_run(
+    dataset_run: dict,
+    source_root: Endpoint,
+    local_input_root: str,
+    source_run_name: str,
+    ssh_opts: Optional[str],
+) -> dict:
+    localized = dict(dataset_run)
+    required_paths = ("dataset_path", "observed_simulated_path", "ground_truth_path")
+    for key in required_paths:
+        localized[key] = copy_artifact(
+            source_root,
+            local_input_root,
+            source_run_name,
+            dataset_run[key],
+            ssh_opts,
+        )
+    return localized
+
+
+def localize_python_summaries(
+    python_summaries: Sequence[dict],
+    dataset_stem: str,
+    source_root: Endpoint,
+    local_input_root: str,
+    source_run_name: str,
+    ssh_opts: Optional[str],
+) -> List[dict]:
+    localized = []
+    for summary in python_summaries:
+        if summary.get("dataset_stem") != dataset_stem:
+            continue
+        copied = dict(summary)
+        copied["averaged_results_path"] = copy_artifact(
+            source_root,
+            local_input_root,
+            source_run_name,
+            summary["averaged_results_path"],
+            ssh_opts,
+        )
+        localized.append(copied)
+    return localized
+
+
+def build_parameter_case_maps() -> Tuple[List[dict], Dict[str, dict]]:
+    parameter_cases, _ground_truth_case = final.build_parameter_combinations(os.path.join(".", "parameters.json"))
+    cases_by_id = {case["case_id"]: case for case in parameter_cases}
+    return parameter_cases, cases_by_id
+
+
+def select_dataset_run(dataset_runs: Sequence[dict], target: DatasetTarget) -> dict:
+    matches = [run for run in dataset_runs if run.get("dataset_stem") == target.dataset_stem]
+    if len(matches) != 1:
+        available = ", ".join(sorted(str(run.get("dataset_stem")) for run in dataset_runs))
+        raise ValueError(
+            f"Expected exactly one dataset_run for {target.dataset_stem}, found {len(matches)}. "
+            f"Available dataset stems: {available}"
+        )
+    return matches[0]
+
+
+def validate_python_summaries(
+    localized_python_summaries: Sequence[dict],
+    target: DatasetTarget,
+    cases_by_id: Dict[str, dict],
+) -> Dict[Tuple[str, str], dict]:
+    summary_by_key = {}
+    for summary in localized_python_summaries:
+        case_id = summary.get("parameter_case_id")
+        if case_id in cases_by_id:
+            summary_by_key[(target.dataset_stem, case_id)] = summary
+    missing = [case_id for case_id in cases_by_id if (target.dataset_stem, case_id) not in summary_by_key]
+    if missing:
+        raise ValueError(
+            f"Missing {len(missing)} Python baseline summaries for {target.dataset_stem}; "
+            f"first missing case: {missing[0]}"
+        )
+    return summary_by_key
+
+
+def worker_count(max_workers: Optional[int], task_count: int) -> int:
+    if task_count <= 0:
+        return 1
+    if max_workers is not None:
+        if max_workers <= 0:
+            raise ValueError("--max-workers must be greater than 0")
+        return min(max_workers, task_count)
+    return final.resolve_worker_count(task_count)
+
+
+def run_java_stage(
+    save_path: str,
+    dataset_run: dict,
+    parameter_cases: Sequence[dict],
+    observation_prior: float,
+    max_workers: Optional[int],
+) -> List[dict]:
+    stage_name = "stage4_java_analysis"
+    total = len(parameter_cases)
+    final.write_stage_checkpoint(
+        save_path,
+        stage_name,
+        0,
+        total,
+        status="running",
+        extra={"observation_prior": observation_prior},
+    )
+    summaries = []
+    completed = 0
+    with ThreadPoolExecutor(max_workers=worker_count(max_workers, total)) as executor:
+        futures = [
+            executor.submit(
+                final.run_java_analysis_task,
+                save_path,
+                dataset_run,
+                parameter_case,
+                final.TIME_STEP,
+                final.INTERNAL_STEPS,
+                observation_prior,
+            )
+            for parameter_case in parameter_cases
+        ]
+        for future in tqdm(as_completed(futures), total=total, desc="Running Java analysis"):
+            summaries.append(future.result())
+            completed += 1
+            final.write_stage_checkpoint(
+                save_path,
+                stage_name,
+                completed,
+                total,
+                status="running",
+                extra={"observation_prior": observation_prior},
+            )
+    summaries.sort(key=lambda item: (item["dataset_stem"], item["parameter_case_id"]))
+    final.write_json(os.path.join(save_path, "java_analysis_summary.json"), summaries)
+    final.mark_stage_complete(save_path, stage_name)
+    final.write_stage_checkpoint(
+        save_path,
+        stage_name,
+        total,
+        total,
+        status="completed",
+        extra={"observation_prior": observation_prior},
+    )
+    return summaries
+
+
+def run_comparison_stage(
+    save_path: str,
+    dataset_run: dict,
+    parameter_cases: Sequence[dict],
+    java_summaries: Sequence[dict],
+    python_summary_by_key: Dict[Tuple[str, str], dict],
+    observation_prior: float,
+    max_workers: Optional[int],
+) -> List[dict]:
+    java_summary_by_key = {
+        (summary["dataset_stem"], summary["parameter_case_id"]): summary
+        for summary in java_summaries
+    }
+    tasks = []
+    for parameter_case in parameter_cases:
+        key = (dataset_run["dataset_stem"], parameter_case["case_id"])
+        tasks.append((parameter_case, java_summary_by_key[key], python_summary_by_key[key]))
+
+    stage_name = "stage7_comparison"
+    total = len(tasks)
+    final.write_stage_checkpoint(
+        save_path,
+        stage_name,
+        0,
+        total,
+        status="running",
+        extra={"observation_prior": observation_prior},
+    )
+    comparison_summaries = []
+    completed = 0
+    with ThreadPoolExecutor(max_workers=worker_count(max_workers, total)) as executor:
+        futures = [
+            executor.submit(
+                final.run_comparison_task,
+                save_path,
+                QUARTILE_LABEL,
+                java_summary["analysis_wall_runtime_seconds"],
+                dataset_run,
+                parameter_case,
+                java_summary,
+                python_summary,
+                final.TIME_STEP,
+                final.INTERNAL_STEPS,
+                False,
+            )
+            for parameter_case, java_summary, python_summary in tasks
+        ]
+        for future in tqdm(as_completed(futures), total=total, desc="Running comparisons"):
+            summary = future.result()
+            summary["observation_prior"] = observation_prior
+            summary.setdefault("java_analysis", {})["observation_prior"] = observation_prior
+            comparison_summaries.append(summary)
+            completed += 1
+            final.write_stage_checkpoint(
+                save_path,
+                stage_name,
+                completed,
+                total,
+                status="running",
+                extra={"observation_prior": observation_prior},
+            )
+    comparison_summaries.sort(key=lambda item: (item["dataset_stem"], item["parameter_case_id"]))
+    final.mark_stage_complete(save_path, stage_name)
+    final.write_stage_checkpoint(
+        save_path,
+        stage_name,
+        total,
+        total,
+        status="completed",
+        extra={"observation_prior": observation_prior},
+    )
+    return comparison_summaries
+
+
+def regenerate_selected_plots(
+    save_path: str,
+    comparison_summaries: List[dict],
+    observation_prior: float,
+    max_workers: Optional[int],
+) -> Tuple[List[dict], str]:
+    notes_by_run, selection_manifest = final.build_notes_map_and_selection_manifest(comparison_summaries)
+    selection_manifest["observation_prior"] = observation_prior
+    final.apply_notes_to_comparison_summaries(comparison_summaries, notes_by_run)
+    selection_manifest_path = os.path.join(save_path, "selected_run_manifest.json")
+    final.write_json(selection_manifest_path, selection_manifest)
+
+    stage_name = "stage8_selected_plots"
+    selected_summaries = [summary for summary in comparison_summaries if summary.get("note")]
+    total = len(selected_summaries)
+    final.write_stage_checkpoint(
+        save_path,
+        stage_name,
+        0,
+        total,
+        status="running",
+        extra={"observation_prior": observation_prior},
+    )
+    if total:
+        updated_by_run_id = {}
+        with ThreadPoolExecutor(max_workers=worker_count(max_workers, total)) as executor:
+            futures = [
+                executor.submit(
+                    final.regenerate_selected_run_plots,
+                    summary,
+                    final.TIME_STEP,
+                    final.INTERNAL_STEPS,
+                )
+                for summary in selected_summaries
+            ]
+            completed = 0
+            for future in tqdm(as_completed(futures), total=total, desc="Generating selected plots"):
+                updated_summary = future.result()
+                updated_summary["observation_prior"] = observation_prior
+                updated_summary.setdefault("java_analysis", {})["observation_prior"] = observation_prior
+                updated_by_run_id[updated_summary["run_id"]] = updated_summary
+                completed += 1
+                final.write_stage_checkpoint(
+                    save_path,
+                    stage_name,
+                    completed,
+                    total,
+                    status="running",
+                    extra={"observation_prior": observation_prior},
+                )
+        comparison_summaries = [
+            updated_by_run_id.get(summary["run_id"], summary)
+            for summary in comparison_summaries
+        ]
+    final.mark_stage_complete(save_path, stage_name)
+    final.write_stage_checkpoint(
+        save_path,
+        stage_name,
+        total,
+        total,
+        status="completed",
+        extra={"observation_prior": observation_prior},
+    )
+    return comparison_summaries, selection_manifest_path
+
+
+def write_experiment_metadata(
+    save_path: str,
+    target: DatasetTarget,
+    observation_prior: float,
+    source_root: Endpoint,
+    started_at: str,
+    rows_written: int,
+    selected_runs: int,
+) -> None:
+    write_json(
+        os.path.join(save_path, "pomega_experiment_metadata.json"),
+        {
+            "dataset_key": target.key,
+            "dataset_stem": target.dataset_stem,
+            "observation_prior": observation_prior,
+            "source_root": source_root.raw,
+            "time_step_hours": final.TIME_STEP,
+            "internal_steps": final.INTERNAL_STEPS,
+            "quartile_label": QUARTILE_LABEL,
+            "rows_written": rows_written,
+            "selected_runs_for_plots": selected_runs,
+            "started_at": started_at,
+            "completed_at": datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+
+
+def write_completion_sentinel(save_path: str, payload: dict) -> None:
+    payload = dict(payload)
+    payload.setdefault("completed_at", datetime.now().isoformat(timespec="seconds"))
+    write_json(os.path.join(save_path, COMPLETION_SENTINEL), payload)
+
+
+def copy_experiment_back(
+    local_experiment_dir: str,
+    dest_root: Endpoint,
+    run_label: str,
+    target: DatasetTarget,
+    prior: float,
+    ssh_opts: Optional[str],
+) -> None:
+    remote_parts = (run_label, target.dataset_stem, f"pomega_{prior_label(prior)}")
+    ensure_endpoint_dir(dest_root, *remote_parts, ssh_opts=ssh_opts)
+    run_rsync(
+        local_experiment_dir.rstrip(os.sep) + os.sep,
+        endpoint_spec(dest_root, *remote_parts, trailing_slash=True),
+        ssh_opts=ssh_opts,
+    )
+
+
+def copy_top_level_summaries_back(
+    local_run_root: str,
+    dest_root: Endpoint,
+    run_label: str,
+    ssh_opts: Optional[str],
+) -> None:
+    ensure_endpoint_dir(dest_root, run_label, ssh_opts=ssh_opts)
+    for filename in ("pomega_sensitivity_summary.json", "pomega_sensitivity_summary.csv"):
+        path = os.path.join(local_run_root, filename)
+        if os.path.exists(path):
+            run_rsync(path, endpoint_spec(dest_root, run_label, filename), ssh_opts=ssh_opts)
+
+
+def run_one_experiment(
+    source_root: Endpoint,
+    dest_root: Endpoint,
+    run_label: str,
+    local_run_root: str,
+    target: DatasetTarget,
+    prior: float,
+    parameter_cases: Sequence[dict],
+    cases_by_id: Dict[str, dict],
+    max_workers: Optional[int],
+    ssh_opts: Optional[str],
+) -> dict:
+    experiment_name = os.path.join(target.dataset_stem, f"pomega_{prior_label(prior)}")
+    experiment_dir = os.path.join(local_run_root, experiment_name)
+    local_input_root = os.path.join(experiment_dir, "_input")
+    save_path = os.path.join(experiment_dir, "result")
+    started_at = datetime.now().isoformat(timespec="seconds")
+    os.makedirs(local_input_root, exist_ok=True)
+    os.makedirs(save_path, exist_ok=True)
+
+    source_run_name = endpoint_basename(source_root)
+    dataset_runs, python_summaries = load_source_indexes(source_root, local_input_root, ssh_opts)
+    source_dataset_run = select_dataset_run(dataset_runs, target)
+    dataset_run = localize_dataset_run(
+        source_dataset_run,
+        source_root,
+        local_input_root,
+        source_run_name,
+        ssh_opts,
+    )
+    localized_python_summaries = localize_python_summaries(
+        python_summaries,
+        target.dataset_stem,
+        source_root,
+        local_input_root,
+        source_run_name,
+        ssh_opts,
+    )
+    python_summary_by_key = validate_python_summaries(localized_python_summaries, target, cases_by_id)
+
+    final.write_json(os.path.join(save_path, "dataset_runs_summary.json"), [dataset_run])
+    final.write_json(os.path.join(save_path, "python_analysis_summary_reused.json"), localized_python_summaries)
+    final.write_json(
+        os.path.join(save_path, "run_metadata.json"),
+        {
+            "mode": "pomega_sensitivity_analysis_only",
+            "dataset_key": target.key,
+            "dataset_stem": target.dataset_stem,
+            "observation_prior": prior,
+            "source_root": source_root.raw,
+            "started_at": started_at,
+            "time_step_hours": final.TIME_STEP,
+            "internal_steps": final.INTERNAL_STEPS,
+            "quartile_label": QUARTILE_LABEL,
+            "reused_ground_truth": True,
+            "reused_python_baseline": True,
+        },
+    )
+
+    java_summaries = run_java_stage(save_path, dataset_run, parameter_cases, prior, max_workers)
+    comparison_summaries = run_comparison_stage(
+        save_path,
+        dataset_run,
+        parameter_cases,
+        java_summaries,
+        python_summary_by_key,
+        prior,
+        max_workers,
+    )
+    comparison_summaries, selection_manifest_path = regenerate_selected_plots(
+        save_path,
+        comparison_summaries,
+        prior,
+        max_workers,
+    )
+    output_paths = final.persist_comparison_outputs(save_path, QUARTILE_LABEL, comparison_summaries)
+    selected_count = len([summary for summary in comparison_summaries if summary.get("note")])
+    final.update_run_completion_metadata(
+        save_path=save_path,
+        quartile_label=QUARTILE_LABEL,
+        comparison_summaries=comparison_summaries,
+        output_paths=output_paths,
+        selection_manifest_path=selection_manifest_path,
+    )
+    write_experiment_metadata(
+        save_path,
+        target,
+        prior,
+        source_root,
+        started_at,
+        output_paths["rows_written"],
+        selected_count,
+    )
+    write_completion_sentinel(
+        save_path,
+        {
+            "dataset_key": target.key,
+            "dataset_stem": target.dataset_stem,
+            "observation_prior": prior,
+            "rows_written": output_paths["rows_written"],
+            "selected_runs_for_plots": selected_count,
+        },
+    )
+
+    copy_experiment_back(save_path, dest_root, run_label, target, prior, ssh_opts)
+    return {
+        "dataset_key": target.key,
+        "dataset_stem": target.dataset_stem,
+        "observation_prior": prior,
+        "local_result_path": save_path,
+        "dest_result_path": posixpath.join(run_label, target.dataset_stem, f"pomega_{prior_label(prior)}"),
+        "rows_written": output_paths["rows_written"],
+        "selected_runs_for_plots": selected_count,
+        "completed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run analysis-only P(omega) sensitivity experiments.")
+    parser.add_argument("--paths-file", default="pomega_paths.txt")
+    parser.add_argument(
+        "--source-run",
+        default=None,
+        help="Optional run directory name under SOURCE_ROOT when SOURCE_ROOT points to a parent directory.",
+    )
+    parser.add_argument("--priors", nargs="+", default=[str(value) for value in DEFAULT_PRIORS])
+    parser.add_argument("--datasets", nargs="+", default=list(DEFAULT_DATASETS))
+    parser.add_argument("--run-label", default=None)
+    parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument("--resume", action="store_true", help="Skip experiments whose destination sentinel already exists.")
+    parser.add_argument("--keep-local", action="store_true", help="Do not delete each staged experiment after copying results back.")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = parse_args(argv)
+    priors = parse_priors(args.priors)
+    targets = resolve_targets(args.datasets)
+
+    config = read_paths_file(args.paths_file)
+    source_root = parse_endpoint(config["SOURCE_ROOT"])
+    if args.source_run:
+        source_root = endpoint_child(source_root, args.source_run)
+    dest_root = parse_endpoint(config["DEST_ROOT"])
+    local_work = os.path.abspath(config["LOCAL_WORK"])
+    ssh_opts = config.get("RSYNC_SSH_OPTS")
+    run_label = args.run_label or RUN_PREFIX + datetime.now().strftime("%Y%m%d-%H%M%S")
+    local_run_root = os.path.join(local_work, run_label)
+    os.makedirs(local_run_root, exist_ok=True)
+
+    parameter_cases, cases_by_id = build_parameter_case_maps()
+    summary_rows: List[dict] = []
+    summary_json_path = os.path.join(local_run_root, "pomega_sensitivity_summary.json")
+    summary_csv_path = os.path.join(local_run_root, "pomega_sensitivity_summary.csv")
+
+    total = len(targets) * len(priors)
+    completed = 0
+    for target in targets:
+        for prior in priors:
+            completed += 1
+            remote_sentinel_parts = (
+                run_label,
+                target.dataset_stem,
+                f"pomega_{prior_label(prior)}",
+                COMPLETION_SENTINEL,
+            )
+            if args.resume and endpoint_exists(dest_root, *remote_sentinel_parts, ssh_opts=ssh_opts):
+                row = {
+                    "dataset_key": target.key,
+                    "dataset_stem": target.dataset_stem,
+                    "observation_prior": prior,
+                    "status": "skipped_existing_destination",
+                    "dest_result_path": posixpath.join(run_label, target.dataset_stem, f"pomega_{prior_label(prior)}"),
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                summary_rows.append(row)
+                write_json(summary_json_path, summary_rows)
+                write_csv(
+                    summary_csv_path,
+                    summary_rows,
+                    ("dataset_key", "dataset_stem", "observation_prior", "status", "dest_result_path", "rows_written", "selected_runs_for_plots", "completed_at"),
+                )
+                copy_top_level_summaries_back(local_run_root, dest_root, run_label, ssh_opts)
+                print(f"[{completed}/{total}] skipped existing {target.dataset_stem} p={prior}")
+                continue
+
+            experiment_dir = os.path.join(local_run_root, target.dataset_stem, f"pomega_{prior_label(prior)}")
+            print(f"[{completed}/{total}] running {target.dataset_stem} with P(omega)={prior}")
+            try:
+                row = run_one_experiment(
+                    source_root=source_root,
+                    dest_root=dest_root,
+                    run_label=run_label,
+                    local_run_root=local_run_root,
+                    target=target,
+                    prior=prior,
+                    parameter_cases=parameter_cases,
+                    cases_by_id=cases_by_id,
+                    max_workers=args.max_workers,
+                    ssh_opts=ssh_opts,
+                )
+                row["status"] = "completed"
+            finally:
+                if not args.keep_local and os.path.isdir(experiment_dir):
+                    shutil.rmtree(experiment_dir)
+
+            summary_rows.append(row)
+            write_json(summary_json_path, summary_rows)
+            write_csv(
+                summary_csv_path,
+                summary_rows,
+                ("dataset_key", "dataset_stem", "observation_prior", "status", "dest_result_path", "rows_written", "selected_runs_for_plots", "completed_at"),
+            )
+            copy_top_level_summaries_back(local_run_root, dest_root, run_label, ssh_opts)
+
+    if not args.keep_local:
+        with open(os.path.join(local_run_root, ".completed"), "w", encoding="utf-8") as handle:
+            handle.write(datetime.now().isoformat(timespec="seconds"))
+
+
+if __name__ == "__main__":
+    main()

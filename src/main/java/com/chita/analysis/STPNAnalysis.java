@@ -1125,6 +1125,18 @@ public class STPNAnalysis {
         return null;
     }
 
+    private static double parseObservationPrior(String[] args) {
+        String observationPriorArg = getArgValue(args, "--observation-prior");
+        if (observationPriorArg == null) {
+            return 0.5;
+        }
+        double observationPrior = Double.parseDouble(observationPriorArg);
+        if (observationPrior <= 0.0 || observationPrior >= 1.0) {
+            throw new IllegalArgumentException("observation-prior must be greater than 0 and lower than 1");
+        }
+        return observationPrior;
+    }
+
     public static void main(String[] args) throws Exception {
         float time_step = 1.0f;
         String timeStepArg = getArgValue(args, "--time-step");
@@ -1149,6 +1161,7 @@ public class STPNAnalysis {
         String parameterBundlePath = getArgValue(args, "--parameter-bundle");
         boolean precomputeOnly = Arrays.asList(args).contains("--precompute-only");
         AnalysisParameters analysisParameters = loadAnalysisParameters(parameterBundlePath);
+        double observationPrior = parseObservationPrior(args);
 
 
         LinkedHashSet<String> discoveredJsonFiles = new LinkedHashSet<>();
@@ -1166,6 +1179,7 @@ public class STPNAnalysis {
         List<String> jsonFiles = new ArrayList<>(discoveredJsonFiles);
         jsonFiles.forEach(System.out::println);
         System.out.println("Using analysis parameter bundle: " + analysisParameters.caseId);
+        System.out.println("Using observation prior: " + observationPrior);
         ObservationCurves observationCurves = loadOrCreateObservationCurves(analysisParameters, time_step);
         int time_limit = 84;
         int curve_time_limit = 63;
@@ -1200,7 +1214,7 @@ public class STPNAnalysis {
         for (int repetition = 0; repetition < 1; repetition++) {
             for (int documentId = 0; documentId < jsonFiles.size(); documentId++) {
                 int n_iterations = requestedIterations;
-                double[] priorsValues = {0.5, 0.5, 0.5};
+                double[] priorsValues = {observationPrior, observationPrior, observationPrior};
                 String filePath = jsonFiles.get(documentId);
                 String documentName = filePath.substring(filePath.lastIndexOf("\\") + 1, filePath.lastIndexOf("."));
                 JsonObject jsonObject = JsonFileReader.readJsonFromFile(filePath);
