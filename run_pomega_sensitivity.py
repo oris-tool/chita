@@ -17,6 +17,7 @@ import posixpath
 import shlex
 import shutil
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -690,6 +691,249 @@ def run_java_stage(
     return summaries
 
 
+_GROUND_TRUTH_CACHE = {}
+_GROUND_TRUTH_CACHE_LOCK = threading.Lock()
+
+
+def _track_cache_key(path: str) -> Tuple[str, int, int]:
+    stat = os.stat(path)
+    return (os.path.abspath(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def read_ground_truth_tracks_cached(path: str):
+    key = _track_cache_key(path)
+    with _GROUND_TRUTH_CACHE_LOCK:
+        cached = _GROUND_TRUTH_CACHE.get(key)
+        if cached is None:
+            cached = final.sort_subject_tracks(final.sp.read_json(path))
+            _GROUND_TRUTH_CACHE[key] = cached
+        return cached
+
+
+def clear_ground_truth_tracks_cache() -> None:
+    with _GROUND_TRUTH_CACHE_LOCK:
+        _GROUND_TRUTH_CACHE.clear()
+
+
+def compute_precision_metrics_from_tracks(candidate, ground_truth, metrics_output: str, m: int = 10) -> dict:
+    os.makedirs(os.path.dirname(metrics_output), exist_ok=True)
+    candidate_subjects = sorted(candidate.keys(), key=int)
+    ground_truth_subjects = sorted(ground_truth.keys(), key=int)
+    if candidate_subjects != ground_truth_subjects:
+        raise ValueError("Prediction and ground-truth tracks do not contain the same subjects.")
+
+    metrics_dict = {}
+    total_brier_score = 0.0
+    total_ece = 0.0
+    bins = final.sp.np.linspace(0, 1, m + 1)
+    for subject_id in ground_truth_subjects:
+        predicted = final.sp.np.asarray(candidate[subject_id], dtype=float)
+        observed = final.sp.np.asarray(ground_truth[subject_id], dtype=float)
+        if predicted.shape != observed.shape:
+            raise ValueError(
+                f"Subject {subject_id} has a different T "
+                f"(prediction:{predicted.shape[0]}, ground_truth:{observed.shape[0]})."
+            )
+        brier_score = float(final.sp.np.mean((predicted - observed) ** 2))
+        ece = 0.0
+        total = predicted.shape[0]
+        for bin_index in range(m):
+            if bin_index == 0:
+                in_bin = (predicted >= bins[bin_index]) & (predicted <= bins[bin_index + 1])
+            else:
+                in_bin = (predicted > bins[bin_index]) & (predicted <= bins[bin_index + 1])
+            count = int(final.sp.np.sum(in_bin))
+            if count:
+                confidence = float(final.sp.np.mean(predicted[in_bin]))
+                accuracy = float(final.sp.np.mean(observed[in_bin]))
+                ece += (count / total) * abs(accuracy - confidence)
+        total_brier_score += brier_score
+        total_ece += ece
+        metrics_dict[subject_id] = {
+            "Brier Score": brier_score,
+            "ECE": float(ece),
+        }
+
+    with open(metrics_output, "w", encoding="utf-8") as handle:
+        json.dump(metrics_dict, handle, indent=4)
+
+    subject_count = len(ground_truth_subjects)
+    return {
+        "metrics_output": metrics_output,
+        "plots_dir": None,
+        "plots_generated": False,
+        "subject_count": subject_count,
+        "mean_brier_score": float(total_brier_score / subject_count) if subject_count else float("nan"),
+        "mean_ece": float(total_ece / subject_count) if subject_count else float("nan"),
+    }
+
+
+def compute_analysis_vs_simulation_metrics_from_tracks(
+    ground_truth,
+    analysis,
+    baseline,
+    run_dir: str,
+    write_csvs: bool,
+) -> dict:
+    output_dir = None
+    csv_summaries = None
+    analysis_summary = final.compute_candidate_summary_fast(
+        ground_truth,
+        analysis,
+        include_moving_avg_metrics=True,
+    )
+    baseline_summary = final.compute_candidate_summary_fast(
+        ground_truth,
+        baseline,
+        include_moving_avg_metrics=True,
+    )
+    if write_csvs:
+        output_dir = final.ensure_dir(os.path.join(run_dir, "plots", "analysis_vs_simulation"))
+        csv_summaries = final.write_analysis_vs_simulation_csvs_fast(
+            output_dir=output_dir,
+            ground_truth=ground_truth,
+            analysis=analysis,
+            baseline=baseline,
+            analysis_summary=analysis_summary,
+            baseline_summary=baseline_summary,
+        )
+    return {
+        "analysis": analysis_summary,
+        "simulation": baseline_summary,
+        "output_dir": output_dir,
+        "plot_paths": [],
+        "csv_paths": [] if csv_summaries is None else csv_summaries["csv_paths"],
+    }
+
+
+def run_comparison_task_fast(
+    save_path: str,
+    quartile_label: str,
+    runtime_budget_seconds: float,
+    dataset_run: dict,
+    parameter_case: dict,
+    java_summary: dict,
+    python_summary: dict,
+    time_step_hours: float,
+    iterations: int,
+) -> dict:
+    case_id = parameter_case["case_id"]
+    case_run_code = parameter_case["case_run_code"]
+    parameter_levels = parameter_case["levels"]
+    comparison_base_dir = os.path.join(
+        save_path,
+        "comparison",
+        quartile_label,
+        dataset_run["dataset_stem"],
+    )
+    comparison_dir = final.resolve_case_output_dir(comparison_base_dir, parameter_case)
+    summary_path = os.path.join(comparison_dir, "comparison_summary.json")
+    run_id = f"{dataset_run['dataset_stem']}__{case_run_code}__{quartile_label}"
+
+    analysis_path = final.ensure_analysis_tracks_path(
+        java_summary["analysis_dir"],
+        java_summary.get("analysis_path"),
+        parameter_case["parameter_bundle"],
+        iterations,
+        time_step_hours,
+        case_id=case_id,
+    )
+    baseline_path = python_summary["averaged_results_path"]
+    ground_truth_path = dataset_run["ground_truth_path"]
+
+    if os.path.exists(summary_path):
+        cached_summary = read_json(summary_path)
+        cached_java_analysis = cached_summary.get("java_analysis", {})
+        cached_python_analysis = cached_summary.get("python_analysis", {})
+        if (
+            os.path.abspath(cached_summary.get("ground_truth_path", "")) == os.path.abspath(ground_truth_path)
+            and os.path.abspath(cached_java_analysis.get("analysis_path", "")) == os.path.abspath(analysis_path)
+            and os.path.abspath(cached_python_analysis.get("baseline_path", "")) == os.path.abspath(baseline_path)
+        ):
+            return cached_summary
+
+    final.ensure_dir(comparison_dir)
+    precision_dir = os.path.join(comparison_dir, "precision_metrics")
+    final.ensure_dir(precision_dir)
+    prediction_metrics_path = os.path.join(precision_dir, "metrics_prediction.json")
+    baseline_metrics_path = os.path.join(precision_dir, "metrics_baseline.json")
+
+    ground_truth = read_ground_truth_tracks_cached(ground_truth_path)
+    analysis = final.sort_subject_tracks(final.sp.read_json(analysis_path))
+    baseline = final.sort_subject_tracks(final.sp.read_json(baseline_path))
+
+    prediction_metrics_summary = compute_precision_metrics_from_tracks(
+        analysis,
+        ground_truth,
+        prediction_metrics_path,
+        m=10,
+    )
+    baseline_metrics_summary = compute_precision_metrics_from_tracks(
+        baseline,
+        ground_truth,
+        baseline_metrics_path,
+        m=10,
+    )
+    comparison_metrics = compute_analysis_vs_simulation_metrics_from_tracks(
+        ground_truth=ground_truth,
+        analysis=analysis,
+        baseline=baseline,
+        run_dir=comparison_dir,
+        write_csvs=final.SAVE_COMPARISON_CSVS,
+    )
+
+    summary = {
+        "run_id": run_id,
+        "quartile_label": quartile_label,
+        "runtime_budget_seconds": runtime_budget_seconds,
+        "dataset_path": dataset_run["dataset_path"],
+        "dataset_stem": dataset_run["dataset_stem"],
+        "ground_truth_iterations": dataset_run.get("ground_truth_iterations"),
+        "ground_truth_path": ground_truth_path,
+        "parameter_case_id": case_id,
+        "parameter_case_code": case_run_code,
+        "parameter_case_index": parameter_case["case_index"],
+        "parameter_levels": parameter_levels,
+        "java_analysis": {
+            "analysis_dir": java_summary["analysis_dir"],
+            "analysis_path": analysis_path,
+            "analysis_wall_runtime_seconds": java_summary["analysis_wall_runtime_seconds"],
+            "observation_prior": java_summary.get("observation_prior"),
+            "parameter_bundle_path": java_summary["parameter_bundle_path"],
+            "stpn_solution_path": java_summary["stpn_solution_path"],
+            "observation_curve_path": java_summary["observation_curve_path"],
+            "subject_curve_plots": {
+                "output_dir": None,
+                "csv_path": None,
+                "epsilon": None,
+                "plot_paths": [],
+                "java_curve_plot_paths": [],
+            },
+        },
+        "python_analysis": {
+            "analysis_dir": python_summary["analysis_dir"],
+            "baseline_path": baseline_path,
+            "actual_runtime_seconds": python_summary["actual_runtime_seconds"],
+            "rep_done": python_summary["rep_done"],
+            "dkw_csv_path": python_summary["dkw_csv_path"],
+            "suppressed_stdout_log_path": python_summary["suppressed_stdout_log_path"],
+        },
+        "precision_metrics": {
+            "prediction_metrics_path": prediction_metrics_path,
+            "baseline_metrics_path": baseline_metrics_path,
+            "prediction_mean_brier": prediction_metrics_summary["mean_brier_score"],
+            "prediction_mean_ece": prediction_metrics_summary["mean_ece"],
+            "baseline_mean_brier": baseline_metrics_summary["mean_brier_score"],
+            "baseline_mean_ece": baseline_metrics_summary["mean_ece"],
+        },
+        "comparison_metrics": comparison_metrics,
+        "comparison_dir": comparison_dir,
+        "note": "",
+    }
+    final.write_json(summary_path, summary)
+    return summary
+
+
 def run_comparison_stage(
     save_path: str,
     dataset_run: dict,
@@ -723,7 +967,7 @@ def run_comparison_stage(
     with ThreadPoolExecutor(max_workers=worker_count(max_workers, total)) as executor:
         futures = [
             executor.submit(
-                final.run_comparison_task,
+                run_comparison_task_fast,
                 save_path,
                 QUARTILE_LABEL,
                 java_summary["analysis_wall_runtime_seconds"],
@@ -733,7 +977,6 @@ def run_comparison_stage(
                 python_summary,
                 final.TIME_STEP,
                 final.INTERNAL_STEPS,
-                False,
             )
             for parameter_case, java_summary, python_summary in tasks
         ]
@@ -977,6 +1220,7 @@ def run_one_experiment(
         prior,
         max_workers,
     )
+    clear_ground_truth_tracks_cache()
     comparison_summaries, selection_manifest_path = regenerate_selected_plots(
         save_path,
         comparison_summaries,
