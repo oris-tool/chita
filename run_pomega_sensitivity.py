@@ -549,6 +549,91 @@ def select_dataset_run(
     return reconstruct_dataset_run_from_artifacts(source_root, target, ssh_opts, local_input_root)
 
 
+def _parse_reps_from_averaged_results_path(path_value: str) -> Optional[int]:
+    filename = os.path.basename(path_value)
+    marker = "_simulated_"
+    suffix = "_reps.json"
+    if marker not in filename or not filename.endswith(suffix):
+        return None
+    try:
+        return int(filename.rsplit(marker, 1)[1][:-len(suffix)])
+    except ValueError:
+        return None
+
+
+def _first_existing_path(paths: Sequence[str]) -> Optional[str]:
+    for path_value in paths:
+        if path_value and os.path.exists(path_value):
+            return path_value
+    return None
+
+
+def reconstruct_python_summary_from_case_dir(
+    local_input_root: str,
+    target: DatasetTarget,
+    parameter_case: dict,
+) -> Optional[dict]:
+    case_code = parameter_case["case_run_code"]
+    analysis_dir = local_artifact_path(
+        local_input_root,
+        f"python_analysis/{QUARTILE_LABEL}/{target.dataset_stem}/{case_code}",
+    )
+    if not os.path.isdir(analysis_dir):
+        return None
+
+    import glob
+
+    averaged_candidates = [
+        candidate
+        for candidate in glob.glob(os.path.join(analysis_dir, "*_simulated_*_reps.json"))
+        if os.path.isfile(candidate)
+    ]
+    averaged_candidates.sort(
+        key=lambda item: (_parse_reps_from_averaged_results_path(item) or -1, item)
+    )
+    if not averaged_candidates:
+        return None
+
+    averaged_results_path = averaged_candidates[-1]
+    rep_done = _parse_reps_from_averaged_results_path(averaged_results_path)
+    dkw_csv_path = _first_existing_path(
+        sorted(glob.glob(os.path.join(analysis_dir, "plots", "*_dkw_band.csv")))
+    )
+    suppressed_stdout_log_path = _first_existing_path(
+        sorted(glob.glob(os.path.join(analysis_dir, "*_stdout.log")))
+    )
+    dataset_candidates = sorted(
+        candidate
+        for candidate in glob.glob(os.path.join(analysis_dir, "*.json"))
+        if os.path.isfile(candidate)
+        and os.path.basename(candidate) != "python_analysis_summary.json"
+        and "_simulated" not in os.path.basename(candidate)
+    )
+    analysis_dataset_path = dataset_candidates[0] if dataset_candidates else None
+
+    return {
+        "quartile_label": QUARTILE_LABEL,
+        "runtime_budget_seconds": None,
+        "dataset_path": None,
+        "dataset_stem": target.dataset_stem,
+        "parameter_case_id": parameter_case["case_id"],
+        "parameter_case_code": case_code,
+        "parameter_case_index": parameter_case["case_index"],
+        "parameter_levels": parameter_case["levels"],
+        "analysis_dir": analysis_dir,
+        "analysis_dataset_path": analysis_dataset_path,
+        "time_step_hours": final.TIME_STEP,
+        "actual_runtime_seconds": None,
+        "max_runtime_seconds": None,
+        "rep_done": rep_done,
+        "averaged_results_path": averaged_results_path,
+        "plots_dir": os.path.join(analysis_dir, "plots"),
+        "dkw_csv_path": dkw_csv_path,
+        "suppressed_stdout_log_path": suppressed_stdout_log_path,
+        "reconstructed_from_artifacts": True,
+    }
+
+
 def reconstruct_python_summaries_from_case_files(
     source_root: Endpoint,
     local_input_root: str,
@@ -558,7 +643,8 @@ def reconstruct_python_summaries_from_case_files(
     ssh_opts: Optional[str],
 ) -> List[dict]:
     summaries = []
-    case_codes = {parameter_case["case_run_code"] for parameter_case in parameter_cases}
+    case_by_code = {parameter_case["case_run_code"]: parameter_case for parameter_case in parameter_cases}
+    case_codes = set(case_by_code)
     local_dataset_dir = local_artifact_path(
         local_input_root,
         f"python_analysis/{QUARTILE_LABEL}/{target.dataset_stem}",
@@ -566,17 +652,24 @@ def reconstruct_python_summaries_from_case_files(
     if os.path.isdir(local_dataset_dir):
         for case_code in sorted(case_codes, key=lambda value: int(value) if str(value).isdigit() else str(value)):
             local_summary_path = os.path.join(local_dataset_dir, case_code, "python_analysis_summary.json")
-            if not os.path.exists(local_summary_path):
+            if os.path.exists(local_summary_path):
+                summary = read_json(local_summary_path)
+                summary["averaged_results_path"] = copy_artifact(
+                    source_root,
+                    local_input_root,
+                    source_run_name,
+                    summary["averaged_results_path"],
+                    ssh_opts,
+                )
+                summaries.append(summary)
                 continue
-            summary = read_json(local_summary_path)
-            summary["averaged_results_path"] = copy_artifact(
-                source_root,
+            recovered_summary = reconstruct_python_summary_from_case_dir(
                 local_input_root,
-                source_run_name,
-                summary["averaged_results_path"],
-                ssh_opts,
+                target,
+                case_by_code[case_code],
             )
-            summaries.append(summary)
+            if recovered_summary is not None:
+                summaries.append(recovered_summary)
         return summaries
 
     for parameter_case in parameter_cases:
@@ -617,9 +710,14 @@ def validate_python_summaries(
             summary_by_key[(target.dataset_stem, case_id)] = summary
     missing = [case_id for case_id in cases_by_id if (target.dataset_stem, case_id) not in summary_by_key]
     if missing:
+        reconstructed = len([summary for summary in localized_python_summaries if summary.get("reconstructed_from_artifacts")])
         raise ValueError(
             f"Missing {len(missing)} Python baseline summaries for {target.dataset_stem}; "
-            f"first missing case: {missing[0]}"
+            f"found {len(summary_by_key)} usable summaries "
+            f"({reconstructed} reconstructed from case artifacts); "
+            f"first missing case: {missing[0]}. "
+            "If this persists, the source sweep is missing the baseline averaged-results JSON files "
+            "for those parameter cases, not only the summary index."
         )
     return summary_by_key
 
@@ -1176,19 +1274,30 @@ def run_one_experiment(
         source_run_name,
         ssh_opts,
     )
-    if not localized_python_summaries:
-        print(
-            f"python_analysis_summary.json has no entries for {target.dataset_stem}; "
-            "attempting per-case summary reconstruction."
-        )
-        localized_python_summaries = reconstruct_python_summaries_from_case_files(
-            source_root,
-            local_input_root,
-            source_run_name,
-            target,
-            parameter_cases,
-            ssh_opts,
-        )
+    recovered_python_summaries = reconstruct_python_summaries_from_case_files(
+        source_root,
+        local_input_root,
+        source_run_name,
+        target,
+        parameter_cases,
+        ssh_opts,
+    )
+    summaries_by_case_id = {
+        summary.get("parameter_case_id"): summary
+        for summary in recovered_python_summaries
+        if summary.get("parameter_case_id")
+    }
+    summaries_by_case_id.update(
+        {
+            summary.get("parameter_case_id"): summary
+            for summary in localized_python_summaries
+            if summary.get("parameter_case_id")
+        }
+    )
+    localized_python_summaries = list(summaries_by_case_id.values())
+    recovered_count = len([summary for summary in localized_python_summaries if summary.get("reconstructed_from_artifacts")])
+    if recovered_count:
+        print(f"Recovered {recovered_count} Python baseline summaries for {target.dataset_stem} from case artifacts.")
     python_summary_by_key = validate_python_summaries(localized_python_summaries, target, cases_by_id)
 
     final.write_json(os.path.join(save_path, "dataset_runs_summary.json"), [dataset_run])
