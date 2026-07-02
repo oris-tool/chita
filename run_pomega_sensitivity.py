@@ -243,21 +243,42 @@ def write_csv(path: str, rows: Sequence[Dict[str, object]], fieldnames: Sequence
 
 
 def run_relative_path(path_value: str, run_name: str) -> str:
+    candidates = artifact_relative_path_candidates(path_value, run_name)
+    if not candidates:
+        raise ValueError(f"Invalid artifact path: {path_value!r}")
+    return candidates[0]
+
+
+def artifact_relative_path_candidates(path_value: str, run_name: str) -> List[str]:
     if not isinstance(path_value, str) or not path_value:
         raise ValueError(f"Invalid artifact path: {path_value!r}")
     normalized = path_value.replace("\\", "/")
     parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    candidates: List[str] = []
+
+    def add_candidate(candidate_parts: Sequence[str]) -> None:
+        if not candidate_parts:
+            return
+        candidate = posixpath.normpath(posixpath.join(*candidate_parts))
+        if candidate != "." and candidate not in candidates:
+            candidates.append(candidate)
+
     if run_name in parts:
         index = parts.index(run_name)
-        tail = parts[index + 1 :]
-        if not tail:
-            raise ValueError(f"Artifact path points at run root, not a file: {path_value}")
-        return posixpath.join(*tail)
-    if normalized.startswith("/"):
+        add_candidate(parts[index + 1 :])
+
+    for anchor in ("python_analysis", "ground_truth", "dataset_noise", "observed_one_run", "plots"):
+        if anchor in parts:
+            add_candidate(parts[parts.index(anchor) :])
+
+    if not normalized.startswith("/"):
+        add_candidate(parts)
+
+    if not candidates and normalized.startswith("/"):
         raise ValueError(
-            f"Absolute artifact path does not contain source run name '{run_name}': {path_value}"
+            f"Absolute artifact path does not contain source run name or a known artifact root: {path_value}"
         )
-    return posixpath.normpath(normalized)
+    return candidates
 
 
 def local_artifact_path(local_input_root: str, relative_path: str) -> str:
@@ -271,17 +292,28 @@ def copy_artifact(
     path_value: str,
     ssh_opts: Optional[str],
 ) -> str:
-    relative_path = run_relative_path(path_value, source_run_name)
-    local_path = local_artifact_path(local_input_root, relative_path)
-    if os.path.exists(local_path):
+    candidates = artifact_relative_path_candidates(path_value, source_run_name)
+    for relative_path in candidates:
+        local_path = local_artifact_path(local_input_root, relative_path)
+        if os.path.exists(local_path):
+            return local_path
+
+    for relative_path in candidates:
+        if not endpoint_exists(source_root, *relative_path.split("/"), ssh_opts=ssh_opts):
+            continue
+        local_path = local_artifact_path(local_input_root, relative_path)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        run_rsync(
+            endpoint_spec(source_root, relative_path),
+            local_path,
+            ssh_opts=ssh_opts,
+        )
         return local_path
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    run_rsync(
-        endpoint_spec(source_root, relative_path),
-        local_path,
-        ssh_opts=ssh_opts,
+
+    candidate_text = ", ".join(candidates)
+    raise FileNotFoundError(
+        f"Could not find artifact {path_value!r}. Tried relative paths under source root/local staging: {candidate_text}"
     )
-    return local_path
 
 
 def copy_top_level_file(
