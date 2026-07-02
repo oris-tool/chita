@@ -13,6 +13,8 @@ import argparse
 import csv
 import json
 import os
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import posixpath
 import shlex
 import shutil
@@ -754,6 +756,77 @@ def validate_python_summaries(
     return summary_by_key
 
 
+def python_summary_key_map(
+    localized_python_summaries: Sequence[dict],
+    target: DatasetTarget,
+    cases_by_id: Dict[str, dict],
+) -> Dict[Tuple[str, str], dict]:
+    summary_by_key = {}
+    for summary in localized_python_summaries:
+        case_id = summary.get("parameter_case_id")
+        if case_id in cases_by_id:
+            summary_by_key[(target.dataset_stem, case_id)] = summary
+    return summary_by_key
+
+
+def missing_python_case_ids(
+    python_summary_by_key: Dict[Tuple[str, str], dict],
+    target: DatasetTarget,
+    cases_by_id: Dict[str, dict],
+) -> List[str]:
+    return [
+        case_id
+        for case_id in cases_by_id
+        if (target.dataset_stem, case_id) not in python_summary_by_key
+    ]
+
+
+def rerun_missing_python_baselines(
+    save_path: str,
+    dataset_run: dict,
+    target: DatasetTarget,
+    missing_case_ids: Sequence[str],
+    cases_by_id: Dict[str, dict],
+    java_summary_by_key: Dict[Tuple[str, str], dict],
+    max_workers: Optional[int],
+) -> List[dict]:
+    if not missing_case_ids:
+        return []
+
+    print(
+        f"Rerunning {len(missing_case_ids)} missing Python baseline(s) for {target.dataset_stem} "
+        "from existing dataset and Java runtime budgets."
+    )
+    tasks = []
+    for case_id in missing_case_ids:
+        key = (target.dataset_stem, case_id)
+        if key not in java_summary_by_key:
+            raise ValueError(f"Cannot rerun missing Python baseline {case_id}: Java summary is unavailable.")
+        tasks.append((cases_by_id[case_id], java_summary_by_key[key]))
+
+    summaries = []
+    total = len(tasks)
+    with ThreadPoolExecutor(max_workers=worker_count(max_workers, total)) as executor:
+        futures = [
+            executor.submit(
+                final.run_python_analysis_task,
+                save_path,
+                dataset_run,
+                parameter_case,
+                QUARTILE_LABEL,
+                java_summary["analysis_wall_runtime_seconds"],
+                final.TIME_STEP,
+            )
+            for parameter_case, java_summary in tasks
+        ]
+        for future in tqdm(as_completed(futures), total=total, desc="Rerunning missing Python baselines"):
+            summary = future.result()
+            summary["recomputed_missing_baseline"] = True
+            summaries.append(summary)
+    summaries.sort(key=lambda item: (item["dataset_stem"], item["parameter_case_id"]))
+    return summaries
+
+
 def worker_count(max_workers: Optional[int], task_count: int) -> int:
     if task_count <= 0:
         return 1
@@ -1330,7 +1403,6 @@ def run_one_experiment(
     recovered_count = len([summary for summary in localized_python_summaries if summary.get("reconstructed_from_artifacts")])
     if recovered_count:
         print(f"Recovered {recovered_count} Python baseline summaries for {target.dataset_stem} from case artifacts.")
-    python_summary_by_key = validate_python_summaries(localized_python_summaries, target, cases_by_id)
 
     final.write_json(os.path.join(save_path, "dataset_runs_summary.json"), [dataset_run])
     final.write_json(os.path.join(save_path, "python_analysis_summary_reused.json"), localized_python_summaries)
@@ -1352,6 +1424,30 @@ def run_one_experiment(
     )
 
     java_summaries = run_java_stage(save_path, dataset_run, parameter_cases, prior, max_workers)
+    java_summary_by_key = {
+        (summary["dataset_stem"], summary["parameter_case_id"]): summary
+        for summary in java_summaries
+    }
+    python_summary_by_key = python_summary_key_map(localized_python_summaries, target, cases_by_id)
+    missing_case_ids = missing_python_case_ids(python_summary_by_key, target, cases_by_id)
+    if missing_case_ids:
+        recomputed_python_summaries = rerun_missing_python_baselines(
+            save_path,
+            dataset_run,
+            target,
+            missing_case_ids,
+            cases_by_id,
+            java_summary_by_key,
+            max_workers,
+        )
+        localized_python_summaries.extend(recomputed_python_summaries)
+        final.write_json(
+            os.path.join(save_path, "python_analysis_summary_recomputed_missing.json"),
+            recomputed_python_summaries,
+        )
+    python_summary_by_key = validate_python_summaries(localized_python_summaries, target, cases_by_id)
+    final.write_json(os.path.join(save_path, "python_analysis_summary_reused.json"), localized_python_summaries)
+
     comparison_summaries = run_comparison_stage(
         save_path,
         dataset_run,
