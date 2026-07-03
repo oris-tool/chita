@@ -19,6 +19,7 @@ import posixpath
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -242,6 +243,76 @@ def write_csv(path: str, rows: Sequence[Dict[str, object]], fieldnames: Sequence
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row.get(field) for field in fieldnames})
+
+
+class PlainProgress:
+    def __init__(self, iterable):
+        self.iterable = iterable
+
+    def __iter__(self):
+        return iter(self.iterable)
+
+    def set_postfix_str(self, *_args, **_kwargs) -> None:
+        return None
+
+
+def _stream_is_usable(stream) -> bool:
+    try:
+        stream.flush()
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _progress_stream():
+    if not _stream_is_usable(sys.stdout):
+        return None
+    if _stream_is_usable(sys.stderr):
+        return sys.stderr
+    return sys.stdout
+
+
+def _message_stream():
+    for stream in (sys.stderr, sys.stdout):
+        if _stream_is_usable(stream):
+            return stream
+    return None
+
+
+def progress_iter(iterable, **kwargs):
+    stream = _progress_stream()
+    if stream is None:
+        return PlainProgress(iterable)
+    try:
+        return tqdm(iterable, file=stream, **kwargs)
+    except (OSError, ValueError):
+        return PlainProgress(iterable)
+
+
+def progress_write(message: str) -> None:
+    stream = _message_stream()
+    if stream is None:
+        return
+    try:
+        print(message, file=stream, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def write_stage_partial(save_path: str, filename: str, rows: Sequence[dict]) -> None:
+    final.write_json(os.path.join(save_path, filename), list(rows))
+
+
+def maybe_write_stage_partial(
+    save_path: str,
+    filename: str,
+    rows: Sequence[dict],
+    completed: int,
+    total: int,
+    every: int = 25,
+) -> None:
+    if completed == total or completed % every == 0:
+        write_stage_partial(save_path, filename, rows)
 
 
 def run_relative_path(path_value: str, run_name: str) -> str:
@@ -576,7 +647,7 @@ def select_dataset_run(
         raise ValueError(f"Expected one dataset_run for {target.dataset_stem}, found {len(matches)}.")
 
     available = ", ".join(sorted(str(run.get("dataset_stem")) for run in dataset_runs))
-    print(
+    progress_write(
         f"dataset_runs_summary.json has no entry for {target.dataset_stem}; "
         f"attempting artifact reconstruction. Available stems: {available or '<none>'}"
     )
@@ -793,7 +864,7 @@ def rerun_missing_python_baselines(
     if not missing_case_ids:
         return []
 
-    print(
+    progress_write(
         f"Rerunning {len(missing_case_ids)} missing Python baseline(s) for {target.dataset_stem} "
         "from existing dataset and Java runtime budgets."
     )
@@ -819,10 +890,19 @@ def rerun_missing_python_baselines(
             )
             for parameter_case, java_summary in tasks
         ]
-        for future in tqdm(as_completed(futures), total=total, desc="Rerunning missing Python baselines"):
+        completed = 0
+        for future in progress_iter(as_completed(futures), total=total, desc="Rerunning missing Python baselines"):
             summary = future.result()
             summary["recomputed_missing_baseline"] = True
             summaries.append(summary)
+            completed += 1
+            maybe_write_stage_partial(
+                save_path,
+                "python_analysis_summary_recomputed_missing.partial.json",
+                summaries,
+                completed,
+                total,
+            )
     summaries.sort(key=lambda item: (item["dataset_stem"], item["parameter_case_id"]))
     return summaries
 
@@ -869,9 +949,16 @@ def run_java_stage(
             )
             for parameter_case in parameter_cases
         ]
-        for future in tqdm(as_completed(futures), total=total, desc="Running Java analysis"):
+        for future in progress_iter(as_completed(futures), total=total, desc="Running Java analysis"):
             summaries.append(future.result())
             completed += 1
+            maybe_write_stage_partial(
+                save_path,
+                "java_analysis_summary.partial.json",
+                summaries,
+                completed,
+                total,
+            )
             final.write_stage_checkpoint(
                 save_path,
                 stage_name,
@@ -1183,12 +1270,19 @@ def run_comparison_stage(
             )
             for parameter_case, java_summary, python_summary in tasks
         ]
-        for future in tqdm(as_completed(futures), total=total, desc="Running comparisons"):
+        for future in progress_iter(as_completed(futures), total=total, desc="Running comparisons"):
             summary = future.result()
             summary["observation_prior"] = observation_prior
             summary.setdefault("java_analysis", {})["observation_prior"] = observation_prior
             comparison_summaries.append(summary)
             completed += 1
+            maybe_write_stage_partial(
+                save_path,
+                f"comparison_summary_{QUARTILE_LABEL}.partial.json",
+                comparison_summaries,
+                completed,
+                total,
+            )
             final.write_stage_checkpoint(
                 save_path,
                 stage_name,
@@ -1246,12 +1340,19 @@ def regenerate_selected_plots(
                 for summary in selected_summaries
             ]
             completed = 0
-            for future in tqdm(as_completed(futures), total=total, desc="Generating selected plots"):
+            for future in progress_iter(as_completed(futures), total=total, desc="Generating selected plots"):
                 updated_summary = future.result()
                 updated_summary["observation_prior"] = observation_prior
                 updated_summary.setdefault("java_analysis", {})["observation_prior"] = observation_prior
                 updated_by_run_id[updated_summary["run_id"]] = updated_summary
                 completed += 1
+                maybe_write_stage_partial(
+                    save_path,
+                    f"selected_plots_{QUARTILE_LABEL}.partial.json",
+                    list(updated_by_run_id.values()),
+                    completed,
+                    total,
+                )
                 final.write_stage_checkpoint(
                     save_path,
                     stage_name,
@@ -1360,7 +1461,7 @@ def run_one_experiment(
     os.makedirs(save_path, exist_ok=True)
 
     source_run_name = endpoint_basename(source_root)
-    print(f"Staging source artifacts for {target.dataset_stem}...")
+    progress_write(f"Staging source artifacts for {target.dataset_stem}...")
     stage_source_artifacts(source_root, local_input_root, target, ssh_opts)
     dataset_runs, python_summaries = load_source_indexes(source_root, local_input_root, ssh_opts)
     source_dataset_run = select_dataset_run(dataset_runs, target, source_root, ssh_opts, local_input_root)
@@ -1402,7 +1503,7 @@ def run_one_experiment(
     localized_python_summaries = list(summaries_by_case_id.values())
     recovered_count = len([summary for summary in localized_python_summaries if summary.get("reconstructed_from_artifacts")])
     if recovered_count:
-        print(f"Recovered {recovered_count} Python baseline summaries for {target.dataset_stem} from case artifacts.")
+        progress_write(f"Recovered {recovered_count} Python baseline summaries for {target.dataset_stem} from case artifacts.")
 
     final.write_json(os.path.join(save_path, "dataset_runs_summary.json"), [dataset_run])
     final.write_json(os.path.join(save_path, "python_analysis_summary_reused.json"), localized_python_summaries)
@@ -1545,14 +1646,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     summary_csv_path = os.path.join(local_run_root, "pomega_sensitivity_summary.csv")
 
     total = len(targets) * len(priors)
-    progress = tqdm(
+    progress = progress_iter(
         [(target, prior) for target in targets for prior in priors],
         total=total,
         desc="P(omega) experiments",
         unit="experiment",
     )
     for completed, (target, prior) in enumerate(progress, start=1):
-        progress.set_postfix_str(f"{target.dataset_stem}, p={prior}")
+        try:
+            progress.set_postfix_str(f"{target.dataset_stem}, p={prior}")
+        except (OSError, ValueError):
+            pass
         remote_sentinel_parts = (
             run_label,
             target.dataset_stem,
@@ -1576,11 +1680,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 ("dataset_key", "dataset_stem", "observation_prior", "status", "dest_result_path", "rows_written", "selected_runs_for_plots", "completed_at"),
             )
             copy_top_level_summaries_back(local_run_root, dest_root, run_label, ssh_opts)
-            tqdm.write(f"[{completed}/{total}] skipped existing {target.dataset_stem} p={prior}")
+            progress_write(f"[{completed}/{total}] skipped existing {target.dataset_stem} p={prior}")
             continue
 
         experiment_dir = os.path.join(local_run_root, target.dataset_stem, f"pomega_{prior_label(prior)}")
-        tqdm.write(f"[{completed}/{total}] running {target.dataset_stem} with P(omega)={prior}")
+        progress_write(f"[{completed}/{total}] running {target.dataset_stem} with P(omega)={prior}")
+        completed_successfully = False
         try:
             row = run_one_experiment(
                 source_root=source_root,
@@ -1595,8 +1700,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 ssh_opts=ssh_opts,
             )
             row["status"] = "completed"
+            completed_successfully = True
         finally:
-            if not args.keep_local and os.path.isdir(experiment_dir):
+            if completed_successfully and not args.keep_local and os.path.isdir(experiment_dir):
                 shutil.rmtree(experiment_dir)
 
         summary_rows.append(row)
