@@ -1,0 +1,14 @@
+# Copy this file to pomega_paths.txt and replace placeholders with local/private paths.
+# pomega_paths.txt is ignored by git.
+
+# Existing sweep artifacts used as inputs. Supports local paths and rsync-compatible remotes.
+SOURCE_ROOT=user@example.org:/path/to/source/sweep_or_parent
+
+# Destination where pomega result folders are copied back. Supports local paths and rsync-compatible remotes.
+DEST_ROOT=user@example.org:/path/to/pomega_results
+
+# Scratch directory on the experiment machine. It should have enough space for one staged experiment.
+LOCAL_WORK=/path/to/local/chita_pomega_work
+
+# Optional SSH options passed to rsync, for example: -i /path/to/private_key
+# RSYNC_SSH_OPTS=-i /path/to/private_key

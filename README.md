@@ -42,6 +42,23 @@ To support reproducibility of the experimental results, use `sweep_pipeline_fina
    MPLCONFIGDIR=.cache/matplotlib python sweep_pipeline_final.py --reuse-run results/sweep_YYYYMMDD-HHMM --only-selected-plots --quartile-label q4
    ```
 
+3. To run the ablation on the effect of p_omega parameter, since it leverages the results computed in the previous steps, first copy the public template and edit it locally:
+```bash
+cp pomega_paths.example.txt pomega_paths.txt
+```
+then run
+```bash
+   python run_pomega_sensitivity.py --paths-file pomega_paths.txt --datasets scale_free_2500
+```
+
+## Tentative execution times
+
+Household-bubble: ~ 6-8 hours per experiment
+Scale-free: ~ a day per experiment
+Small-world: ~ 30-32 hours per experiment 
+
+Reported times are tentative because they depend on CPU, number of workers, and dataset size.
+
 ## Installation
 
 Use Python 3.8+ and JDK 11+.
