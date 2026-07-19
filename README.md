@@ -51,13 +51,13 @@ then run
    python run_pomega_sensitivity.py --paths-file pomega_paths.txt --datasets scale_free_2500
 ```
 
-## Tentative execution times
+## Approximated execution times
 
 Household-bubble: ~ 6-8 hours per experiment
 Scale-free: ~ a day per experiment
 Small-world: ~ 30-32 hours per experiment 
 
-Reported times are tentative because they depend on CPU, number of workers, and dataset size.
+Reported times are approximated because they depend on CPU, number of workers, and dataset size.
 
 ## Installation
 
