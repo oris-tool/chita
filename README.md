@@ -53,9 +53,9 @@ then run
 
 ## Approximated execution times
 
-Household-bubble: ~ 6-8 hours per experiment
-Scale-free: ~ a day per experiment
-Small-world: ~ 30-32 hours per experiment 
+- Household-bubble: ~ 6-8 hours per experiment
+- Scale-free: ~ a day per experiment
+- Small-world: ~ 30-32 hours per experiment 
 
 Reported times are approximated because they depend on CPU, number of workers, and dataset size.
 
